@@ -2,7 +2,6 @@ const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs-extra');
 const { v4: uuidv4 } = require('uuid');
-const archiver = require('archiver');
 
 class SplitService {
   constructor() {
@@ -12,7 +11,7 @@ class SplitService {
 
   /**
    * Split video at reaction timestamps
-   * Returns individual clips that user can edit in CapCut
+   * Returns individual clips that user can download separately (faster!)
    */
   async splitVideoForReactions(videoPath, reactions) {
     const jobId = uuidv4();
@@ -36,7 +35,8 @@ class SplitService {
         
         // Create video clip before this reaction
         const clipNumber = i + 1;
-        const clipPath = path.join(clipsDir, `clip_${clipNumber}.mp4`);
+        const clipFilename = `clip_${clipNumber}.mp4`;
+        const clipPath = path.join(clipsDir, clipFilename);
         
         console.log(`Creating clip ${clipNumber}: ${currentTime}s to ${reaction.timestamp}s`);
         
@@ -50,7 +50,7 @@ class SplitService {
         clips.push({
           number: clipNumber,
           path: clipPath,
-          filename: `clip_${clipNumber}.mp4`,
+          filename: clipFilename,
           startTime: currentTime,
           endTime: reaction.timestamp,
           duration: reaction.timestamp - currentTime
@@ -69,7 +69,8 @@ class SplitService {
 
       // Create final clip (after last reaction to end)
       const finalClipNumber = sortedReactions.length + 1;
-      const finalClipPath = path.join(clipsDir, `clip_${finalClipNumber}.mp4`);
+      const finalClipFilename = `clip_${finalClipNumber}.mp4`;
+      const finalClipPath = path.join(clipsDir, finalClipFilename);
       
       console.log(`Creating final clip ${finalClipNumber}: ${currentTime}s to end`);
       
@@ -83,31 +84,45 @@ class SplitService {
       clips.push({
         number: finalClipNumber,
         path: finalClipPath,
-        filename: `clip_${finalClipNumber}.mp4`,
+        filename: finalClipFilename,
         startTime: currentTime,
         endTime: null,
         duration: null
       });
 
-      // Create reactions guide text file
-      const guideText = this.createReactionsGuide(reactionGuide);
-      const guidePath = path.join(clipsDir, 'reactions_guide.txt');
-      await fs.writeFile(guidePath, guideText);
-
       console.log(`✓ Created ${clips.length} clips`);
 
-      // Create ZIP file with all clips + guide
-      const zipPath = path.join(this.outputDir, `split_video_${jobId}.zip`);
-      await this.createZipFile(clipsDir, zipPath);
+      // Create reactions guide text file
+      const guideText = this.createReactionsGuide(reactionGuide);
+      const guideFilename = 'reactions_guide.txt';
+      const guidePath = path.join(clipsDir, guideFilename);
+      await fs.writeFile(guidePath, guideText);
+
+      // Move clips to output directory for individual download
+      const outputClips = [];
+      for (const clip of clips) {
+        const outputPath = path.join(this.outputDir, `${jobId}_${clip.filename}`);
+        await fs.move(clip.path, outputPath);
+        outputClips.push({
+          number: clip.number,
+          filename: clip.filename,
+          startTime: clip.startTime,
+          endTime: clip.endTime,
+          duration: clip.duration,
+          downloadUrl: `/api/split/${jobId}/clip/${clip.number}`
+        });
+      }
+
+      // Move guide to output
+      const outputGuidePath = path.join(this.outputDir, `${jobId}_${guideFilename}`);
+      await fs.move(guidePath, outputGuidePath);
 
       return {
         jobId,
         totalClips: clips.length,
-        clips,
+        clips: outputClips,
         reactionGuide,
-        guidePath,
-        zipPath,
-        zipFilename: `split_video_${jobId}.zip`,
+        guideDownloadUrl: `/api/split/${jobId}/guide`,
         success: true
       };
 
@@ -202,28 +217,17 @@ class SplitService {
   }
 
   /**
-   * Create ZIP file containing all clips and guide
+   * Get clip file path by job ID and clip number
    */
-  createZipFile(sourceDir, outputPath) {
-    return new Promise((resolve, reject) => {
-      const output = fs.createWriteStream(outputPath);
-      const archive = archiver('zip', {
-        zlib: { level: 9 }
-      });
+  getClipPath(jobId, clipNumber) {
+    return path.join(this.outputDir, `${jobId}_clip_${clipNumber}.mp4`);
+  }
 
-      output.on('close', () => {
-        console.log(`✓ ZIP created: ${archive.pointer()} bytes`);
-        resolve(outputPath);
-      });
-
-      archive.on('error', (err) => {
-        reject(err);
-      });
-
-      archive.pipe(output);
-      archive.directory(sourceDir, false);
-      archive.finalize();
-    });
+  /**
+   * Get guide file path by job ID
+   */
+  getGuidePath(jobId) {
+    return path.join(this.outputDir, `${jobId}_reactions_guide.txt`);
   }
 }
 
