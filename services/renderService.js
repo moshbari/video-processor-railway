@@ -18,7 +18,8 @@ class RenderService {
       transcript,
       reactions = [],
       cuts = [],
-      outputFilename = null
+      outputFilename = null,
+      renderStyle = 'pause-and-react' // 'pause-and-react' or 'simple-overlay'
     } = config;
 
     const jobId = uuidv4();
@@ -27,6 +28,7 @@ class RenderService {
 
     try {
       console.log(`Starting render job: ${jobId}`);
+      console.log(`Render style: ${renderStyle}`);
 
       // Step 1: Process cuts if specified
       let processedVideo = videoPath;
@@ -35,10 +37,15 @@ class RenderService {
         processedVideo = await this.applyCuts(videoPath, cuts, workDir);
       }
 
-      // Step 2: Add reactions (simplified version that works)
+      // Step 2: Add reactions
       if (reactions && reactions.length > 0) {
         console.log(`Adding ${reactions.length} reactions...`);
-        processedVideo = await this.addReactions(processedVideo, reactions, workDir);
+        
+        if (renderStyle === 'pause-and-react') {
+          processedVideo = await this.addReactionsPauseAndReact(processedVideo, reactions, workDir);
+        } else {
+          processedVideo = await this.addReactionsSimple(processedVideo, reactions, workDir);
+        }
       }
 
       // Step 3: Move to output directory
@@ -75,10 +82,8 @@ class RenderService {
     return new Promise((resolve, reject) => {
       const outputPath = path.join(workDir, 'cut_video.mp4');
       
-      // Sort cuts by start time
       const sortedCuts = cuts.sort((a, b) => a.start - b.start);
 
-      // Create filter complex for cuts
       let filterComplex = '';
       let concatInputs = '';
 
@@ -114,38 +119,225 @@ class RenderService {
   }
 
   /**
-   * Add reactions to video - SIMPLIFIED VERSION THAT WORKS
+   * Add reactions with PAUSE-AND-REACT style
+   * Video pauses, shows darkened frame with text, then resumes
    */
-  async addReactions(videoPath, reactions, workDir) {
+  async addReactionsPauseAndReact(videoPath, reactions, workDir) {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const outputPath = path.join(workDir, 'with_reactions.mp4');
+        const segmentsDir = path.join(workDir, 'segments');
+        await fs.ensureDir(segmentsDir);
+
+        const sortedReactions = reactions.sort((a, b) => a.timestamp - b.timestamp);
+        
+        console.log('Creating pause-and-react video with segment approach');
+        console.log(`Processing ${sortedReactions.length} reactions`);
+
+        const segmentFiles = [];
+        let currentTime = 0;
+
+        for (let i = 0; i < sortedReactions.length; i++) {
+          const reaction = sortedReactions[i];
+          const reactionDuration = reaction.duration || 3;
+
+          // Create video segment before this reaction
+          if (reaction.timestamp > currentTime) {
+            const videoSegmentPath = path.join(segmentsDir, `video_${i}.mp4`);
+            console.log(`Creating video segment ${i}: ${currentTime}s to ${reaction.timestamp}s`);
+            
+            await this.createVideoSegment(
+              videoPath,
+              currentTime,
+              reaction.timestamp,
+              videoSegmentPath
+            );
+            
+            segmentFiles.push(videoSegmentPath);
+          }
+
+          // Create reaction segment (freeze frame with text)
+          const reactionSegmentPath = path.join(segmentsDir, `reaction_${i}.mp4`);
+          console.log(`Creating reaction segment ${i}: ${reactionDuration}s at ${reaction.timestamp}s`);
+          
+          await this.createReactionSegment(
+            videoPath,
+            reaction.timestamp,
+            reaction.text,
+            reactionDuration,
+            reactionSegmentPath
+          );
+          
+          segmentFiles.push(reactionSegmentPath);
+          currentTime = reaction.timestamp;
+        }
+
+        // Create final video segment (after last reaction to end)
+        const finalSegmentPath = path.join(segmentsDir, `video_final.mp4`);
+        console.log(`Creating final video segment from ${currentTime}s to end`);
+        
+        await this.createVideoSegment(
+          videoPath,
+          currentTime,
+          999999,
+          finalSegmentPath
+        );
+        
+        segmentFiles.push(finalSegmentPath);
+
+        // Concatenate all segments
+        console.log(`Concatenating ${segmentFiles.length} segments...`);
+        await this.concatenateSegments(segmentFiles, outputPath);
+
+        console.log('Pause-and-react video complete!');
+        resolve(outputPath);
+
+      } catch (error) {
+        console.error('Pause-and-react error:', error);
+        reject(error);
+      }
+    });
+  }
+
+  /**
+   * Create a video segment (trim from start to end)
+   */
+  createVideoSegment(videoPath, startTime, endTime, outputPath) {
+    return new Promise((resolve, reject) => {
+      const duration = endTime - startTime;
+      
+      // Skip if duration is too short
+      if (duration < 0.1) {
+        console.log(`Skipping very short segment: ${duration}s`);
+        return resolve(outputPath);
+      }
+
+      ffmpeg(videoPath)
+        .setStartTime(startTime)
+        .setDuration(duration)
+        .outputOptions([
+          '-c:v libx264',
+          '-preset ultrafast',
+          '-c:a aac'
+        ])
+        .on('start', cmd => console.log(`Video segment FFmpeg started`))
+        .on('end', () => resolve(outputPath))
+        .on('error', reject)
+        .save(outputPath);
+    });
+  }
+
+  /**
+   * Create a reaction segment (freeze frame with text overlay)
+   */
+  createReactionSegment(videoPath, freezeTime, text, duration, outputPath) {
+    return new Promise((resolve, reject) => {
+      const cleanText = text
+        .replace(/['"\\]/g, '')
+        .replace(/:/g, ' ')
+        .replace(/\n/g, ' ')
+        .substring(0, 120);
+
+      const tempImagePath = outputPath.replace('.mp4', '.jpg');
+
+      // Step 1: Extract frame at freezeTime
+      ffmpeg(videoPath)
+        .seekInput(freezeTime)
+        .frames(1)
+        .outputOptions([
+          '-vf', 'eq=brightness=-0.15'
+        ])
+        .on('end', () => {
+          // Step 2: Create video from frame with text
+          ffmpeg()
+            .input(tempImagePath)
+            .loop(duration)
+            .inputOptions([
+              '-loop', '1',
+              '-t', duration.toString()
+            ])
+            .outputOptions([
+              '-vf', `drawtext=text='${cleanText}':fontsize=48:fontcolor=white:bordercolor=black:borderw=4:x=(w-text_w)/2:y=(h-text_h)/2`,
+              '-c:v', 'libx264',
+              '-preset', 'ultrafast',
+              '-pix_fmt', 'yuv420p'
+            ])
+            .complexFilter([
+              'anullsrc=r=44100:cl=stereo',
+              `[0:v][1:a]concat=n=1:v=1:a=1[outv][outa]`
+            ])
+            .map('[outv]')
+            .map('[outa]')
+            .duration(duration)
+            .on('end', () => {
+              fs.remove(tempImagePath).catch(console.error);
+              resolve(outputPath);
+            })
+            .on('error', reject)
+            .save(outputPath);
+        })
+        .on('error', reject)
+        .save(tempImagePath);
+    });
+  }
+
+  /**
+   * Concatenate multiple video segments
+   */
+  concatenateSegments(segmentFiles, outputPath) {
+    return new Promise((resolve, reject) => {
+      const concatListPath = path.join(path.dirname(outputPath), 'concat_list.txt');
+      const concatContent = segmentFiles
+        .map(file => `file '${file}'`)
+        .join('\n');
+      
+      fs.writeFileSync(concatListPath, concatContent);
+
+      ffmpeg()
+        .input(concatListPath)
+        .inputOptions(['-f', 'concat', '-safe', '0'])
+        .outputOptions([
+          '-c', 'copy',
+          '-movflags', '+faststart'
+        ])
+        .on('start', cmd => console.log('Concatenating segments...'))
+        .on('progress', progress => {
+          if (progress.percent) {
+            console.log(`Concatenation progress: ${progress.percent.toFixed(1)}%`);
+          }
+        })
+        .on('end', () => {
+          fs.remove(concatListPath).catch(console.error);
+          resolve(outputPath);
+        })
+        .on('error', reject)
+        .save(outputPath);
+    });
+  }
+
+  /**
+   * Simple text overlay (no pause) - for backward compatibility
+   */
+  async addReactionsSimple(videoPath, reactions, workDir) {
     return new Promise((resolve, reject) => {
       const outputPath = path.join(workDir, 'with_reactions.mp4');
 
-      // Sort reactions by timestamp
       const sortedReactions = reactions.sort((a, b) => a.timestamp - b.timestamp);
 
-      console.log('Using simplified text overlay rendering');
-      console.log(`Processing ${sortedReactions.length} reactions`);
+      console.log('Using simple text overlay rendering');
 
-      // Build simple text overlays
-      const textOverlays = sortedReactions.map((reaction, index) => {
-        // Clean the text - remove problematic characters
+      const textOverlays = sortedReactions.map((reaction) => {
         const cleanText = reaction.text
-          .replace(/['"]/g, '') // Remove quotes
-          .replace(/:/g, ' ')    // Remove colons
-          .replace(/\\/g, '')    // Remove backslashes
-          .substring(0, 100);    // Limit length
+          .replace(/['"]/g, '')
+          .replace(/:/g, ' ')
+          .replace(/\\/g, '')
+          .substring(0, 100);
 
         const start = reaction.timestamp;
         const duration = reaction.duration || 3;
         const end = start + duration;
         
-        console.log(`Reaction ${index + 1}: ${start}s-${end}s: "${cleanText}"`);
-        
-        return `drawtext=text='${cleanText}':` +
-               `fontsize=32:fontcolor=white:` +
-               `box=1:boxcolor=black@0.7:boxborderw=5:` +
-               `x=(w-text_w)/2:y=h-100:` +
-               `enable='between(t,${start},${end})'`;
+        return `drawtext=text='${cleanText}':fontsize=32:fontcolor=white:box=1:boxcolor=black@0.7:boxborderw=5:x=(w-text_w)/2:y=h-100:enable='between(t,${start},${end})'`;
       }).join(',');
 
       ffmpeg(videoPath)
@@ -157,22 +349,22 @@ class RenderService {
           '-c:a copy',
           '-movflags +faststart'
         ])
-        .on('start', cmd => console.log('FFmpeg command:', cmd))
         .on('progress', progress => {
           if (progress.percent) {
             console.log(`Rendering progress: ${progress.percent.toFixed(1)}%`);
           }
         })
-        .on('end', () => {
-          console.log('Rendering complete!');
-          resolve(outputPath);
-        })
-        .on('error', (err) => {
-          console.error('FFmpeg error:', err);
-          reject(err);
-        })
+        .on('end', () => resolve(outputPath))
+        .on('error', reject)
         .save(outputPath);
     });
+  }
+
+  /**
+   * Legacy addReactions function
+   */
+  async addReactions(videoPath, reactions, workDir) {
+    return this.addReactionsPauseAndReact(videoPath, reactions, workDir);
   }
 
   /**
@@ -249,17 +441,6 @@ class RenderService {
         .on('end', () => resolve(outputPath))
         .on('error', reject);
     });
-  }
-
-  /**
-   * Escape text for FFmpeg drawtext filter
-   */
-  escapeText(text) {
-    return text
-      .replace(/\\/g, '')
-      .replace(/'/g, '')
-      .replace(/:/g, ' ')
-      .replace(/\n/g, ' ');
   }
 }
 
