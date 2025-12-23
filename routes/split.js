@@ -37,35 +37,88 @@ router.post('/', async (req, res) => {
 });
 
 /**
- * GET /api/split/:jobId/download - Download ZIP file with all clips
+ * GET /api/split/:jobId/clip/:clipNumber - Download individual clip
  */
-router.get('/:jobId/download', async (req, res) => {
+router.get('/:jobId/clip/:clipNumber', async (req, res) => {
   try {
-    const { jobId } = req.params;
-    const zipPath = path.join(
-      process.env.OUTPUT_DIR || '/app/outputs',
-      `split_video_${jobId}.zip`
-    );
+    const { jobId, clipNumber } = req.params;
+    const clipPath = splitService.getClipPath(jobId, clipNumber);
 
-    if (!await fs.pathExists(zipPath)) {
+    if (!await fs.pathExists(clipPath)) {
       return res.status(404).json({
         success: false,
-        error: 'ZIP file not found'
+        error: 'Clip not found'
       });
     }
 
-    res.download(zipPath, `reaction_clips_${jobId}.zip`, (err) => {
+    res.download(clipPath, `clip_${clipNumber}.mp4`, (err) => {
       if (err) {
         console.error('Download error:', err);
       }
-      // Cleanup after download
-      setTimeout(() => {
-        fs.remove(zipPath).catch(console.error);
-      }, 5000);
     });
 
   } catch (error) {
     console.error('Download error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * GET /api/split/:jobId/guide - Download reactions guide
+ */
+router.get('/:jobId/guide', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const guidePath = splitService.getGuidePath(jobId);
+
+    if (!await fs.pathExists(guidePath)) {
+      return res.status(404).json({
+        success: false,
+        error: 'Guide not found'
+      });
+    }
+
+    res.download(guidePath, 'reactions_guide.txt', (err) => {
+      if (err) {
+        console.error('Download error:', err);
+      }
+    });
+
+  } catch (error) {
+    console.error('Download error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * DELETE /api/split/:jobId - Cleanup clips after download
+ */
+router.delete('/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const outputDir = process.env.OUTPUT_DIR || '/app/outputs';
+    
+    // Find and delete all files for this job
+    const files = await fs.readdir(outputDir);
+    const jobFiles = files.filter(f => f.startsWith(jobId));
+    
+    for (const file of jobFiles) {
+      await fs.remove(path.join(outputDir, file));
+    }
+
+    res.json({
+      success: true,
+      message: `Deleted ${jobFiles.length} files`
+    });
+
+  } catch (error) {
+    console.error('Cleanup error:', error);
     res.status(500).json({
       success: false,
       error: error.message
