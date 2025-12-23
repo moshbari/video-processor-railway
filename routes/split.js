@@ -6,13 +6,6 @@ const fs = require('fs-extra');
 
 /**
  * POST /api/split - Split video at reaction timestamps for manual editing
- * Body: {
- *   videoPath: "/path/to/video.mp4",
- *   reactions: [
- *     { timestamp: 15, text: "Wow, honest!", sentiment: "POSITIVE" },
- *     { timestamp: 30, text: "This is confusing", sentiment: "NEGATIVE" }
- *   ]
- * }
  */
 router.post('/', async (req, res) => {
   try {
