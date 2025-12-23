@@ -222,8 +222,14 @@ class RenderService {
           '-c:a aac'
         ])
         .on('start', cmd => console.log(`Video segment FFmpeg started`))
-        .on('end', () => resolve(outputPath))
-        .on('error', reject)
+        .on('end', () => {
+          console.log(`Video segment created: ${outputPath}`);
+          resolve(outputPath);
+        })
+        .on('error', (err) => {
+          console.error(`Video segment error:`, err);
+          reject(err);
+        })
         .save(outputPath);
     });
   }
@@ -242,12 +248,23 @@ class RenderService {
 
       const tempImagePath = outputPath.replace('.mp4', '.jpg');
 
+      console.log(`Extracting frame at ${freezeTime}s for reaction segment...`);
+      
       // Step 1: Extract frame
       ffmpeg(videoPath)
         .seekInput(freezeTime)
         .frames(1)
         .outputOptions(['-vf', 'eq=brightness=-0.15'])
+        .on('start', cmd => console.log(`Frame extraction: ${cmd.substring(0, 150)}...`))
         .on('end', () => {
+          // Verify temp image was created
+          if (!fs.existsSync(tempImagePath)) {
+            console.error(`Temp image not created: ${tempImagePath}`);
+            return reject(new Error('Failed to extract frame - image not created'));
+          }
+          
+          console.log(`Frame extracted successfully: ${tempImagePath}`);
+          
           // Step 2: Create video with text and audio using direct FFmpeg command
           const ffmpegCmd = `ffmpeg -loop 1 -i "${tempImagePath}" ` +
             `-f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 ` +
@@ -257,24 +274,31 @@ class RenderService {
             `-c:a aac -shortest ` +
             `-y "${outputPath}"`;
           
-          console.log('Running FFmpeg command for reaction segment...');
+          console.log('Creating reaction video segment with FFmpeg...');
           
           exec(ffmpegCmd, (error, stdout, stderr) => {
             // Cleanup temp image
-            fs.remove(tempImagePath).catch(console.error);
+            fs.remove(tempImagePath).catch(err => console.error('Cleanup error:', err));
             
             if (error) {
-              console.error('FFmpeg exec error:', stderr);
-              return reject(new Error(`FFmpeg failed: ${stderr}`));
+              console.error('FFmpeg exec error:', stderr.substring(0, 500));
+              return reject(new Error(`FFmpeg failed: ${stderr.substring(0, 200)}`));
             }
             
-            console.log('Reaction segment created successfully');
+            // Verify output was created
+            if (!fs.existsSync(outputPath)) {
+              console.error(`Output not created: ${outputPath}`);
+              return reject(new Error('Failed to create reaction segment - output not found'));
+            }
+            
+            console.log(`Reaction segment created successfully: ${outputPath}`);
             resolve(outputPath);
           });
         })
         .on('error', (err) => {
-          console.error('Frame extraction error:', err);
-          reject(err);
+          console.error(`Frame extraction failed at ${freezeTime}s:`, err.message);
+          fs.remove(tempImagePath).catch(console.error);
+          reject(new Error(`Frame extraction failed at ${freezeTime}s: ${err.message}`));
         })
         .save(tempImagePath);
     });
@@ -291,6 +315,7 @@ class RenderService {
         .join('\n');
       
       fs.writeFileSync(concatListPath, concatContent);
+      console.log(`Concat list created with ${segmentFiles.length} files`);
 
       ffmpeg()
         .input(concatListPath)
@@ -307,9 +332,14 @@ class RenderService {
         })
         .on('end', () => {
           fs.remove(concatListPath).catch(console.error);
+          console.log('Concatenation complete');
           resolve(outputPath);
         })
-        .on('error', reject)
+        .on('error', (err) => {
+          console.error('Concatenation error:', err);
+          fs.remove(concatListPath).catch(console.error);
+          reject(err);
+        })
         .save(outputPath);
     });
   }
