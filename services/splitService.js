@@ -123,7 +123,7 @@ class SplitService {
   }
 
   /**
-   * Extract a single clip from video
+   * Extract a single clip from video - FAST VERSION with copy codec
    */
   extractClip(videoPath, startTime, endTime, outputPath) {
     return new Promise((resolve, reject) => {
@@ -144,9 +144,8 @@ class SplitService {
 
       command
         .outputOptions([
-          '-c:v libx264',
-          '-preset ultrafast',
-          '-c:a aac'
+          '-c copy',  // FAST: Just copy streams, don't re-encode!
+          '-avoid_negative_ts make_zero'  // Fix timing issues
         ])
         .on('start', cmd => console.log(`Extracting clip: ${startTime}s to ${endTime === 999999 ? 'end' : endTime + 's'}`))
         .on('end', () => {
