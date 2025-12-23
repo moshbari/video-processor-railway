@@ -2,6 +2,7 @@ const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs-extra');
 const { v4: uuidv4 } = require('uuid');
+const { exec } = require('child_process');
 
 class RenderService {
   constructor() {
@@ -229,6 +230,7 @@ class RenderService {
 
   /**
    * Create a reaction segment (freeze frame with text overlay)
+   * Using direct exec to avoid fluent-ffmpeg audio filter bugs
    */
   createReactionSegment(videoPath, freezeTime, text, duration, outputPath) {
     return new Promise((resolve, reject) => {
@@ -240,43 +242,40 @@ class RenderService {
 
       const tempImagePath = outputPath.replace('.mp4', '.jpg');
 
-      // Step 1: Extract frame at freezeTime
+      // Step 1: Extract frame
       ffmpeg(videoPath)
         .seekInput(freezeTime)
         .frames(1)
-        .outputOptions([
-          '-vf', 'eq=brightness=-0.15'
-        ])
+        .outputOptions(['-vf', 'eq=brightness=-0.15'])
         .on('end', () => {
-          // Step 2: Create video from frame with text
-          ffmpeg()
-            .input(tempImagePath)
-            .loop(duration)
-            .inputOptions([
-              '-loop', '1',
-              '-t', duration.toString()
-            ])
-            .outputOptions([
-              '-vf', `drawtext=text='${cleanText}':fontsize=48:fontcolor=white:bordercolor=black:borderw=4:x=(w-text_w)/2:y=(h-text_h)/2`,
-              '-c:v', 'libx264',
-              '-preset', 'ultrafast',
-              '-pix_fmt', 'yuv420p'
-            ])
-            .complexFilter([
-              'anullsrc=r=44100:cl=stereo',
-              `[0:v][1:a]concat=n=1:v=1:a=1[outv][outa]`
-            ])
-            .map('[outv]')
-            .map('[outa]')
-            .duration(duration)
-            .on('end', () => {
-              fs.remove(tempImagePath).catch(console.error);
-              resolve(outputPath);
-            })
-            .on('error', reject)
-            .save(outputPath);
+          // Step 2: Create video with text and audio using direct FFmpeg command
+          const ffmpegCmd = `ffmpeg -loop 1 -i "${tempImagePath}" ` +
+            `-f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 ` +
+            `-vf "drawtext=text='${cleanText}':fontsize=48:fontcolor=white:bordercolor=black:borderw=4:x=(w-text_w)/2:y=(h-text_h)/2" ` +
+            `-t ${duration} ` +
+            `-c:v libx264 -preset ultrafast -pix_fmt yuv420p ` +
+            `-c:a aac -shortest ` +
+            `-y "${outputPath}"`;
+          
+          console.log('Running FFmpeg command for reaction segment...');
+          
+          exec(ffmpegCmd, (error, stdout, stderr) => {
+            // Cleanup temp image
+            fs.remove(tempImagePath).catch(console.error);
+            
+            if (error) {
+              console.error('FFmpeg exec error:', stderr);
+              return reject(new Error(`FFmpeg failed: ${stderr}`));
+            }
+            
+            console.log('Reaction segment created successfully');
+            resolve(outputPath);
+          });
         })
-        .on('error', reject)
+        .on('error', (err) => {
+          console.error('Frame extraction error:', err);
+          reject(err);
+        })
         .save(tempImagePath);
     });
   }
