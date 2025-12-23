@@ -4,7 +4,7 @@ const downloadRoutes = require('./routes/download');
 const transcribeRoutes = require('./routes/transcribe');
 const renderRoutes = require('./routes/render');
 const jobsRoutes = require('./routes/jobs');
-const voiceRoutes = require('./routes/voice');
+const splitRoutes = require('./routes/split');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -22,7 +22,7 @@ app.get('/health', (req, res) => {
       download: 'active',
       transcribe: 'active',
       render: 'active',
-      voice: 'active'
+      split: 'active'
     }
   });
 });
@@ -32,7 +32,7 @@ app.use('/api/download', downloadRoutes);
 app.use('/api/transcribe', transcribeRoutes);
 app.use('/api/render', renderRoutes);
 app.use('/api/jobs', jobsRoutes);
-app.use('/api/voices', voiceRoutes);
+app.use('/api/split', splitRoutes);
 
 // Error handling
 app.use((err, req, res, next) => {
@@ -50,8 +50,7 @@ app.listen(PORT, () => {
   console.log('  POST /api/download');
   console.log('  POST /api/transcribe');
   console.log('  POST /api/render');
-  console.log('  GET  /api/voices');
-  console.log('  POST /api/voices/generate');
-  console.log('  POST /api/voices/test');
+  console.log('  POST /api/split');
+  console.log('  GET  /api/split/:jobId/download');
   console.log('  GET  /api/jobs/:jobId/download');
 });
