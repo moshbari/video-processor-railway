@@ -11,7 +11,8 @@ class SplitService {
 
   /**
    * Split video at reaction timestamps
-   * Returns individual clips that user can download separately (faster!)
+   * Returns individual clips that user can download separately
+   * Clips stay in temp directory for combine feature to use
    */
   async splitVideoForReactions(videoPath, reactions) {
     const jobId = uuidv4();
@@ -21,6 +22,8 @@ class SplitService {
 
     try {
       console.log(`Splitting video into ${reactions.length + 1} clips...`);
+      console.log(`Job ID: ${jobId}`);
+      console.log(`Clips directory: ${clipsDir}`);
 
       // Sort reactions by timestamp
       const sortedReactions = reactions.sort((a, b) => a.timestamp - b.timestamp);
@@ -90,7 +93,7 @@ class SplitService {
         duration: null
       });
 
-      console.log(`✓ Created ${clips.length} clips`);
+      console.log(`✓ Created ${clips.length} clips in ${clipsDir}`);
 
       // Create reactions guide text file
       const guideText = this.createReactionsGuide(reactionGuide);
@@ -98,24 +101,18 @@ class SplitService {
       const guidePath = path.join(clipsDir, guideFilename);
       await fs.writeFile(guidePath, guideText);
 
-      // Move clips to output directory for individual download
-      const outputClips = [];
-      for (const clip of clips) {
-        const outputPath = path.join(this.outputDir, `${jobId}_${clip.filename}`);
-        await fs.move(clip.path, outputPath);
-        outputClips.push({
-          number: clip.number,
-          filename: clip.filename,
-          startTime: clip.startTime,
-          endTime: clip.endTime,
-          duration: clip.duration,
-          downloadUrl: `/api/split/${jobId}/clip/${clip.number}`
-        });
-      }
+      // Build response with download URLs
+      // Clips STAY in temp directory so combine feature can use them
+      const outputClips = clips.map(clip => ({
+        number: clip.number,
+        filename: clip.filename,
+        startTime: clip.startTime,
+        endTime: clip.endTime,
+        duration: clip.duration,
+        downloadUrl: `/api/split/${jobId}/clip/${clip.number}`
+      }));
 
-      // Move guide to output
-      const outputGuidePath = path.join(this.outputDir, `${jobId}_${guideFilename}`);
-      await fs.move(guidePath, outputGuidePath);
+      console.log(`Split job ${jobId} complete. Clips available for 24 hours.`);
 
       return {
         jobId,
@@ -128,13 +125,11 @@ class SplitService {
 
     } catch (error) {
       console.error('Split video error:', error);
+      // Cleanup on error
+      await fs.remove(workDir).catch(() => {});
       throw error;
-    } finally {
-      // Cleanup work directory after 10 seconds
-      setTimeout(() => {
-        fs.remove(workDir).catch(console.error);
-      }, 10000);
     }
+    // NO cleanup here - let cleanup service handle it after 24 hours
   }
 
   /**
@@ -218,16 +213,18 @@ class SplitService {
 
   /**
    * Get clip file path by job ID and clip number
+   * Now reads from temp directory
    */
   getClipPath(jobId, clipNumber) {
-    return path.join(this.outputDir, `${jobId}_clip_${clipNumber}.mp4`);
+    return path.join(this.tempDir, jobId, 'clips', `clip_${clipNumber}.mp4`);
   }
 
   /**
    * Get guide file path by job ID
+   * Now reads from temp directory
    */
   getGuidePath(jobId) {
-    return path.join(this.outputDir, `${jobId}_reactions_guide.txt`);
+    return path.join(this.tempDir, jobId, 'clips', 'reactions_guide.txt');
   }
 }
 
