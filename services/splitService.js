@@ -21,7 +21,7 @@ class SplitService {
     await fs.ensureDir(clipsDir);
 
     try {
-      console.log(`Splitting video into ${reactions.length + 1} clips...`);
+      console.log(`Splitting video into clips...`);
       console.log(`Job ID: ${jobId}`);
       console.log(`Clips directory: ${clipsDir}`);
 
@@ -31,17 +31,33 @@ class SplitService {
       const clips = [];
       const reactionGuide = [];
       let currentTime = 0;
+      let clipNumber = 0;
 
       // Create clips between reactions
       for (let i = 0; i < sortedReactions.length; i++) {
         const reaction = sortedReactions[i];
+        const duration = reaction.timestamp - currentTime;
         
-        // Create video clip before this reaction
-        const clipNumber = i + 1;
+        // Skip if no actual content before this reaction (duration <= 0.5s)
+        if (duration <= 0.5) {
+          console.log(`Skipping empty/tiny segment: ${currentTime}s to ${reaction.timestamp}s (${duration}s)`);
+          currentTime = reaction.timestamp;
+          
+          // Still add reaction guide entry
+          reactionGuide.push({
+            afterClip: clipNumber > 0 ? clipNumber : 1,
+            timestamp: reaction.timestamp,
+            text: reaction.text,
+            sentiment: reaction.sentiment || 'NEUTRAL'
+          });
+          continue;
+        }
+        
+        clipNumber++;
         const clipFilename = `clip_${clipNumber}.mp4`;
         const clipPath = path.join(clipsDir, clipFilename);
         
-        console.log(`Creating clip ${clipNumber}: ${currentTime}s to ${reaction.timestamp}s`);
+        console.log(`Creating clip ${clipNumber}: ${currentTime}s to ${reaction.timestamp}s (${duration}s)`);
         
         await this.extractClip(
           videoPath,
@@ -56,7 +72,7 @@ class SplitService {
           filename: clipFilename,
           startTime: currentTime,
           endTime: reaction.timestamp,
-          duration: reaction.timestamp - currentTime
+          duration: duration
         });
 
         // Add reaction guide
@@ -71,11 +87,11 @@ class SplitService {
       }
 
       // Create final clip (after last reaction to end)
-      const finalClipNumber = sortedReactions.length + 1;
-      const finalClipFilename = `clip_${finalClipNumber}.mp4`;
+      clipNumber++;
+      const finalClipFilename = `clip_${clipNumber}.mp4`;
       const finalClipPath = path.join(clipsDir, finalClipFilename);
       
-      console.log(`Creating final clip ${finalClipNumber}: ${currentTime}s to end`);
+      console.log(`Creating final clip ${clipNumber}: ${currentTime}s to end`);
       
       await this.extractClip(
         videoPath,
@@ -85,7 +101,7 @@ class SplitService {
       );
 
       clips.push({
-        number: finalClipNumber,
+        number: clipNumber,
         path: finalClipPath,
         filename: finalClipFilename,
         startTime: currentTime,
@@ -139,8 +155,8 @@ class SplitService {
     return new Promise((resolve, reject) => {
       const duration = endTime === 999999 ? undefined : endTime - startTime;
 
-      // Skip very short clips
-      if (duration && duration < 0.5) {
+      // Skip clips with no duration or very short duration
+      if (duration !== undefined && duration <= 0.5) {
         console.log(`Skipping very short clip: ${duration}s`);
         return resolve(outputPath);
       }
@@ -148,7 +164,8 @@ class SplitService {
       const command = ffmpeg(videoPath)
         .setStartTime(startTime);
 
-      if (duration) {
+      // Only set duration if we have a valid one (not going to end of file)
+      if (duration !== undefined && duration > 0) {
         command.setDuration(duration);
       }
 
