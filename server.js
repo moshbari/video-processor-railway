@@ -10,6 +10,10 @@ const renderRoutes = require('./routes/render');
 const jobsRoutes = require('./routes/jobs');
 const splitRoutes = require('./routes/split');
 const combineRoutes = require('./routes/combine');
+const adminRoutes = require('./routes/admin');
+
+// Import services
+const cleanupService = require('./services/cleanupService');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -27,6 +31,9 @@ const ensureDirs = async () => {
 };
 ensureDirs();
 
+// Start cleanup service (runs every hour, deletes files older than 24h)
+cleanupService.startAutoCleanup();
+
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -42,7 +49,8 @@ app.get('/health', (req, res) => {
       transcribe: 'active',
       render: 'active',
       split: 'active',
-      combine: 'active'
+      combine: 'active',
+      cleanup: 'active'
     }
   });
 });
@@ -54,6 +62,7 @@ app.use('/api/render', renderRoutes);
 app.use('/api/jobs', jobsRoutes);
 app.use('/api/split', splitRoutes);
 app.use('/api/combine', combineRoutes);
+app.use('/api/admin', adminRoutes);
 
 // Error handling for multer
 app.use((err, req, res, next) => {
@@ -89,4 +98,6 @@ app.listen(PORT, () => {
   console.log('  GET  /api/combine/:jobId/download');
   console.log('  GET  /api/split/:jobId/download');
   console.log('  GET  /api/jobs/:jobId/download');
+  console.log('  GET  /api/admin/status');
+  console.log('  POST /api/admin/cleanup');
 });
