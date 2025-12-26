@@ -10,33 +10,56 @@ class CombineService {
   }
 
   /**
-   * Get video duration using ffprobe
+   * Get video metadata using ffprobe
    */
-  async getVideoDuration(videoPath) {
+  async getVideoMetadata(videoPath) {
     return new Promise((resolve, reject) => {
       ffmpeg.ffprobe(videoPath, (err, metadata) => {
         if (err) reject(err);
-        else resolve(metadata.format.duration);
+        else {
+          const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+          const audioStream = metadata.streams.find(s => s.codec_type === 'audio');
+          
+          // Get durations - prefer stream duration, fallback to format duration
+          const videoDuration = videoStream ? parseFloat(videoStream.duration) || metadata.format.duration : 0;
+          const audioDuration = audioStream ? parseFloat(audioStream.duration) || metadata.format.duration : 0;
+          const formatDuration = metadata.format.duration || 0;
+          
+          // Use the maximum duration to ensure we don't cut anything short
+          const maxDuration = Math.max(videoDuration, audioDuration, formatDuration);
+          
+          resolve({
+            duration: maxDuration,
+            videoDuration,
+            audioDuration,
+            formatDuration,
+            width: videoStream ? videoStream.width : 0,
+            height: videoStream ? videoStream.height : 0,
+            hasVideo: !!videoStream,
+            hasAudio: !!audioStream
+          });
+        }
       });
     });
+  }
+
+  /**
+   * Get video duration using ffprobe
+   */
+  async getVideoDuration(videoPath) {
+    const metadata = await this.getVideoMetadata(videoPath);
+    return metadata.duration;
   }
 
   /**
    * Get video dimensions using ffprobe
    */
   async getVideoDimensions(videoPath) {
-    return new Promise((resolve, reject) => {
-      ffmpeg.ffprobe(videoPath, (err, metadata) => {
-        if (err) reject(err);
-        else {
-          const videoStream = metadata.streams.find(s => s.codec_type === 'video');
-          resolve({
-            width: videoStream.width,
-            height: videoStream.height
-          });
-        }
-      });
-    });
+    const metadata = await this.getVideoMetadata(videoPath);
+    return {
+      width: metadata.width,
+      height: metadata.height
+    };
   }
 
   /**
@@ -89,6 +112,7 @@ class CombineService {
    * - Reaction video is 35% width, top-right corner
    * - Maintains reaction video aspect ratio
    * - Only reaction audio plays
+   * - Video duration matches the LONGER of video/audio streams
    */
   async createPipSegment(originalClipPath, reactionPath, outputPath, targetWidth = 1080, targetHeight = 1920) {
     const workDir = path.dirname(outputPath);
@@ -110,31 +134,46 @@ class CombineService {
       }
       console.log('Step 1: Complete - frame extracted');
       
-      // Get reaction video duration and dimensions
+      // Get reaction video metadata (including separate video/audio durations)
       console.log('Step 2: Getting reaction video info...');
-      const reactionDuration = await this.getVideoDuration(reactionPath);
-      const reactionDims = await this.getVideoDimensions(reactionPath);
+      const reactionMeta = await this.getVideoMetadata(reactionPath);
       
-      console.log(`Creating PiP segment: ${reactionDuration.toFixed(2)}s, reaction dims: ${reactionDims.width}x${reactionDims.height}`);
+      console.log(`Reaction metadata:`);
+      console.log(`  - Video duration: ${reactionMeta.videoDuration}s`);
+      console.log(`  - Audio duration: ${reactionMeta.audioDuration}s`);
+      console.log(`  - Format duration: ${reactionMeta.formatDuration}s`);
+      console.log(`  - Max duration (used): ${reactionMeta.duration}s`);
+      console.log(`  - Dimensions: ${reactionMeta.width}x${reactionMeta.height}`);
+      console.log(`  - Has video: ${reactionMeta.hasVideo}, Has audio: ${reactionMeta.hasAudio}`);
+      
+      if (!reactionMeta.hasVideo) {
+        throw new Error('Reaction file has no video stream');
+      }
+      
+      // Use the max duration to ensure audio doesn't get cut
+      const totalDuration = reactionMeta.duration;
       
       // Calculate PiP size (35% of target width, maintain aspect ratio)
       const pipWidth = Math.round(targetWidth * 0.35);
-      const pipHeight = Math.round(pipWidth * (reactionDims.height / reactionDims.width));
+      const pipHeight = Math.round(pipWidth * (reactionMeta.height / reactionMeta.width));
       
       // Position: top-right corner with 20px padding
       const pipX = targetWidth - pipWidth - 20;
       const pipY = 20;
       
       console.log(`PiP dimensions: ${pipWidth}x${pipHeight}, position: (${pipX}, ${pipY})`);
+      console.log(`Total segment duration: ${totalDuration}s`);
       
-      // Build filter_complex string manually for precise control
+      // Build filter_complex string
+      // Use eof_action=repeat to keep showing last frame if video ends before audio
       const filterComplex = [
         // Scale the frozen frame to target resolution
         `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[bg]`,
         // Scale reaction video to PiP size, maintaining aspect ratio
-        `[1:v]scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,setsar=1[pip]`,
-        // Overlay PiP on frozen frame
-        `[bg][pip]overlay=${pipX}:${pipY}:shortest=1[outv]`
+        // Add loop to ensure video continues if it's shorter than audio
+        `[1:v]scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,setsar=1,loop=loop=-1:size=1:start=0[pip]`,
+        // Overlay PiP on frozen frame - removed shortest=1
+        `[bg][pip]overlay=${pipX}:${pipY}[outv]`
       ].join(';');
       
       console.log('Step 3: Rendering PiP segment...');
@@ -155,7 +194,7 @@ class CombineService {
             '-ar', '44100',
             '-ac', '2',
             '-b:a', '128k',
-            '-t', String(reactionDuration),
+            '-t', String(totalDuration),  // Use max duration
             '-movflags', '+faststart',
             '-y'
           ])
@@ -170,8 +209,15 @@ class CombineService {
           .on('end', async () => {
             // Cleanup last frame
             await fs.remove(lastFramePath).catch(() => {});
-            console.log('PiP segment created successfully');
-            resolve(outputPath);
+            
+            // Verify output was created
+            if (await fs.pathExists(outputPath)) {
+              const stats = await fs.stat(outputPath);
+              console.log(`PiP segment created successfully: ${outputPath} (${stats.size} bytes)`);
+              resolve(outputPath);
+            } else {
+              reject(new Error('PiP segment render completed but output file not found'));
+            }
           })
           .on('error', async (err) => {
             await fs.remove(lastFramePath).catch(() => {});
@@ -243,15 +289,31 @@ class CombineService {
             const pipSegmentPath = path.join(workDir, `pip_segment_${i}.mp4`);
             console.log('Creating PiP segment (frozen frame + reaction overlay)...');
             
-            // Use the NORMALIZED clip for frame extraction (ensures consistent format)
-            await this.createPipSegment(
-              normalizedOriginalPath,  // Use normalized clip for frame extraction
-              reactionPath,
-              pipSegmentPath,
-              targetWidth,
-              targetHeight
-            );
-            processedClips.push(pipSegmentPath);
+            try {
+              // Use the NORMALIZED clip for frame extraction (ensures consistent format)
+              await this.createPipSegment(
+                normalizedOriginalPath,
+                reactionPath,
+                pipSegmentPath,
+                targetWidth,
+                targetHeight
+              );
+              
+              // Verify the PiP segment was created
+              if (await fs.pathExists(pipSegmentPath)) {
+                processedClips.push(pipSegmentPath);
+                console.log(`PiP segment ${i} added to sequence`);
+              } else {
+                console.error(`PiP segment ${i} was not created, skipping`);
+              }
+            } catch (pipError) {
+              console.error(`Error creating PiP segment ${i}:`, pipError.message);
+              console.log('Falling back to sequential mode for this clip');
+              // Fallback: use normalized reaction as sequential
+              const normalizedReactionPath = path.join(workDir, `normalized_reaction_${i}.mp4`);
+              await this.normalizeClip(reactionPath, normalizedReactionPath, targetWidth, targetHeight);
+              processedClips.push(normalizedReactionPath);
+            }
           } else {
             // SEQUENTIAL MODE: Normalize and add full reaction video
             const normalizedReactionPath = path.join(workDir, `normalized_reaction_${i}.mp4`);
@@ -273,6 +335,8 @@ class CombineService {
         .join('\n');
       
       await fs.writeFile(concatFilePath, concatContent);
+      console.log('Concat file contents:');
+      console.log(concatContent);
 
       // Concatenate all clips
       const outputPath = path.join(workDir, 'final_combined.mp4');
