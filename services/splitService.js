@@ -1,248 +1,238 @@
-const ffmpeg = require('fluent-ffmpeg');
+const express = require('express');
+const router = express.Router();
+const splitService = require('../services/splitService');
+const driveService = require('../services/driveService');
 const path = require('path');
 const fs = require('fs-extra');
-const { v4: uuidv4 } = require('uuid');
 
-class SplitService {
-  constructor() {
-    this.outputDir = process.env.OUTPUT_DIR || '/app/outputs';
-    this.tempDir = process.env.TEMP_DIR || '/app/temp';
-  }
+/**
+ * POST /api/split - Split video based on reaction timestamps
+ * Now uploads clips to Google Drive for reliable downloads
+ */
+router.post('/', async (req, res) => {
+  try {
+    const { videoPath, reactions } = req.body;
 
-  /**
-   * Split video at reaction timestamps
-   * Returns individual clips that user can download separately
-   * Clips stay in temp directory for combine feature to use
-   */
-  async splitVideoForReactions(videoPath, reactions) {
-    const jobId = uuidv4();
-    const workDir = path.join(this.tempDir, jobId);
-    const clipsDir = path.join(workDir, 'clips');
-    await fs.ensureDir(clipsDir);
-
-    try {
-      console.log(`Splitting video into clips...`);
-      console.log(`Job ID: ${jobId}`);
-      console.log(`Clips directory: ${clipsDir}`);
-
-      // Sort reactions by timestamp
-      const sortedReactions = reactions.sort((a, b) => a.timestamp - b.timestamp);
-
-      const clips = [];
-      const reactionGuide = [];
-      let currentTime = 0;
-      let clipNumber = 0;
-
-      // Create clips between reactions
-      for (let i = 0; i < sortedReactions.length; i++) {
-        const reaction = sortedReactions[i];
-        const duration = reaction.timestamp - currentTime;
-        
-        // Skip if no actual content before this reaction (duration <= 0.5s)
-        if (duration <= 0.5) {
-          console.log(`Skipping empty/tiny segment: ${currentTime}s to ${reaction.timestamp}s (${duration}s)`);
-          currentTime = reaction.timestamp;
-          
-          // Still add reaction guide entry
-          reactionGuide.push({
-            afterClip: clipNumber > 0 ? clipNumber : 1,
-            timestamp: reaction.timestamp,
-            text: reaction.text,
-            sentiment: reaction.sentiment || 'NEUTRAL'
-          });
-          continue;
-        }
-        
-        clipNumber++;
-        const clipFilename = `clip_${clipNumber}.mp4`;
-        const clipPath = path.join(clipsDir, clipFilename);
-        
-        console.log(`Creating clip ${clipNumber}: ${currentTime}s to ${reaction.timestamp}s (${duration}s)`);
-        
-        await this.extractClip(
-          videoPath,
-          currentTime,
-          reaction.timestamp,
-          clipPath
-        );
-        
-        clips.push({
-          number: clipNumber,
-          path: clipPath,
-          filename: clipFilename,
-          startTime: currentTime,
-          endTime: reaction.timestamp,
-          duration: duration
-        });
-
-        // Add reaction guide
-        reactionGuide.push({
-          afterClip: clipNumber,
-          timestamp: reaction.timestamp,
-          text: reaction.text,
-          sentiment: reaction.sentiment || 'NEUTRAL'
-        });
-
-        currentTime = reaction.timestamp;
-      }
-
-      // Create final clip (after last reaction to end)
-      clipNumber++;
-      const finalClipFilename = `clip_${clipNumber}.mp4`;
-      const finalClipPath = path.join(clipsDir, finalClipFilename);
-      
-      console.log(`Creating final clip ${clipNumber}: ${currentTime}s to end`);
-      
-      await this.extractClip(
-        videoPath,
-        currentTime,
-        999999, // to end
-        finalClipPath
-      );
-
-      clips.push({
-        number: clipNumber,
-        path: finalClipPath,
-        filename: finalClipFilename,
-        startTime: currentTime,
-        endTime: null,
-        duration: null
+    if (!videoPath) {
+      return res.status(400).json({
+        success: false,
+        error: 'videoPath is required'
       });
+    }
 
-      console.log(`✓ Created ${clips.length} clips in ${clipsDir}`);
+    if (!reactions || !Array.isArray(reactions) || reactions.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'reactions array is required'
+      });
+    }
 
-      // Create reactions guide text file
-      const guideText = this.createReactionsGuide(reactionGuide);
-      const guideFilename = 'reactions_guide.txt';
-      const guidePath = path.join(clipsDir, guideFilename);
-      await fs.writeFile(guidePath, guideText);
+    console.log(`\n${'='.repeat(50)}`);
+    console.log('SPLIT VIDEO REQUEST');
+    console.log('='.repeat(50));
+    console.log(`Video: ${videoPath}`);
+    console.log(`Reactions: ${reactions.length}`);
+    console.log(`Google Drive enabled: ${driveService.isConfigured()}`);
 
-      // Build response with download URLs
-      // Clips STAY in temp directory so combine feature can use them
-      const outputClips = clips.map(clip => ({
-        number: clip.number,
-        filename: clip.filename,
-        startTime: clip.startTime,
-        endTime: clip.endTime,
-        duration: clip.duration,
-        downloadUrl: `/api/split/${jobId}/clip/${clip.number}`
+    // Split the video using correct function name
+    const result = await splitService.splitVideoForReactions(videoPath, reactions);
+
+    // If Google Drive is configured, upload clips
+    if (driveService.isConfigured()) {
+      console.log('\nUploading clips to Google Drive...');
+      
+      const clipFiles = result.clips.map((clip) => ({
+        localPath: splitService.getClipPath(result.jobId, clip.number),
+        fileName: `${result.jobId}_clip_${clip.number}.mp4`,
+        mimeType: 'video/mp4'
       }));
 
-      console.log(`Split job ${jobId} complete. Clips available for 24 hours.`);
+      // Upload guide too
+      const guidePath = splitService.getGuidePath(result.jobId);
+      if (await fs.pathExists(guidePath)) {
+        clipFiles.push({
+          localPath: guidePath,
+          fileName: `${result.jobId}_reactions_guide.txt`,
+          mimeType: 'text/plain'
+        });
+      }
 
-      return {
-        jobId,
-        totalClips: clips.length,
-        clips: outputClips,
-        reactionGuide,
-        guideDownloadUrl: `/api/split/${jobId}/guide`,
-        success: true
-      };
+      const uploadResults = await driveService.uploadFiles(clipFiles);
 
-    } catch (error) {
-      console.error('Split video error:', error);
-      // Cleanup on error
-      await fs.remove(workDir).catch(() => {});
-      throw error;
+      // Map upload results back to clips
+      const clipsWithDriveLinks = result.clips.map((clip, index) => {
+        const uploadResult = uploadResults[index];
+        return {
+          ...clip,
+          driveLink: uploadResult?.success ? uploadResult.directLink : null,
+          driveViewLink: uploadResult?.success ? uploadResult.webViewLink : null
+        };
+      });
+
+      // Get guide upload result
+      const guideUpload = uploadResults.find(r => r.fileName.endsWith('.txt'));
+
+      console.log(`\nUpload complete: ${uploadResults.filter(r => r.success).length}/${uploadResults.length} files`);
+
+      res.json({
+        success: true,
+        data: {
+          jobId: result.jobId,
+          totalClips: result.totalClips,
+          clips: clipsWithDriveLinks,
+          reactionGuide: result.reactionGuide,
+          guide: {
+            downloadUrl: result.guideDownloadUrl,
+            driveLink: guideUpload?.success ? guideUpload.directLink : null
+          },
+          storage: 'google_drive'
+        }
+      });
+    } else {
+      // No Google Drive - return local download URLs only
+      console.log('\nGoogle Drive not configured, using local downloads');
+      
+      res.json({
+        success: true,
+        data: {
+          jobId: result.jobId,
+          totalClips: result.totalClips,
+          clips: result.clips,
+          reactionGuide: result.reactionGuide,
+          guide: {
+            downloadUrl: result.guideDownloadUrl
+          },
+          storage: 'local'
+        }
+      });
     }
-    // NO cleanup here - let cleanup service handle it after 24 hours
-  }
 
-  /**
-   * Extract a single clip from video - FAST VERSION with copy codec
-   */
-  extractClip(videoPath, startTime, endTime, outputPath) {
-    return new Promise((resolve, reject) => {
-      const duration = endTime === 999999 ? undefined : endTime - startTime;
-
-      // Skip clips with no duration or very short duration
-      if (duration !== undefined && duration <= 0.5) {
-        console.log(`Skipping very short clip: ${duration}s`);
-        return resolve(outputPath);
-      }
-
-      const command = ffmpeg(videoPath)
-        .setStartTime(startTime);
-
-      // Only set duration if we have a valid one (not going to end of file)
-      if (duration !== undefined && duration > 0) {
-        command.setDuration(duration);
-      }
-
-      command
-        .outputOptions([
-          '-c copy',  // FAST: Just copy streams, don't re-encode!
-          '-avoid_negative_ts make_zero'  // Fix timing issues
-        ])
-        .on('start', cmd => console.log(`Extracting clip: ${startTime}s to ${endTime === 999999 ? 'end' : endTime + 's'}`))
-        .on('end', () => {
-          console.log(`✓ Clip created: ${outputPath}`);
-          resolve(outputPath);
-        })
-        .on('error', (err) => {
-          console.error(`Clip extraction error:`, err);
-          reject(err);
-        })
-        .save(outputPath);
+  } catch (error) {
+    console.error('Split error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
     });
   }
+});
 
-  /**
-   * Create reactions guide text file
-   */
-  createReactionsGuide(reactionGuide) {
-    let guide = '='.repeat(60) + '\n';
-    guide += 'REACTIONS GUIDE FOR CAPCUT\n';
-    guide += '='.repeat(60) + '\n\n';
-    guide += 'Instructions:\n';
-    guide += '1. Import all clips into CapCut in order (clip_1, clip_2, etc.)\n';
-    guide += '2. Record your reaction after each clip using the text below\n';
-    guide += '3. Insert your reaction video between the clips\n';
-    guide += '4. Export your final reaction video!\n\n';
-    guide += '='.repeat(60) + '\n\n';
+/**
+ * GET /api/split/:jobId/clip/:clipNumber - Download individual clip (fallback)
+ */
+router.get('/:jobId/clip/:clipNumber', async (req, res) => {
+  try {
+    const { jobId, clipNumber } = req.params;
+    const clipPath = splitService.getClipPath(jobId, parseInt(clipNumber));
 
-    reactionGuide.forEach((reaction, index) => {
-      guide += `AFTER CLIP ${reaction.afterClip}:\n`;
-      guide += `Timestamp: ${this.formatTimestamp(reaction.timestamp)}\n`;
-      guide += `Sentiment: ${reaction.sentiment}\n`;
-      guide += `\nWhat to say:\n`;
-      guide += `"${reaction.text}"\n\n`;
-      guide += '-'.repeat(60) + '\n\n';
+    if (!await fs.pathExists(clipPath)) {
+      return res.status(404).json({
+        success: false,
+        error: 'Clip not found'
+      });
+    }
+
+    const stats = await fs.stat(clipPath);
+    const fileName = `clip_${clipNumber}.mp4`;
+
+    res.setHeader('Content-Length', stats.size);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+
+    const readStream = fs.createReadStream(clipPath);
+    readStream.pipe(res);
+
+  } catch (error) {
+    console.error('Download error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * GET /api/split/:jobId/guide - Download reactions guide (fallback)
+ */
+router.get('/:jobId/guide', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const guidePath = splitService.getGuidePath(jobId);
+
+    if (!await fs.pathExists(guidePath)) {
+      return res.status(404).json({
+        success: false,
+        error: 'Guide not found'
+      });
+    }
+
+    res.download(guidePath, 'reactions_guide.txt');
+
+  } catch (error) {
+    console.error('Download error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * GET /api/split/:jobId/status - Check job status
+ */
+router.get('/:jobId/status', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const clipsDir = path.join(process.env.TEMP_DIR || '/app/temp', jobId, 'clips');
+
+    if (!await fs.pathExists(clipsDir)) {
+      return res.status(404).json({
+        success: false,
+        error: 'Job not found'
+      });
+    }
+
+    const files = await fs.readdir(clipsDir);
+    const clips = files.filter(f => f.startsWith('clip_') && f.endsWith('.mp4'));
+
+    res.json({
+      success: true,
+      data: {
+        jobId,
+        clipCount: clips.length,
+        clips: clips.sort()
+      }
     });
 
-    guide += '\nTIPS:\n';
-    guide += '• Keep reactions 2-5 seconds for best pacing\n';
-    guide += '• Match your energy to the sentiment (POSITIVE = excited, NEGATIVE = critical)\n';
-    guide += '• Feel free to improvise and add your own personality!\n';
-    guide += '• Use CapCut\'s text overlay feature to add captions if needed\n';
-
-    return guide;
+  } catch (error) {
+    console.error('Status error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
+});
 
-  /**
-   * Format timestamp for display
-   */
-  formatTimestamp(seconds) {
-    const mins = Math.floor(seconds / 60);
-    const secs = Math.floor(seconds % 60);
-    return `${mins}:${secs.toString().padStart(2, '0')}`;
+/**
+ * DELETE /api/split/:jobId - Cleanup job files
+ */
+router.delete('/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const jobDir = path.join(process.env.TEMP_DIR || '/app/temp', jobId);
+    await fs.remove(jobDir);
+
+    res.json({
+      success: true,
+      message: `Job ${jobId} cleaned up`
+    });
+
+  } catch (error) {
+    console.error('Cleanup error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
+});
 
-  /**
-   * Get clip file path by job ID and clip number
-   * Now reads from temp directory
-   */
-  getClipPath(jobId, clipNumber) {
-    return path.join(this.tempDir, jobId, 'clips', `clip_${clipNumber}.mp4`);
-  }
-
-  /**
-   * Get guide file path by job ID
-   * Now reads from temp directory
-   */
-  getGuidePath(jobId) {
-    return path.join(this.tempDir, jobId, 'clips', 'reactions_guide.txt');
-  }
-}
-
-module.exports = new SplitService();
+module.exports = router;
