@@ -4,6 +4,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs-extra');
 const combineService = require('../services/combineService');
+const driveService = require('../services/driveService');
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
@@ -35,7 +36,6 @@ const upload = multer({
 
 /**
  * Extract clip number from filename
- * Handles: "reaction-0.mp4", "a1.mp4", "1.mp4", "clip_1.mp4", etc.
  */
 function extractClipNumber(filename) {
   const match = filename.match(/(\d+)/);
@@ -43,6 +43,32 @@ function extractClipNumber(filename) {
     return parseInt(match[1], 10);
   }
   return null;
+}
+
+/**
+ * Upload result to Google Drive
+ */
+async function uploadToDrive(result) {
+  if (!driveService.isConfigured()) {
+    return { driveLink: null, driveViewLink: null };
+  }
+
+  console.log('\nUploading combined video to Google Drive...');
+  try {
+    const uploadResult = await driveService.uploadFile(
+      result.outputPath,
+      `reaction_video_${result.jobId}.mp4`,
+      'video/mp4'
+    );
+    console.log(`✓ Uploaded to Drive: ${uploadResult.directLink}`);
+    return {
+      driveLink: uploadResult.directLink,
+      driveViewLink: uploadResult.webViewLink
+    };
+  } catch (error) {
+    console.error('Drive upload failed:', error.message);
+    return { driveLink: null, driveViewLink: null };
+  }
 }
 
 /**
@@ -58,6 +84,7 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
     console.log('='.repeat(60));
     console.log(`Split Job ID: ${splitJobId}`);
     console.log(`Mode: ${mode}`);
+    console.log(`Google Drive: ${driveService.isConfigured() ? 'ENABLED' : 'DISABLED'}`);
     
     if (!['sequential', 'pip'].includes(mode)) {
       return res.status(400).json({
@@ -66,7 +93,6 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
       });
     }
     
-    // Get original clips from split job directory
     const splitDir = path.join(process.env.TEMP_DIR || '/app/temp', splitJobId, 'clips');
     
     if (!await fs.pathExists(splitDir)) {
@@ -76,7 +102,6 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
       });
     }
 
-    // Get all clip files sorted by number
     const clipFiles = await fs.readdir(splitDir);
     const originalClipPaths = clipFiles
       .filter(f => f.startsWith('clip_') && f.endsWith('.mp4'))
@@ -99,7 +124,6 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
       console.log(`  Index ${i} (Clip ${i + 1}): ${path.basename(p)}`);
     });
 
-    // Get uploaded reaction files
     const uploadedReactions = req.files || [];
     
     console.log(`\nUPLOADED REACTIONS (${uploadedReactions.length}):`);
@@ -108,7 +132,6 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
       console.log(`  [${i}] originalname: "${f.originalname}" → extracted number: ${clipNum}`);
     });
 
-    // Detect if filenames are 0-indexed or 1-indexed
     const extractedNumbers = uploadedReactions
       .map(f => extractClipNumber(f.originalname))
       .filter(n => n !== null);
@@ -120,23 +143,18 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
     console.log(`  Min number in filenames: ${minNumber}`);
     console.log(`  Indexing style: ${isZeroIndexed ? '0-indexed (0,1,2...)' : '1-indexed (1,2,3...)'}`);
 
-    // Initialize reaction array with nulls
     const reactionClipPaths = new Array(originalClipPaths.length).fill(null);
 
-    // Map reactions to clips based on filename number
     console.log(`\nMAPPING REACTIONS TO CLIPS:`);
     
     uploadedReactions.forEach((file) => {
       const clipNum = extractClipNumber(file.originalname);
       
       if (clipNum !== null) {
-        // Convert to array index based on detected indexing style
         let arrayIndex;
         if (isZeroIndexed) {
-          // 0-indexed: reaction-0 → index 0, reaction-1 → index 1
           arrayIndex = clipNum;
         } else {
-          // 1-indexed: a1 → index 0, a2 → index 1
           arrayIndex = clipNum - 1;
         }
         
@@ -167,9 +185,17 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
       { mode }
     );
 
+    // Upload to Google Drive
+    const { driveLink, driveViewLink } = await uploadToDrive(result);
+
     res.json({
       success: true,
-      data: result
+      data: {
+        ...result,
+        driveLink,
+        driveViewLink,
+        storage: driveLink ? 'google_drive' : 'local'
+      }
     });
 
   } catch (error) {
@@ -236,9 +262,17 @@ router.post('/', upload.fields([
       { mode }
     );
 
+    // Upload to Google Drive
+    const { driveLink, driveViewLink } = await uploadToDrive(result);
+
     res.json({
       success: true,
-      data: result
+      data: {
+        ...result,
+        driveLink,
+        driveViewLink,
+        storage: driveLink ? 'google_drive' : 'local'
+      }
     });
 
   } catch (error) {
@@ -251,7 +285,7 @@ router.post('/', upload.fields([
 });
 
 /**
- * GET /api/combine/:jobId/download
+ * GET /api/combine/:jobId/download - Fallback local download
  */
 router.get('/:jobId/download', async (req, res) => {
   try {
