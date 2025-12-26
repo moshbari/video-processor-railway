@@ -35,7 +35,7 @@ router.post('/', async (req, res) => {
     console.log(`Google Drive enabled: ${driveService.isConfigured()}`);
 
     // Split the video
-    const result = await splitService.splitVideo(videoPath, reactions, existingJobId);
+   const result = await splitService.splitVideoForReactions(videoPath, reactions);
 
     // If Google Drive is configured, upload clips
     if (driveService.isConfigured()) {
