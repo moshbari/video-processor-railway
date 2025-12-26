@@ -43,17 +43,43 @@ class CombineService {
    * Extract the last frame from a video as an image
    */
   async extractLastFrame(videoPath, outputPath) {
+    console.log(`Extracting last frame from: ${videoPath}`);
+    console.log(`Output path: ${outputPath}`);
+    
+    // Verify input exists
+    if (!await fs.pathExists(videoPath)) {
+      throw new Error(`Input video does not exist: ${videoPath}`);
+    }
+    
     const duration = await this.getVideoDuration(videoPath);
-    // Go back 0.1 seconds from end to ensure we get a frame
-    const seekTime = Math.max(0, duration - 0.1);
+    console.log(`Video duration: ${duration}s`);
+    
+    // Go back 0.5 seconds from end to ensure we get a frame
+    const seekTime = Math.max(0, duration - 0.5);
+    console.log(`Seeking to: ${seekTime}s`);
     
     return new Promise((resolve, reject) => {
       ffmpeg(videoPath)
         .seekInput(seekTime)
         .frames(1)
-        .outputOptions(['-q:v', '2'])
-        .on('end', () => resolve(outputPath))
-        .on('error', reject)
+        .outputOptions(['-q:v', '2', '-y'])
+        .on('start', (cmd) => {
+          console.log('Extract frame command:', cmd);
+        })
+        .on('end', async () => {
+          // Verify the file was created
+          if (await fs.pathExists(outputPath)) {
+            const stats = await fs.stat(outputPath);
+            console.log(`Frame extracted successfully: ${outputPath} (${stats.size} bytes)`);
+            resolve(outputPath);
+          } else {
+            reject(new Error(`Frame extraction completed but file not found: ${outputPath}`));
+          }
+        })
+        .on('error', (err) => {
+          console.error('Frame extraction error:', err);
+          reject(err);
+        })
         .save(outputPath);
     });
   }
@@ -69,10 +95,23 @@ class CombineService {
     const lastFramePath = path.join(workDir, `lastframe_${Date.now()}.jpg`);
     
     try {
+      console.log('=== Starting PiP Segment Creation ===');
+      console.log(`Original clip: ${originalClipPath}`);
+      console.log(`Reaction: ${reactionPath}`);
+      console.log(`Output: ${outputPath}`);
+      
       // Extract last frame
+      console.log('Step 1: Extracting last frame...');
       await this.extractLastFrame(originalClipPath, lastFramePath);
       
+      // Double-check the frame exists
+      if (!await fs.pathExists(lastFramePath)) {
+        throw new Error(`Last frame file not found after extraction: ${lastFramePath}`);
+      }
+      console.log('Step 1: Complete - frame extracted');
+      
       // Get reaction video duration and dimensions
+      console.log('Step 2: Getting reaction video info...');
       const reactionDuration = await this.getVideoDuration(reactionPath);
       const reactionDims = await this.getVideoDimensions(reactionPath);
       
@@ -98,6 +137,8 @@ class CombineService {
         `[bg][pip]overlay=${pipX}:${pipY}:shortest=1[outv]`
       ].join(';');
       
+      console.log('Step 3: Rendering PiP segment...');
+      
       return new Promise((resolve, reject) => {
         ffmpeg()
           .input(lastFramePath)
@@ -115,7 +156,8 @@ class CombineService {
             '-ac', '2',
             '-b:a', '128k',
             '-t', String(reactionDuration),
-            '-movflags', '+faststart'
+            '-movflags', '+faststart',
+            '-y'
           ])
           .on('start', (cmd) => {
             console.log('Creating PiP segment with command:', cmd);
@@ -125,14 +167,14 @@ class CombineService {
               console.log(`  PiP rendering: ${Math.round(progress.percent)}%`);
             }
           })
-          .on('end', () => {
+          .on('end', async () => {
             // Cleanup last frame
-            fs.remove(lastFramePath).catch(() => {});
+            await fs.remove(lastFramePath).catch(() => {});
             console.log('PiP segment created successfully');
             resolve(outputPath);
           })
-          .on('error', (err) => {
-            fs.remove(lastFramePath).catch(() => {});
+          .on('error', async (err) => {
+            await fs.remove(lastFramePath).catch(() => {});
             console.error('PiP segment error:', err);
             reject(err);
           })
@@ -141,6 +183,7 @@ class CombineService {
       
     } catch (error) {
       await fs.remove(lastFramePath).catch(() => {});
+      console.error('createPipSegment error:', error);
       throw error;
     }
   }
@@ -184,6 +227,8 @@ class CombineService {
         const reactionPath = reactionClips[i];
         
         console.log(`\n--- Processing clip ${i + 1}/${originalClips.length} ---`);
+        console.log(`Original: ${originalPath}`);
+        console.log(`Reaction: ${reactionPath || 'none'}`);
         
         // Normalize original clip
         const normalizedOriginalPath = path.join(workDir, `normalized_original_${i}.mp4`);
@@ -197,8 +242,10 @@ class CombineService {
             // PiP MODE: Create frozen frame + reaction overlay segment
             const pipSegmentPath = path.join(workDir, `pip_segment_${i}.mp4`);
             console.log('Creating PiP segment (frozen frame + reaction overlay)...');
+            
+            // Use the NORMALIZED clip for frame extraction (ensures consistent format)
             await this.createPipSegment(
-              originalPath,  // Use original to extract last frame
+              normalizedOriginalPath,  // Use normalized clip for frame extraction
               reactionPath,
               pipSegmentPath,
               targetWidth,
@@ -269,7 +316,8 @@ class CombineService {
           '-ar', '44100',
           '-ac', '2',
           '-b:a', '128k',
-          '-movflags', '+faststart'
+          '-movflags', '+faststart',
+          '-y'
         ])
         .on('start', (cmd) => {
           console.log('Normalizing with command:', cmd);
@@ -301,7 +349,8 @@ class CombineService {
         .inputOptions(['-f', 'concat', '-safe', '0'])
         .outputOptions([
           '-c', 'copy',
-          '-movflags', '+faststart'
+          '-movflags', '+faststart',
+          '-y'
         ])
         .on('start', (cmd) => {
           console.log('Concatenating with command:', cmd);
