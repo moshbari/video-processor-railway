@@ -112,7 +112,7 @@ class CombineService {
    * - Reaction video is 35% width, top-right corner
    * - Maintains reaction video aspect ratio
    * - Only reaction audio plays
-   * - Video duration matches the LONGER of video/audio streams
+   * - Reaction VIDEO PLAYS (not frozen)
    */
   async createPipSegment(originalClipPath, reactionPath, outputPath, targetWidth = 1080, targetHeight = 1920) {
     const workDir = path.dirname(outputPath);
@@ -134,7 +134,7 @@ class CombineService {
       }
       console.log('Step 1: Complete - frame extracted');
       
-      // Get reaction video metadata (including separate video/audio durations)
+      // Get reaction video metadata
       console.log('Step 2: Getting reaction video info...');
       const reactionMeta = await this.getVideoMetadata(reactionPath);
       
@@ -165,24 +165,27 @@ class CombineService {
       console.log(`Total segment duration: ${totalDuration}s`);
       
       // Build filter_complex string
-      // Use eof_action=repeat to keep showing last frame if video ends before audio
+      // - Background: frozen frame (looped via -loop 1 input option)
+      // - PiP: reaction video plays normally (NO loop filter!)
+      // - eof_action=repeat: if reaction video ends before audio, show last frame
       const filterComplex = [
         // Scale the frozen frame to target resolution
         `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[bg]`,
-        // Scale reaction video to PiP size, maintaining aspect ratio
-        // Add loop to ensure video continues if it's shorter than audio
-        `[1:v]scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,setsar=1,loop=loop=-1:size=1:start=0[pip]`,
-        // Overlay PiP on frozen frame - removed shortest=1
-        `[bg][pip]overlay=${pipX}:${pipY}[outv]`
+        // Scale reaction video to PiP size - NO LOOP, video plays normally
+        `[1:v]scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,setsar=1[pip]`,
+        // Overlay PiP on frozen frame
+        // eof_action=repeat: if PiP video ends, repeat last frame until audio ends
+        `[bg][pip]overlay=${pipX}:${pipY}:eof_action=repeat[outv]`
       ].join(';');
       
       console.log('Step 3: Rendering PiP segment...');
+      console.log('Filter complex:', filterComplex);
       
       return new Promise((resolve, reject) => {
         ffmpeg()
           .input(lastFramePath)
-          .inputOptions(['-loop', '1'])
-          .input(reactionPath)
+          .inputOptions(['-loop', '1'])  // Loop the background image
+          .input(reactionPath)           // Reaction video plays normally
           .outputOptions([
             '-filter_complex', filterComplex,
             '-map', '[outv]',
@@ -194,7 +197,7 @@ class CombineService {
             '-ar', '44100',
             '-ac', '2',
             '-b:a', '128k',
-            '-t', String(totalDuration),  // Use max duration
+            '-t', String(totalDuration),  // Duration matches audio length
             '-movflags', '+faststart',
             '-y'
           ])
@@ -240,11 +243,6 @@ class CombineService {
    * Supports two modes:
    * - 'sequential' (default): clip1 → reaction1_fullscreen → clip2 → reaction2_fullscreen
    * - 'pip': clip1 → frozen_frame + reaction1_pip → clip2 → frozen_frame + reaction2_pip
-   * 
-   * @param {string[]} originalClips - Array of original clip paths
-   * @param {string[]} reactionClips - Array of reaction clip paths (can have nulls)
-   * @param {string} jobId - Optional job ID
-   * @param {object} options - Options including mode ('sequential' or 'pip')
    */
   async combineClipsWithReactions(originalClips, reactionClips, jobId = null, options = {}) {
     jobId = jobId || uuidv4();
@@ -290,7 +288,6 @@ class CombineService {
             console.log('Creating PiP segment (frozen frame + reaction overlay)...');
             
             try {
-              // Use the NORMALIZED clip for frame extraction (ensures consistent format)
               await this.createPipSegment(
                 normalizedOriginalPath,
                 reactionPath,
@@ -309,7 +306,6 @@ class CombineService {
             } catch (pipError) {
               console.error(`Error creating PiP segment ${i}:`, pipError.message);
               console.log('Falling back to sequential mode for this clip');
-              // Fallback: use normalized reaction as sequential
               const normalizedReactionPath = path.join(workDir, `normalized_reaction_${i}.mp4`);
               await this.normalizeClip(reactionPath, normalizedReactionPath, targetWidth, targetHeight);
               processedClips.push(normalizedReactionPath);
@@ -358,7 +354,6 @@ class CombineService {
 
     } catch (error) {
       console.error('Combine error:', error);
-      // Cleanup on error
       await fs.remove(workDir).catch(() => {});
       throw error;
     }
