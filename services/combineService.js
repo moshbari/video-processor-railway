@@ -88,24 +88,25 @@ class CombineService {
       
       console.log(`PiP dimensions: ${pipWidth}x${pipHeight}, position: (${pipX}, ${pipY})`);
       
+      // Build filter_complex string manually for precise control
+      const filterComplex = [
+        // Scale the frozen frame to target resolution
+        `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[bg]`,
+        // Scale reaction video to PiP size, maintaining aspect ratio
+        `[1:v]scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,setsar=1[pip]`,
+        // Overlay PiP on frozen frame
+        `[bg][pip]overlay=${pipX}:${pipY}:shortest=1[outv]`
+      ].join(';');
+      
       return new Promise((resolve, reject) => {
         ffmpeg()
-          // Input 0: Last frame image (will be looped)
           .input(lastFramePath)
           .inputOptions(['-loop', '1'])
-          // Input 1: Reaction video
           .input(reactionPath)
-          .complexFilter([
-            // Scale the frozen frame to target resolution
-            `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[bg]`,
-            // Scale reaction video to PiP size, maintaining aspect ratio
-            `[1:v]scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,setsar=1[pip]`,
-            // Overlay PiP on frozen frame
-            `[bg][pip]overlay=${pipX}:${pipY}:shortest=1[outv]`
-          ], 'outv')
           .outputOptions([
+            '-filter_complex', filterComplex,
             '-map', '[outv]',
-            '-map', '1:a',  // Use audio from reaction video only
+            '-map', '1:a',
             '-c:v', 'libx264',
             '-preset', 'fast',
             '-crf', '23',
@@ -113,7 +114,7 @@ class CombineService {
             '-ar', '44100',
             '-ac', '2',
             '-b:a', '128k',
-            '-t', String(reactionDuration),  // Match reaction duration
+            '-t', String(reactionDuration),
             '-movflags', '+faststart'
           ])
           .on('start', (cmd) => {
