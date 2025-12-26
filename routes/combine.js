@@ -21,7 +21,7 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   limits: {
-    fileSize: 100 * 1024 * 1024, // 100MB per file
+    fileSize: 100 * 1024 * 1024,
     files: 20
   },
   fileFilter: (req, file, cb) => {
@@ -34,107 +34,32 @@ const upload = multer({
 });
 
 /**
- * POST /api/combine - Combine original clips with reaction clips
- * 
- * Supports two modes:
- * - 'sequential' (default): clip → full reaction → clip → full reaction
- * - 'pip': clip → frozen frame + reaction PiP overlay → clip → ...
- * 
- * Body:
- * - originalClips[]: Array of original clip files (uploaded)
- * - reactionClips[]: Array of reaction clip files (uploaded)
- * - mode: 'sequential' or 'pip' (optional, defaults to 'sequential')
- * 
- * Or JSON body:
- * - originalClipPaths: Array of paths to original clips
- * - reactionClipPaths: Array of paths to reaction clips
- * - mode: 'sequential' or 'pip'
+ * Extract clip number from filename
+ * Handles: "a1.mp4", "1.mp4", "clip_1.mp4", "reaction1.mp4", etc.
+ * Returns 1-indexed number (a1 = 1, a2 = 2, etc.)
  */
-router.post('/', upload.fields([
-  { name: 'originalClips', maxCount: 20 },
-  { name: 'reactionClips', maxCount: 20 }
-]), async (req, res) => {
-  try {
-    let originalClipPaths = [];
-    let reactionClipPaths = [];
-    
-    // Get mode from form data or JSON body
-    const mode = req.body.mode || 'sequential';
-    
-    // Validate mode
-    if (!['sequential', 'pip'].includes(mode)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid mode. Use "sequential" or "pip".'
-      });
-    }
-
-    // Get files from multipart upload
-    if (req.files && req.files.originalClips) {
-      originalClipPaths = req.files.originalClips.map(f => f.path);
-      reactionClipPaths = req.files.reactionClips 
-        ? req.files.reactionClips.map(f => f.path)
-        : [];
-    } 
-    // Or use paths from JSON body
-    else if (req.body.originalClipPaths) {
-      originalClipPaths = JSON.parse(req.body.originalClipPaths);
-      reactionClipPaths = req.body.reactionClipPaths 
-        ? JSON.parse(req.body.reactionClipPaths)
-        : [];
-    }
-    else {
-      return res.status(400).json({
-        success: false,
-        error: 'No clips provided. Upload originalClips[] and reactionClips[] files, or provide originalClipPaths and reactionClipPaths arrays.'
-      });
-    }
-
-    if (originalClipPaths.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'At least one original clip is required'
-      });
-    }
-
-    console.log(`Combining ${originalClipPaths.length} original clips with ${reactionClipPaths.length} reactions (mode: ${mode})`);
-
-    const result = await combineService.combineClipsWithReactions(
-      originalClipPaths,
-      reactionClipPaths,
-      null,
-      { mode }
-    );
-
-    res.json({
-      success: true,
-      data: result
-    });
-
-  } catch (error) {
-    console.error('Combine error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+function extractClipNumber(filename) {
+  const match = filename.match(/(\d+)/);
+  if (match) {
+    return parseInt(match[1], 10);
   }
-});
+  return null;
+}
 
 /**
- * POST /api/combine/from-split/:splitJobId - Combine using clips from a previous split job
- * 
- * Body:
- * - reactionClips[]: Array of reaction clip files (uploaded)
- * - mode: 'sequential' or 'pip' (optional, defaults to 'sequential')
+ * POST /api/combine/from-split/:splitJobId
  */
 router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async (req, res) => {
   try {
     const { splitJobId } = req.params;
-    
-    // Get mode from form data
     const mode = req.body.mode || 'sequential';
     
-    // Validate mode
+    console.log('\n' + '='.repeat(60));
+    console.log('COMBINE FROM SPLIT');
+    console.log('='.repeat(60));
+    console.log(`Split Job ID: ${splitJobId}`);
+    console.log(`Mode: ${mode}`);
+    
     if (!['sequential', 'pip'].includes(mode)) {
       return res.status(400).json({
         success: false,
@@ -170,11 +95,52 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
       });
     }
 
-    // Get uploaded reaction clips
-    const reactionClipPaths = req.files ? 
-      req.files.map(f => f.path) : [];
+    console.log(`\nORIGINAL CLIPS (${originalClipPaths.length}):`);
+    originalClipPaths.forEach((p, i) => {
+      console.log(`  Index ${i} (Clip ${i + 1}): ${path.basename(p)}`);
+    });
 
-    console.log(`Combining ${originalClipPaths.length} clips from split job ${splitJobId} with ${reactionClipPaths.length} reactions (mode: ${mode})`);
+    // Get uploaded reaction files
+    const uploadedReactions = req.files || [];
+    
+    console.log(`\nUPLOADED REACTIONS (${uploadedReactions.length}):`);
+    uploadedReactions.forEach((f, i) => {
+      const clipNum = extractClipNumber(f.originalname);
+      console.log(`  [${i}] originalname: "${f.originalname}" → extracted number: ${clipNum}`);
+    });
+
+    // Initialize reaction array with nulls
+    const reactionClipPaths = new Array(originalClipPaths.length).fill(null);
+
+    // Map reactions to clips based on filename number
+    console.log(`\nMAPPING REACTIONS TO CLIPS:`);
+    
+    uploadedReactions.forEach((file) => {
+      const clipNum = extractClipNumber(file.originalname);
+      
+      if (clipNum !== null) {
+        // clipNum is 1-indexed (a1 = clip 1), array is 0-indexed
+        const arrayIndex = clipNum - 1;
+        
+        if (arrayIndex >= 0 && arrayIndex < originalClipPaths.length) {
+          reactionClipPaths[arrayIndex] = file.path;
+          console.log(`  ✓ "${file.originalname}" (number ${clipNum}) → Clip ${clipNum} (index ${arrayIndex})`);
+        } else {
+          console.log(`  ✗ "${file.originalname}" (number ${clipNum}) → OUT OF RANGE (max: ${originalClipPaths.length})`);
+        }
+      } else {
+        console.log(`  ✗ "${file.originalname}" → NO NUMBER FOUND`);
+      }
+    });
+
+    console.log(`\nFINAL MAPPING:`);
+    console.log('-'.repeat(50));
+    for (let i = 0; i < originalClipPaths.length; i++) {
+      const origName = path.basename(originalClipPaths[i]);
+      const reactName = reactionClipPaths[i] ? path.basename(reactionClipPaths[i]) : '(none)';
+      console.log(`  Clip ${i + 1} [${origName}] ← Reaction: ${reactName}`);
+    }
+    console.log('-'.repeat(50));
 
     const result = await combineService.combineClipsWithReactions(
       originalClipPaths,
@@ -198,7 +164,76 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
 });
 
 /**
- * GET /api/combine/:jobId/download - Download the combined video
+ * POST /api/combine - Direct combine with uploaded clips
+ */
+router.post('/', upload.fields([
+  { name: 'originalClips', maxCount: 20 },
+  { name: 'reactionClips', maxCount: 20 }
+]), async (req, res) => {
+  try {
+    let originalClipPaths = [];
+    let reactionClipPaths = [];
+    
+    const mode = req.body.mode || 'sequential';
+    
+    if (!['sequential', 'pip'].includes(mode)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid mode. Use "sequential" or "pip".'
+      });
+    }
+
+    if (req.files && req.files.originalClips) {
+      originalClipPaths = req.files.originalClips.map(f => f.path);
+      reactionClipPaths = req.files.reactionClips 
+        ? req.files.reactionClips.map(f => f.path)
+        : [];
+    } 
+    else if (req.body.originalClipPaths) {
+      originalClipPaths = JSON.parse(req.body.originalClipPaths);
+      reactionClipPaths = req.body.reactionClipPaths 
+        ? JSON.parse(req.body.reactionClipPaths)
+        : [];
+    }
+    else {
+      return res.status(400).json({
+        success: false,
+        error: 'No clips provided.'
+      });
+    }
+
+    if (originalClipPaths.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'At least one original clip is required'
+      });
+    }
+
+    console.log(`Combining ${originalClipPaths.length} clips with ${reactionClipPaths.length} reactions (mode: ${mode})`);
+
+    const result = await combineService.combineClipsWithReactions(
+      originalClipPaths,
+      reactionClipPaths,
+      null,
+      { mode }
+    );
+
+    res.json({
+      success: true,
+      data: result
+    });
+
+  } catch (error) {
+    console.error('Combine error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * GET /api/combine/:jobId/download
  */
 router.get('/:jobId/download', async (req, res) => {
   try {
@@ -231,7 +266,7 @@ router.get('/:jobId/download', async (req, res) => {
 });
 
 /**
- * DELETE /api/combine/:jobId - Cleanup job files
+ * DELETE /api/combine/:jobId
  */
 router.delete('/:jobId', async (req, res) => {
   try {
