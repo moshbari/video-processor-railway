@@ -7,11 +7,10 @@ const fs = require('fs-extra');
 
 /**
  * POST /api/split - Split video based on reaction timestamps
- * Now uploads clips to Google Drive for reliable downloads
  */
 router.post('/', async (req, res) => {
   try {
-    const { videoPath, reactions, jobId: existingJobId } = req.body;
+    const { videoPath, reactions } = req.body;
 
     if (!videoPath) {
       return res.status(400).json({
@@ -35,26 +34,43 @@ router.post('/', async (req, res) => {
     console.log(`Google Drive enabled: ${driveService.isConfigured()}`);
 
     // Split the video
-   const result = await splitService.splitVideoForReactions(videoPath, reactions);
+    const result = await splitService.splitVideoForReactions(videoPath, reactions);
 
     // If Google Drive is configured, upload clips
     if (driveService.isConfigured()) {
       console.log('\nUploading clips to Google Drive...');
       
-      const clipFiles = result.clips.map((clip, index) => ({
-        localPath: clip.path,
-        fileName: `${result.jobId}_clip_${index + 1}.mp4`,
-        mimeType: 'video/mp4'
-      }));
+      const clipFiles = [];
+      
+      // Build clip file list with verified paths
+      for (const clip of result.clips) {
+        const clipPath = splitService.getClipPath(result.jobId, clip.number);
+        console.log(`Clip ${clip.number} path: ${clipPath}`);
+        
+        if (await fs.pathExists(clipPath)) {
+          clipFiles.push({
+            localPath: clipPath,
+            fileName: `${result.jobId}_clip_${clip.number}.mp4`,
+            mimeType: 'video/mp4'
+          });
+        } else {
+          console.error(`Clip file not found: ${clipPath}`);
+        }
+      }
 
       // Upload guide too
-      if (result.guidePath && await fs.pathExists(result.guidePath)) {
+      const guidePath = splitService.getGuidePath(result.jobId);
+      console.log(`Guide path: ${guidePath}`);
+      
+      if (await fs.pathExists(guidePath)) {
         clipFiles.push({
-          localPath: result.guidePath,
+          localPath: guidePath,
           fileName: `${result.jobId}_reactions_guide.txt`,
           mimeType: 'text/plain'
         });
       }
+
+      console.log(`Files to upload: ${clipFiles.length}`);
 
       const uploadResults = await driveService.uploadFiles(clipFiles);
 
@@ -64,8 +80,7 @@ router.post('/', async (req, res) => {
         return {
           ...clip,
           driveLink: uploadResult?.success ? uploadResult.directLink : null,
-          driveViewLink: uploadResult?.success ? uploadResult.webViewLink : null,
-          driveFileId: uploadResult?.success ? uploadResult.fileId : null
+          driveViewLink: uploadResult?.success ? uploadResult.webViewLink : null
         };
       });
 
@@ -78,19 +93,11 @@ router.post('/', async (req, res) => {
         success: true,
         data: {
           jobId: result.jobId,
-          clipCount: result.clips.length,
-          clips: clipsWithDriveLinks.map((clip, index) => ({
-            index: index + 1,
-            duration: clip.duration,
-            reaction: clip.reaction,
-            // Local download (fallback)
-            downloadUrl: `/api/split/${result.jobId}/clip/${index + 1}`,
-            // Google Drive download (preferred)
-            driveLink: clip.driveLink,
-            driveViewLink: clip.driveViewLink
-          })),
+          totalClips: result.totalClips,
+          clips: clipsWithDriveLinks,
+          reactionGuide: result.reactionGuide,
           guide: {
-            downloadUrl: `/api/split/${result.jobId}/guide`,
+            downloadUrl: result.guideDownloadUrl,
             driveLink: guideUpload?.success ? guideUpload.directLink : null
           },
           storage: 'google_drive'
@@ -104,15 +111,11 @@ router.post('/', async (req, res) => {
         success: true,
         data: {
           jobId: result.jobId,
-          clipCount: result.clips.length,
-          clips: result.clips.map((clip, index) => ({
-            index: index + 1,
-            duration: clip.duration,
-            reaction: clip.reaction,
-            downloadUrl: `/api/split/${result.jobId}/clip/${index + 1}`
-          })),
+          totalClips: result.totalClips,
+          clips: result.clips,
+          reactionGuide: result.reactionGuide,
           guide: {
-            downloadUrl: `/api/split/${result.jobId}/guide`
+            downloadUrl: result.guideDownloadUrl
           },
           storage: 'local'
         }
@@ -129,7 +132,7 @@ router.post('/', async (req, res) => {
 });
 
 /**
- * GET /api/split/:jobId/clip/:clipNumber - Download individual clip (fallback)
+ * GET /api/split/:jobId/clip/:clipNumber - Download individual clip
  */
 router.get('/:jobId/clip/:clipNumber', async (req, res) => {
   try {
@@ -163,7 +166,7 @@ router.get('/:jobId/clip/:clipNumber', async (req, res) => {
 });
 
 /**
- * GET /api/split/:jobId/guide - Download reactions guide (fallback)
+ * GET /api/split/:jobId/guide - Download reactions guide
  */
 router.get('/:jobId/guide', async (req, res) => {
   try {
@@ -230,7 +233,8 @@ router.get('/:jobId/status', async (req, res) => {
 router.delete('/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
-    await splitService.cleanup(jobId);
+    const jobDir = path.join(process.env.TEMP_DIR || '/app/temp', jobId);
+    await fs.remove(jobDir);
 
     res.json({
       success: true,
