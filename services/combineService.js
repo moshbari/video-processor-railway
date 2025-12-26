@@ -10,74 +10,234 @@ class CombineService {
   }
 
   /**
-   * Combine original clips with reaction clips in "watch then react" format
-   * Sequence: clip1 → reaction1 → clip2 → reaction2 → ...
+   * Get video duration using ffprobe
    */
-  async combineClipsWithReactions(originalClips, reactionClips, jobId = null) {
+  async getVideoDuration(videoPath) {
+    return new Promise((resolve, reject) => {
+      ffmpeg.ffprobe(videoPath, (err, metadata) => {
+        if (err) reject(err);
+        else resolve(metadata.format.duration);
+      });
+    });
+  }
+
+  /**
+   * Get video dimensions using ffprobe
+   */
+  async getVideoDimensions(videoPath) {
+    return new Promise((resolve, reject) => {
+      ffmpeg.ffprobe(videoPath, (err, metadata) => {
+        if (err) reject(err);
+        else {
+          const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+          resolve({
+            width: videoStream.width,
+            height: videoStream.height
+          });
+        }
+      });
+    });
+  }
+
+  /**
+   * Extract the last frame from a video as an image
+   */
+  async extractLastFrame(videoPath, outputPath) {
+    const duration = await this.getVideoDuration(videoPath);
+    // Go back 0.1 seconds from end to ensure we get a frame
+    const seekTime = Math.max(0, duration - 0.1);
+    
+    return new Promise((resolve, reject) => {
+      ffmpeg(videoPath)
+        .seekInput(seekTime)
+        .frames(1)
+        .outputOptions(['-q:v', '2'])
+        .on('end', () => resolve(outputPath))
+        .on('error', reject)
+        .save(outputPath);
+    });
+  }
+
+  /**
+   * Create PiP segment: frozen last frame with reaction overlay
+   * - Reaction video is 35% width, top-right corner
+   * - Maintains reaction video aspect ratio
+   * - Only reaction audio plays
+   */
+  async createPipSegment(originalClipPath, reactionPath, outputPath, targetWidth = 1080, targetHeight = 1920) {
+    const workDir = path.dirname(outputPath);
+    const lastFramePath = path.join(workDir, `lastframe_${Date.now()}.jpg`);
+    
+    try {
+      // Extract last frame
+      await this.extractLastFrame(originalClipPath, lastFramePath);
+      
+      // Get reaction video duration and dimensions
+      const reactionDuration = await this.getVideoDuration(reactionPath);
+      const reactionDims = await this.getVideoDimensions(reactionPath);
+      
+      console.log(`Creating PiP segment: ${reactionDuration.toFixed(2)}s, reaction dims: ${reactionDims.width}x${reactionDims.height}`);
+      
+      // Calculate PiP size (35% of target width, maintain aspect ratio)
+      const pipWidth = Math.round(targetWidth * 0.35);
+      const pipHeight = Math.round(pipWidth * (reactionDims.height / reactionDims.width));
+      
+      // Position: top-right corner with 20px padding
+      const pipX = targetWidth - pipWidth - 20;
+      const pipY = 20;
+      
+      console.log(`PiP dimensions: ${pipWidth}x${pipHeight}, position: (${pipX}, ${pipY})`);
+      
+      return new Promise((resolve, reject) => {
+        ffmpeg()
+          // Input 0: Last frame image (will be looped)
+          .input(lastFramePath)
+          .inputOptions(['-loop', '1'])
+          // Input 1: Reaction video
+          .input(reactionPath)
+          .complexFilter([
+            // Scale the frozen frame to target resolution
+            `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[bg]`,
+            // Scale reaction video to PiP size, maintaining aspect ratio
+            `[1:v]scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,setsar=1[pip]`,
+            // Overlay PiP on frozen frame
+            `[bg][pip]overlay=${pipX}:${pipY}:shortest=1[outv]`
+          ], 'outv')
+          .outputOptions([
+            '-map', '[outv]',
+            '-map', '1:a',  // Use audio from reaction video only
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-ar', '44100',
+            '-ac', '2',
+            '-b:a', '128k',
+            '-t', String(reactionDuration),  // Match reaction duration
+            '-movflags', '+faststart'
+          ])
+          .on('start', (cmd) => {
+            console.log('Creating PiP segment with command:', cmd);
+          })
+          .on('progress', (progress) => {
+            if (progress.percent) {
+              console.log(`  PiP rendering: ${Math.round(progress.percent)}%`);
+            }
+          })
+          .on('end', () => {
+            // Cleanup last frame
+            fs.remove(lastFramePath).catch(() => {});
+            console.log('PiP segment created successfully');
+            resolve(outputPath);
+          })
+          .on('error', (err) => {
+            fs.remove(lastFramePath).catch(() => {});
+            console.error('PiP segment error:', err);
+            reject(err);
+          })
+          .save(outputPath);
+      });
+      
+    } catch (error) {
+      await fs.remove(lastFramePath).catch(() => {});
+      throw error;
+    }
+  }
+
+  /**
+   * Combine original clips with reaction clips
+   * 
+   * Supports two modes:
+   * - 'sequential' (default): clip1 → reaction1_fullscreen → clip2 → reaction2_fullscreen
+   * - 'pip': clip1 → frozen_frame + reaction1_pip → clip2 → frozen_frame + reaction2_pip
+   * 
+   * @param {string[]} originalClips - Array of original clip paths
+   * @param {string[]} reactionClips - Array of reaction clip paths (can have nulls)
+   * @param {string} jobId - Optional job ID
+   * @param {object} options - Options including mode ('sequential' or 'pip')
+   */
+  async combineClipsWithReactions(originalClips, reactionClips, jobId = null, options = {}) {
     jobId = jobId || uuidv4();
     const workDir = path.join(this.tempDir, jobId);
     await fs.ensureDir(workDir);
 
+    // Mode: 'sequential' (original) or 'pip' (new)
+    const mode = options.mode || 'sequential';
+    
+    // Target resolution (default 1080x1920 for vertical/portrait)
+    const targetWidth = options.targetWidth || 1080;
+    const targetHeight = options.targetHeight || 1920;
+
+    console.log(`\n========================================`);
+    console.log(`Combine Mode: ${mode.toUpperCase()}`);
+    console.log(`========================================\n`);
+
     try {
       console.log(`Combining ${originalClips.length} clips with ${reactionClips.length} reactions...`);
+      console.log(`Target resolution: ${targetWidth}x${targetHeight}`);
 
-      // Build the sequence of clips
-      const clipSequence = [];
+      const processedClips = [];
       
       for (let i = 0; i < originalClips.length; i++) {
-        // Add original clip
-        clipSequence.push(originalClips[i]);
+        const originalPath = originalClips[i];
+        const reactionPath = reactionClips[i];
         
-        // Add reaction clip if exists for this position
-        if (reactionClips[i]) {
-          clipSequence.push(reactionClips[i]);
+        console.log(`\n--- Processing clip ${i + 1}/${originalClips.length} ---`);
+        
+        // Normalize original clip
+        const normalizedOriginalPath = path.join(workDir, `normalized_original_${i}.mp4`);
+        console.log('Normalizing original clip...');
+        await this.normalizeClip(originalPath, normalizedOriginalPath, targetWidth, targetHeight);
+        processedClips.push(normalizedOriginalPath);
+        
+        // Process reaction if exists
+        if (reactionPath && await fs.pathExists(reactionPath)) {
+          if (mode === 'pip') {
+            // PiP MODE: Create frozen frame + reaction overlay segment
+            const pipSegmentPath = path.join(workDir, `pip_segment_${i}.mp4`);
+            console.log('Creating PiP segment (frozen frame + reaction overlay)...');
+            await this.createPipSegment(
+              originalPath,  // Use original to extract last frame
+              reactionPath,
+              pipSegmentPath,
+              targetWidth,
+              targetHeight
+            );
+            processedClips.push(pipSegmentPath);
+          } else {
+            // SEQUENTIAL MODE: Normalize and add full reaction video
+            const normalizedReactionPath = path.join(workDir, `normalized_reaction_${i}.mp4`);
+            console.log('Normalizing reaction clip (sequential mode)...');
+            await this.normalizeClip(reactionPath, normalizedReactionPath, targetWidth, targetHeight);
+            processedClips.push(normalizedReactionPath);
+          }
+        } else {
+          console.log('No reaction for this clip, skipping reaction segment');
         }
       }
 
-      console.log(`Total clips in sequence: ${clipSequence.length}`);
+      console.log(`\nTotal segments to concatenate: ${processedClips.length}`);
 
-      // Create concat file for FFmpeg
+      // Create concat file
       const concatFilePath = path.join(workDir, 'concat.txt');
-      const concatContent = clipSequence
+      const concatContent = processedClips
         .map(clipPath => `file '${clipPath}'`)
         .join('\n');
       
       await fs.writeFile(concatFilePath, concatContent);
-      console.log('Concat file created:', concatFilePath);
 
-      // First, we need to normalize all clips to same format
-      const normalizedClips = [];
-      
-      for (let i = 0; i < clipSequence.length; i++) {
-        const inputPath = clipSequence[i];
-        const normalizedPath = path.join(workDir, `normalized_${i}.mp4`);
-        
-        console.log(`Normalizing clip ${i + 1}/${clipSequence.length}...`);
-        
-        await this.normalizeClip(inputPath, normalizedPath);
-        normalizedClips.push(normalizedPath);
-      }
-
-      // Create new concat file with normalized clips
-      const normalizedConcatPath = path.join(workDir, 'concat_normalized.txt');
-      const normalizedConcatContent = normalizedClips
-        .map(clipPath => `file '${clipPath}'`)
-        .join('\n');
-      
-      await fs.writeFile(normalizedConcatPath, normalizedConcatContent);
-
-      // Combine all normalized clips
+      // Concatenate all clips
       const outputPath = path.join(workDir, 'final_combined.mp4');
-      
-      await this.concatenateClips(normalizedConcatPath, outputPath);
+      await this.concatenateClips(concatFilePath, outputPath);
 
       // Get file info
       const stats = await fs.stat(outputPath);
 
       return {
         jobId,
+        mode,
         outputPath,
-        clipCount: clipSequence.length,
+        segmentCount: processedClips.length,
         originalCount: originalClips.length,
         reactionCount: reactionClips.filter(c => c).length,
         fileSize: stats.size,
@@ -94,16 +254,12 @@ class CombineService {
 
   /**
    * Normalize a clip to consistent format for concatenation
-   * - 1080p resolution (or scale down if larger)
-   * - 30fps
-   * - AAC audio
-   * - H.264 video
    */
-  async normalizeClip(inputPath, outputPath) {
+  async normalizeClip(inputPath, outputPath, targetWidth = 1080, targetHeight = 1920) {
     return new Promise((resolve, reject) => {
       ffmpeg(inputPath)
         .outputOptions([
-          '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
+          '-vf', `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
           '-r', '30',
           '-c:v', 'libx264',
           '-preset', 'fast',
