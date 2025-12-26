@@ -35,8 +35,7 @@ const upload = multer({
 
 /**
  * Extract clip number from filename
- * Handles: "a1.mp4", "1.mp4", "clip_1.mp4", "reaction1.mp4", etc.
- * Returns 1-indexed number (a1 = 1, a2 = 2, etc.)
+ * Handles: "reaction-0.mp4", "a1.mp4", "1.mp4", "clip_1.mp4", etc.
  */
 function extractClipNumber(filename) {
   const match = filename.match(/(\d+)/);
@@ -109,6 +108,18 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
       console.log(`  [${i}] originalname: "${f.originalname}" → extracted number: ${clipNum}`);
     });
 
+    // Detect if filenames are 0-indexed or 1-indexed
+    const extractedNumbers = uploadedReactions
+      .map(f => extractClipNumber(f.originalname))
+      .filter(n => n !== null);
+    
+    const minNumber = extractedNumbers.length > 0 ? Math.min(...extractedNumbers) : 1;
+    const isZeroIndexed = minNumber === 0;
+    
+    console.log(`\nDETECTED INDEXING:`);
+    console.log(`  Min number in filenames: ${minNumber}`);
+    console.log(`  Indexing style: ${isZeroIndexed ? '0-indexed (0,1,2...)' : '1-indexed (1,2,3...)'}`);
+
     // Initialize reaction array with nulls
     const reactionClipPaths = new Array(originalClipPaths.length).fill(null);
 
@@ -119,14 +130,21 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
       const clipNum = extractClipNumber(file.originalname);
       
       if (clipNum !== null) {
-        // clipNum is 1-indexed (a1 = clip 1), array is 0-indexed
-        const arrayIndex = clipNum - 1;
+        // Convert to array index based on detected indexing style
+        let arrayIndex;
+        if (isZeroIndexed) {
+          // 0-indexed: reaction-0 → index 0, reaction-1 → index 1
+          arrayIndex = clipNum;
+        } else {
+          // 1-indexed: a1 → index 0, a2 → index 1
+          arrayIndex = clipNum - 1;
+        }
         
         if (arrayIndex >= 0 && arrayIndex < originalClipPaths.length) {
           reactionClipPaths[arrayIndex] = file.path;
-          console.log(`  ✓ "${file.originalname}" (number ${clipNum}) → Clip ${clipNum} (index ${arrayIndex})`);
+          console.log(`  ✓ "${file.originalname}" (number ${clipNum}) → Clip ${arrayIndex + 1} (index ${arrayIndex})`);
         } else {
-          console.log(`  ✗ "${file.originalname}" (number ${clipNum}) → OUT OF RANGE (max: ${originalClipPaths.length})`);
+          console.log(`  ✗ "${file.originalname}" (number ${clipNum}) → OUT OF RANGE (index ${arrayIndex}, max: ${originalClipPaths.length - 1})`);
         }
       } else {
         console.log(`  ✗ "${file.originalname}" → NO NUMBER FOUND`);
