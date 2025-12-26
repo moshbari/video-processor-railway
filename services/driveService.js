@@ -16,14 +16,22 @@ class DriveService {
     if (this.initialized) return;
 
     try {
-      if (!process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
+      let credentialsJson = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+      
+      if (!credentialsJson) {
         throw new Error('GOOGLE_SERVICE_ACCOUNT_KEY not set');
       }
       if (!this.folderId) {
         throw new Error('GOOGLE_DRIVE_FOLDER_ID not set');
       }
 
-      const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
+      // Check if credentials are Base64 encoded
+      if (process.env.GOOGLE_SERVICE_ACCOUNT_BASE64 === 'true') {
+        console.log('Decoding Base64 credentials...');
+        credentialsJson = Buffer.from(credentialsJson, 'base64').toString('utf-8');
+      }
+
+      const credentials = JSON.parse(credentialsJson);
       
       const auth = new google.auth.GoogleAuth({
         credentials,
@@ -41,10 +49,6 @@ class DriveService {
 
   /**
    * Upload a file to Google Drive
-   * @param {string} filePath - Local file path
-   * @param {string} fileName - Name for the file in Drive
-   * @param {string} mimeType - File MIME type
-   * @returns {object} - { fileId, webViewLink, webContentLink }
    */
   async uploadFile(filePath, fileName, mimeType = 'video/mp4') {
     await this.init();
@@ -94,8 +98,6 @@ class DriveService {
 
   /**
    * Upload multiple files to Google Drive
-   * @param {Array} files - Array of { localPath, fileName, mimeType }
-   * @returns {Array} - Array of upload results
    */
   async uploadFiles(files) {
     await this.init();
@@ -130,8 +132,6 @@ class DriveService {
 
   /**
    * Create a subfolder in the main folder
-   * @param {string} folderName - Name of the subfolder
-   * @returns {string} - Folder ID
    */
   async createSubfolder(folderName) {
     await this.init();
@@ -153,7 +153,6 @@ class DriveService {
 
   /**
    * Delete a file from Google Drive
-   * @param {string} fileId - Google Drive file ID
    */
   async deleteFile(fileId) {
     await this.init();
