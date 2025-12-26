@@ -1,33 +1,30 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
-const combineService = require('../services/combineService');
 const path = require('path');
 const fs = require('fs-extra');
-const { v4: uuidv4 } = require('uuid');
+const combineService = require('../services/combineService');
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
   destination: async (req, file, cb) => {
-    const uploadDir = path.join(process.env.TEMP_DIR || '/app/temp', 'uploads', uuidv4());
+    const uploadDir = path.join(process.env.TEMP_DIR || '/app/temp', 'uploads');
     await fs.ensureDir(uploadDir);
     cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
-    // Keep original filename with sanitization
-    const sanitized = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
-    cb(null, sanitized);
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, uniqueSuffix + '-' + file.originalname);
   }
 });
 
 const upload = multer({
   storage,
   limits: {
-    fileSize: 100 * 1024 * 1024, // 100MB max per file
-    files: 20 // Max 20 files
+    fileSize: 100 * 1024 * 1024, // 100MB per file
+    files: 20
   },
   fileFilter: (req, file, cb) => {
-    // Accept video files only
     if (file.mimetype.startsWith('video/')) {
       cb(null, true);
     } else {
@@ -39,13 +36,19 @@ const upload = multer({
 /**
  * POST /api/combine - Combine original clips with reaction clips
  * 
- * Expects multipart form data:
- * - originalClips[]: Array of original clip files (in order)
- * - reactionClips[]: Array of reaction clip files (in order, matching originalClips)
+ * Supports two modes:
+ * - 'sequential' (default): clip → full reaction → clip → full reaction
+ * - 'pip': clip → frozen frame + reaction PiP overlay → clip → ...
  * 
- * OR JSON body with paths:
- * - originalClipPaths: Array of paths to original clips on server
- * - reactionClipPaths: Array of paths to reaction clips on server
+ * Body:
+ * - originalClips[]: Array of original clip files (uploaded)
+ * - reactionClips[]: Array of reaction clip files (uploaded)
+ * - mode: 'sequential' or 'pip' (optional, defaults to 'sequential')
+ * 
+ * Or JSON body:
+ * - originalClipPaths: Array of paths to original clips
+ * - reactionClipPaths: Array of paths to reaction clips
+ * - mode: 'sequential' or 'pip'
  */
 router.post('/', upload.fields([
   { name: 'originalClips', maxCount: 20 },
@@ -54,8 +57,19 @@ router.post('/', upload.fields([
   try {
     let originalClipPaths = [];
     let reactionClipPaths = [];
+    
+    // Get mode from form data or JSON body
+    const mode = req.body.mode || 'sequential';
+    
+    // Validate mode
+    if (!['sequential', 'pip'].includes(mode)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid mode. Use "sequential" or "pip".'
+      });
+    }
 
-    // Check if files were uploaded
+    // Get files from multipart upload
     if (req.files && req.files.originalClips) {
       originalClipPaths = req.files.originalClips.map(f => f.path);
       reactionClipPaths = req.files.reactionClips 
@@ -83,11 +97,13 @@ router.post('/', upload.fields([
       });
     }
 
-    console.log(`Combining ${originalClipPaths.length} original clips with ${reactionClipPaths.length} reactions`);
+    console.log(`Combining ${originalClipPaths.length} original clips with ${reactionClipPaths.length} reactions (mode: ${mode})`);
 
     const result = await combineService.combineClipsWithReactions(
       originalClipPaths,
-      reactionClipPaths
+      reactionClipPaths,
+      null,
+      { mode }
     );
 
     res.json({
@@ -109,10 +125,22 @@ router.post('/', upload.fields([
  * 
  * Body:
  * - reactionClips[]: Array of reaction clip files (uploaded)
+ * - mode: 'sequential' or 'pip' (optional, defaults to 'sequential')
  */
 router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async (req, res) => {
   try {
     const { splitJobId } = req.params;
+    
+    // Get mode from form data
+    const mode = req.body.mode || 'sequential';
+    
+    // Validate mode
+    if (!['sequential', 'pip'].includes(mode)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid mode. Use "sequential" or "pip".'
+      });
+    }
     
     // Get original clips from split job directory
     const splitDir = path.join(process.env.TEMP_DIR || '/app/temp', splitJobId, 'clips');
@@ -143,13 +171,16 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
     }
 
     // Get uploaded reaction clips
-    const reactionClipPaths = req.files ? req.files.map(f => f.path) : [];
+    const reactionClipPaths = req.files ? 
+      req.files.map(f => f.path) : [];
 
-    console.log(`Combining ${originalClipPaths.length} clips from split job ${splitJobId} with ${reactionClipPaths.length} reactions`);
+    console.log(`Combining ${originalClipPaths.length} clips from split job ${splitJobId} with ${reactionClipPaths.length} reactions (mode: ${mode})`);
 
     const result = await combineService.combineClipsWithReactions(
       originalClipPaths,
-      reactionClipPaths
+      reactionClipPaths,
+      null,
+      { mode }
     );
 
     res.json({
