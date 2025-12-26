@@ -1,238 +1,199 @@
-const express = require('express');
-const router = express.Router();
-const splitService = require('../services/splitService');
-const driveService = require('../services/driveService');
+const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs-extra');
+const { v4: uuidv4 } = require('uuid');
 
-/**
- * POST /api/split - Split video based on reaction timestamps
- * Now uploads clips to Google Drive for reliable downloads
- */
-router.post('/', async (req, res) => {
-  try {
-    const { videoPath, reactions } = req.body;
+class SplitService {
+  constructor() {
+    this.outputDir = process.env.OUTPUT_DIR || '/app/outputs';
+    this.tempDir = process.env.TEMP_DIR || '/app/temp';
+  }
 
-    if (!videoPath) {
-      return res.status(400).json({
-        success: false,
-        error: 'videoPath is required'
-      });
-    }
+  async splitVideoForReactions(videoPath, reactions) {
+    const jobId = uuidv4();
+    const workDir = path.join(this.tempDir, jobId);
+    const clipsDir = path.join(workDir, 'clips');
+    await fs.ensureDir(clipsDir);
 
-    if (!reactions || !Array.isArray(reactions) || reactions.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'reactions array is required'
-      });
-    }
+    try {
+      console.log(`Splitting video into clips...`);
+      console.log(`Job ID: ${jobId}`);
+      console.log(`Clips directory: ${clipsDir}`);
 
-    console.log(`\n${'='.repeat(50)}`);
-    console.log('SPLIT VIDEO REQUEST');
-    console.log('='.repeat(50));
-    console.log(`Video: ${videoPath}`);
-    console.log(`Reactions: ${reactions.length}`);
-    console.log(`Google Drive enabled: ${driveService.isConfigured()}`);
+      const sortedReactions = reactions.sort((a, b) => a.timestamp - b.timestamp);
 
-    // Split the video using correct function name
-    const result = await splitService.splitVideoForReactions(videoPath, reactions);
+      const clips = [];
+      const reactionGuide = [];
+      let currentTime = 0;
+      let clipNumber = 0;
 
-    // If Google Drive is configured, upload clips
-    if (driveService.isConfigured()) {
-      console.log('\nUploading clips to Google Drive...');
+      for (let i = 0; i < sortedReactions.length; i++) {
+        const reaction = sortedReactions[i];
+        const duration = reaction.timestamp - currentTime;
+        
+        if (duration <= 0.5) {
+          console.log(`Skipping empty/tiny segment: ${currentTime}s to ${reaction.timestamp}s (${duration}s)`);
+          currentTime = reaction.timestamp;
+          
+          reactionGuide.push({
+            afterClip: clipNumber > 0 ? clipNumber : 1,
+            timestamp: reaction.timestamp,
+            text: reaction.text,
+            sentiment: reaction.sentiment || 'NEUTRAL'
+          });
+          continue;
+        }
+        
+        clipNumber++;
+        const clipFilename = `clip_${clipNumber}.mp4`;
+        const clipPath = path.join(clipsDir, clipFilename);
+        
+        console.log(`Creating clip ${clipNumber}: ${currentTime}s to ${reaction.timestamp}s (${duration}s)`);
+        
+        await this.extractClip(videoPath, currentTime, reaction.timestamp, clipPath);
+        
+        clips.push({
+          number: clipNumber,
+          path: clipPath,
+          filename: clipFilename,
+          startTime: currentTime,
+          endTime: reaction.timestamp,
+          duration: duration
+        });
+
+        reactionGuide.push({
+          afterClip: clipNumber,
+          timestamp: reaction.timestamp,
+          text: reaction.text,
+          sentiment: reaction.sentiment || 'NEUTRAL'
+        });
+
+        currentTime = reaction.timestamp;
+      }
+
+      clipNumber++;
+      const finalClipFilename = `clip_${clipNumber}.mp4`;
+      const finalClipPath = path.join(clipsDir, finalClipFilename);
       
-      const clipFiles = result.clips.map((clip) => ({
-        localPath: splitService.getClipPath(result.jobId, clip.number),
-        fileName: `${result.jobId}_clip_${clip.number}.mp4`,
-        mimeType: 'video/mp4'
+      console.log(`Creating final clip ${clipNumber}: ${currentTime}s to end`);
+      
+      await this.extractClip(videoPath, currentTime, 999999, finalClipPath);
+
+      clips.push({
+        number: clipNumber,
+        path: finalClipPath,
+        filename: finalClipFilename,
+        startTime: currentTime,
+        endTime: null,
+        duration: null
+      });
+
+      console.log(`✓ Created ${clips.length} clips in ${clipsDir}`);
+
+      const guideText = this.createReactionsGuide(reactionGuide);
+      const guideFilename = 'reactions_guide.txt';
+      const guidePath = path.join(clipsDir, guideFilename);
+      await fs.writeFile(guidePath, guideText);
+
+      const outputClips = clips.map(clip => ({
+        number: clip.number,
+        filename: clip.filename,
+        startTime: clip.startTime,
+        endTime: clip.endTime,
+        duration: clip.duration,
+        downloadUrl: `/api/split/${jobId}/clip/${clip.number}`
       }));
 
-      // Upload guide too
-      const guidePath = splitService.getGuidePath(result.jobId);
-      if (await fs.pathExists(guidePath)) {
-        clipFiles.push({
-          localPath: guidePath,
-          fileName: `${result.jobId}_reactions_guide.txt`,
-          mimeType: 'text/plain'
-        });
-      }
+      console.log(`Split job ${jobId} complete. Clips available for 24 hours.`);
 
-      const uploadResults = await driveService.uploadFiles(clipFiles);
-
-      // Map upload results back to clips
-      const clipsWithDriveLinks = result.clips.map((clip, index) => {
-        const uploadResult = uploadResults[index];
-        return {
-          ...clip,
-          driveLink: uploadResult?.success ? uploadResult.directLink : null,
-          driveViewLink: uploadResult?.success ? uploadResult.webViewLink : null
-        };
-      });
-
-      // Get guide upload result
-      const guideUpload = uploadResults.find(r => r.fileName.endsWith('.txt'));
-
-      console.log(`\nUpload complete: ${uploadResults.filter(r => r.success).length}/${uploadResults.length} files`);
-
-      res.json({
-        success: true,
-        data: {
-          jobId: result.jobId,
-          totalClips: result.totalClips,
-          clips: clipsWithDriveLinks,
-          reactionGuide: result.reactionGuide,
-          guide: {
-            downloadUrl: result.guideDownloadUrl,
-            driveLink: guideUpload?.success ? guideUpload.directLink : null
-          },
-          storage: 'google_drive'
-        }
-      });
-    } else {
-      // No Google Drive - return local download URLs only
-      console.log('\nGoogle Drive not configured, using local downloads');
-      
-      res.json({
-        success: true,
-        data: {
-          jobId: result.jobId,
-          totalClips: result.totalClips,
-          clips: result.clips,
-          reactionGuide: result.reactionGuide,
-          guide: {
-            downloadUrl: result.guideDownloadUrl
-          },
-          storage: 'local'
-        }
-      });
-    }
-
-  } catch (error) {
-    console.error('Split error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-/**
- * GET /api/split/:jobId/clip/:clipNumber - Download individual clip (fallback)
- */
-router.get('/:jobId/clip/:clipNumber', async (req, res) => {
-  try {
-    const { jobId, clipNumber } = req.params;
-    const clipPath = splitService.getClipPath(jobId, parseInt(clipNumber));
-
-    if (!await fs.pathExists(clipPath)) {
-      return res.status(404).json({
-        success: false,
-        error: 'Clip not found'
-      });
-    }
-
-    const stats = await fs.stat(clipPath);
-    const fileName = `clip_${clipNumber}.mp4`;
-
-    res.setHeader('Content-Length', stats.size);
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-
-    const readStream = fs.createReadStream(clipPath);
-    readStream.pipe(res);
-
-  } catch (error) {
-    console.error('Download error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-/**
- * GET /api/split/:jobId/guide - Download reactions guide (fallback)
- */
-router.get('/:jobId/guide', async (req, res) => {
-  try {
-    const { jobId } = req.params;
-    const guidePath = splitService.getGuidePath(jobId);
-
-    if (!await fs.pathExists(guidePath)) {
-      return res.status(404).json({
-        success: false,
-        error: 'Guide not found'
-      });
-    }
-
-    res.download(guidePath, 'reactions_guide.txt');
-
-  } catch (error) {
-    console.error('Download error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-/**
- * GET /api/split/:jobId/status - Check job status
- */
-router.get('/:jobId/status', async (req, res) => {
-  try {
-    const { jobId } = req.params;
-    const clipsDir = path.join(process.env.TEMP_DIR || '/app/temp', jobId, 'clips');
-
-    if (!await fs.pathExists(clipsDir)) {
-      return res.status(404).json({
-        success: false,
-        error: 'Job not found'
-      });
-    }
-
-    const files = await fs.readdir(clipsDir);
-    const clips = files.filter(f => f.startsWith('clip_') && f.endsWith('.mp4'));
-
-    res.json({
-      success: true,
-      data: {
+      return {
         jobId,
-        clipCount: clips.length,
-        clips: clips.sort()
+        totalClips: clips.length,
+        clips: outputClips,
+        reactionGuide,
+        guideDownloadUrl: `/api/split/${jobId}/guide`,
+        success: true
+      };
+
+    } catch (error) {
+      console.error('Split video error:', error);
+      await fs.remove(workDir).catch(() => {});
+      throw error;
+    }
+  }
+
+  extractClip(videoPath, startTime, endTime, outputPath) {
+    return new Promise((resolve, reject) => {
+      const duration = endTime === 999999 ? undefined : endTime - startTime;
+
+      if (duration !== undefined && duration <= 0.5) {
+        console.log(`Skipping very short clip: ${duration}s`);
+        return resolve(outputPath);
       }
-    });
 
-  } catch (error) {
-    console.error('Status error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
+      const command = ffmpeg(videoPath).setStartTime(startTime);
 
-/**
- * DELETE /api/split/:jobId - Cleanup job files
- */
-router.delete('/:jobId', async (req, res) => {
-  try {
-    const { jobId } = req.params;
-    const jobDir = path.join(process.env.TEMP_DIR || '/app/temp', jobId);
-    await fs.remove(jobDir);
+      if (duration !== undefined && duration > 0) {
+        command.setDuration(duration);
+      }
 
-    res.json({
-      success: true,
-      message: `Job ${jobId} cleaned up`
-    });
-
-  } catch (error) {
-    console.error('Cleanup error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
+      command
+        .outputOptions(['-c copy', '-avoid_negative_ts make_zero'])
+        .on('start', cmd => console.log(`Extracting clip: ${startTime}s to ${endTime === 999999 ? 'end' : endTime + 's'}`))
+        .on('end', () => {
+          console.log(`✓ Clip created: ${outputPath}`);
+          resolve(outputPath);
+        })
+        .on('error', (err) => {
+          console.error(`Clip extraction error:`, err);
+          reject(err);
+        })
+        .save(outputPath);
     });
   }
-});
 
-module.exports = router;
+  createReactionsGuide(reactionGuide) {
+    let guide = '='.repeat(60) + '\n';
+    guide += 'REACTIONS GUIDE FOR CAPCUT\n';
+    guide += '='.repeat(60) + '\n\n';
+    guide += 'Instructions:\n';
+    guide += '1. Import all clips into CapCut in order (clip_1, clip_2, etc.)\n';
+    guide += '2. Record your reaction after each clip using the text below\n';
+    guide += '3. Insert your reaction video between the clips\n';
+    guide += '4. Export your final reaction video!\n\n';
+    guide += '='.repeat(60) + '\n\n';
+
+    reactionGuide.forEach((reaction, index) => {
+      guide += `AFTER CLIP ${reaction.afterClip}:\n`;
+      guide += `Timestamp: ${this.formatTimestamp(reaction.timestamp)}\n`;
+      guide += `Sentiment: ${reaction.sentiment}\n`;
+      guide += `\nWhat to say:\n`;
+      guide += `"${reaction.text}"\n\n`;
+      guide += '-'.repeat(60) + '\n\n';
+    });
+
+    guide += '\nTIPS:\n';
+    guide += '• Keep reactions 2-5 seconds for best pacing\n';
+    guide += '• Match your energy to the sentiment (POSITIVE = excited, NEGATIVE = critical)\n';
+    guide += '• Feel free to improvise and add your own personality!\n';
+    guide += '• Use CapCut\'s text overlay feature to add captions if needed\n';
+
+    return guide;
+  }
+
+  formatTimestamp(seconds) {
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  }
+
+  getClipPath(jobId, clipNumber) {
+    return path.join(this.tempDir, jobId, 'clips', `clip_${clipNumber}.mp4`);
+  }
+
+  getGuidePath(jobId) {
+    return path.join(this.tempDir, jobId, 'clips', 'reactions_guide.txt');
+  }
+}
+
+module.exports = new SplitService();
