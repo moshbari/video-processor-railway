@@ -1,31 +1,123 @@
 const express = require('express');
 const router = express.Router();
 const splitService = require('../services/splitService');
+const driveService = require('../services/driveService');
 const path = require('path');
 const fs = require('fs-extra');
 
 /**
- * POST /api/split - Split video at reaction timestamps for manual editing
+ * POST /api/split - Split video based on reaction timestamps
+ * Now uploads clips to Google Drive for reliable downloads
  */
 router.post('/', async (req, res) => {
   try {
-    const { videoPath, reactions } = req.body;
+    const { videoPath, reactions, jobId: existingJobId } = req.body;
 
-    if (!videoPath || !reactions || !Array.isArray(reactions)) {
+    if (!videoPath) {
       return res.status(400).json({
         success: false,
-        error: 'videoPath and reactions array are required'
+        error: 'videoPath is required'
       });
     }
 
-    console.log(`Splitting video into ${reactions.length + 1} clips...`);
+    if (!reactions || !Array.isArray(reactions) || reactions.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'reactions array is required'
+      });
+    }
 
-    const result = await splitService.splitVideoForReactions(videoPath, reactions);
+    console.log(`\n${'='.repeat(50)}`);
+    console.log('SPLIT VIDEO REQUEST');
+    console.log('='.repeat(50));
+    console.log(`Video: ${videoPath}`);
+    console.log(`Reactions: ${reactions.length}`);
+    console.log(`Google Drive enabled: ${driveService.isConfigured()}`);
 
-    res.json({
-      success: true,
-      data: result
-    });
+    // Split the video
+    const result = await splitService.splitVideo(videoPath, reactions, existingJobId);
+
+    // If Google Drive is configured, upload clips
+    if (driveService.isConfigured()) {
+      console.log('\nUploading clips to Google Drive...');
+      
+      const clipFiles = result.clips.map((clip, index) => ({
+        localPath: clip.path,
+        fileName: `${result.jobId}_clip_${index + 1}.mp4`,
+        mimeType: 'video/mp4'
+      }));
+
+      // Upload guide too
+      if (result.guidePath && await fs.pathExists(result.guidePath)) {
+        clipFiles.push({
+          localPath: result.guidePath,
+          fileName: `${result.jobId}_reactions_guide.txt`,
+          mimeType: 'text/plain'
+        });
+      }
+
+      const uploadResults = await driveService.uploadFiles(clipFiles);
+
+      // Map upload results back to clips
+      const clipsWithDriveLinks = result.clips.map((clip, index) => {
+        const uploadResult = uploadResults[index];
+        return {
+          ...clip,
+          driveLink: uploadResult?.success ? uploadResult.directLink : null,
+          driveViewLink: uploadResult?.success ? uploadResult.webViewLink : null,
+          driveFileId: uploadResult?.success ? uploadResult.fileId : null
+        };
+      });
+
+      // Get guide upload result
+      const guideUpload = uploadResults.find(r => r.fileName.endsWith('.txt'));
+
+      console.log(`\nUpload complete: ${uploadResults.filter(r => r.success).length}/${uploadResults.length} files`);
+
+      res.json({
+        success: true,
+        data: {
+          jobId: result.jobId,
+          clipCount: result.clips.length,
+          clips: clipsWithDriveLinks.map((clip, index) => ({
+            index: index + 1,
+            duration: clip.duration,
+            reaction: clip.reaction,
+            // Local download (fallback)
+            downloadUrl: `/api/split/${result.jobId}/clip/${index + 1}`,
+            // Google Drive download (preferred)
+            driveLink: clip.driveLink,
+            driveViewLink: clip.driveViewLink
+          })),
+          guide: {
+            downloadUrl: `/api/split/${result.jobId}/guide`,
+            driveLink: guideUpload?.success ? guideUpload.directLink : null
+          },
+          storage: 'google_drive'
+        }
+      });
+    } else {
+      // No Google Drive - return local download URLs only
+      console.log('\nGoogle Drive not configured, using local downloads');
+      
+      res.json({
+        success: true,
+        data: {
+          jobId: result.jobId,
+          clipCount: result.clips.length,
+          clips: result.clips.map((clip, index) => ({
+            index: index + 1,
+            duration: clip.duration,
+            reaction: clip.reaction,
+            downloadUrl: `/api/split/${result.jobId}/clip/${index + 1}`
+          })),
+          guide: {
+            downloadUrl: `/api/split/${result.jobId}/guide`
+          },
+          storage: 'local'
+        }
+      });
+    }
 
   } catch (error) {
     console.error('Split error:', error);
@@ -37,12 +129,12 @@ router.post('/', async (req, res) => {
 });
 
 /**
- * GET /api/split/:jobId/clip/:clipNumber - Download individual clip
+ * GET /api/split/:jobId/clip/:clipNumber - Download individual clip (fallback)
  */
 router.get('/:jobId/clip/:clipNumber', async (req, res) => {
   try {
     const { jobId, clipNumber } = req.params;
-    const clipPath = splitService.getClipPath(jobId, clipNumber);
+    const clipPath = splitService.getClipPath(jobId, parseInt(clipNumber));
 
     if (!await fs.pathExists(clipPath)) {
       return res.status(404).json({
@@ -51,11 +143,15 @@ router.get('/:jobId/clip/:clipNumber', async (req, res) => {
       });
     }
 
-    res.download(clipPath, `clip_${clipNumber}.mp4`, (err) => {
-      if (err) {
-        console.error('Download error:', err);
-      }
-    });
+    const stats = await fs.stat(clipPath);
+    const fileName = `clip_${clipNumber}.mp4`;
+
+    res.setHeader('Content-Length', stats.size);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+
+    const readStream = fs.createReadStream(clipPath);
+    readStream.pipe(res);
 
   } catch (error) {
     console.error('Download error:', error);
@@ -67,7 +163,7 @@ router.get('/:jobId/clip/:clipNumber', async (req, res) => {
 });
 
 /**
- * GET /api/split/:jobId/guide - Download reactions guide
+ * GET /api/split/:jobId/guide - Download reactions guide (fallback)
  */
 router.get('/:jobId/guide', async (req, res) => {
   try {
@@ -81,11 +177,7 @@ router.get('/:jobId/guide', async (req, res) => {
       });
     }
 
-    res.download(guidePath, 'reactions_guide.txt', (err) => {
-      if (err) {
-        console.error('Download error:', err);
-      }
-    });
+    res.download(guidePath, 'reactions_guide.txt');
 
   } catch (error) {
     console.error('Download error:', error);
@@ -97,24 +189,52 @@ router.get('/:jobId/guide', async (req, res) => {
 });
 
 /**
- * DELETE /api/split/:jobId - Cleanup clips after download
+ * GET /api/split/:jobId/status - Check job status
+ */
+router.get('/:jobId/status', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const clipsDir = path.join(process.env.TEMP_DIR || '/app/temp', jobId, 'clips');
+
+    if (!await fs.pathExists(clipsDir)) {
+      return res.status(404).json({
+        success: false,
+        error: 'Job not found'
+      });
+    }
+
+    const files = await fs.readdir(clipsDir);
+    const clips = files.filter(f => f.startsWith('clip_') && f.endsWith('.mp4'));
+
+    res.json({
+      success: true,
+      data: {
+        jobId,
+        clipCount: clips.length,
+        clips: clips.sort()
+      }
+    });
+
+  } catch (error) {
+    console.error('Status error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * DELETE /api/split/:jobId - Cleanup job files
  */
 router.delete('/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
-    const outputDir = process.env.OUTPUT_DIR || '/app/outputs';
-    
-    // Find and delete all files for this job
-    const files = await fs.readdir(outputDir);
-    const jobFiles = files.filter(f => f.startsWith(jobId));
-    
-    for (const file of jobFiles) {
-      await fs.remove(path.join(outputDir, file));
-    }
+    await splitService.cleanup(jobId);
 
     res.json({
       success: true,
-      message: `Deleted ${jobFiles.length} files`
+      message: `Job ${jobId} cleaned up`
     });
 
   } catch (error) {
