@@ -35,6 +35,49 @@ const upload = multer({
 });
 
 /**
+ * Generate filename in format: MODE-XXX-MonYY-HHMMSSAM.mp4
+ * Example: PIP-Wha-Dec25-083045PM.mp4
+ */
+function generateFileName(mode, firstReactionText) {
+  // Get first 3 letters from first reaction (capitalize first letter)
+  let prefix = 'Vid';
+  if (firstReactionText && firstReactionText.length >= 3) {
+    prefix = firstReactionText.substring(0, 3);
+    prefix = prefix.charAt(0).toUpperCase() + prefix.slice(1, 3).toLowerCase();
+  }
+  
+  // Mode: PIP or SEQ
+  const modePrefix = mode === 'pip' ? 'PIP' : 'SEQ';
+  
+  // Get current time in GMT+4
+  const now = new Date();
+  // Add 4 hours for GMT+4
+  const gmt4 = new Date(now.getTime() + (4 * 60 * 60 * 1000));
+  
+  // Month abbreviation
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const month = months[gmt4.getUTCMonth()];
+  
+  // Year (2 digits)
+  const year = gmt4.getUTCFullYear().toString().slice(-2);
+  
+  // Time components
+  let hours = gmt4.getUTCHours();
+  const minutes = gmt4.getUTCMinutes().toString().padStart(2, '0');
+  const seconds = gmt4.getUTCSeconds().toString().padStart(2, '0');
+  
+  // AM/PM
+  const ampm = hours >= 12 ? 'PM' : 'AM';
+  hours = hours % 12;
+  hours = hours ? hours : 12; // 0 should be 12
+  const hoursStr = hours.toString().padStart(2, '0');
+  
+  // Final format: PIP-Wha-Dec25-083045PM.mp4
+  return `${modePrefix}-${prefix}-${month}${year}-${hoursStr}${minutes}${seconds}${ampm}.mp4`;
+}
+
+/**
  * Extract clip number from filename
  */
 function extractClipNumber(filename) {
@@ -46,25 +89,28 @@ function extractClipNumber(filename) {
 }
 
 /**
- * Upload result to R2
+ * Upload result to R2 with custom filename
  */
-async function uploadToR2(result) {
+async function uploadToR2(result, mode, firstReactionText) {
   if (!r2Service.isConfigured()) {
-    return { r2Link: null };
+    return { r2Link: null, fileName: null };
   }
 
-  console.log('\nUploading combined video to R2...');
+  const fileName = generateFileName(mode, firstReactionText);
+  console.log(`\nGenerated filename: ${fileName}`);
+  console.log('Uploading combined video to R2...');
+  
   try {
     const uploadResult = await r2Service.uploadFile(
       result.outputPath,
-      `combined/${result.jobId}.mp4`,
+      `combined/${fileName}`,
       'video/mp4'
     );
     console.log(`✓ Uploaded to R2: ${uploadResult.downloadUrl}`);
-    return { r2Link: uploadResult.downloadUrl };
+    return { r2Link: uploadResult.downloadUrl, fileName };
   } catch (error) {
     console.error('R2 upload failed:', error.message);
-    return { r2Link: null };
+    return { r2Link: null, fileName: null };
   }
 }
 
@@ -75,12 +121,14 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
   try {
     const { splitJobId } = req.params;
     const mode = req.body.mode || 'sequential';
+    const firstReactionText = req.body.firstReactionText || ''; // Get from frontend
     
     console.log('\n' + '='.repeat(60));
     console.log('COMBINE FROM SPLIT');
     console.log('='.repeat(60));
     console.log(`Split Job ID: ${splitJobId}`);
     console.log(`Mode: ${mode}`);
+    console.log(`First reaction text: ${firstReactionText}`);
     console.log(`R2 Storage: ${r2Service.isConfigured() ? 'ENABLED' : 'DISABLED'}`);
     
     if (!['sequential', 'pip'].includes(mode)) {
@@ -182,14 +230,15 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
       { mode }
     );
 
-    // Upload to R2
-    const { r2Link } = await uploadToR2(result);
+    // Upload to R2 with custom filename
+    const { r2Link, fileName } = await uploadToR2(result, mode, firstReactionText);
 
     res.json({
       success: true,
       data: {
         ...result,
         r2Link,
+        fileName,
         storage: r2Link ? 'r2' : 'local'
       }
     });
@@ -215,6 +264,7 @@ router.post('/', upload.fields([
     let reactionClipPaths = [];
     
     const mode = req.body.mode || 'sequential';
+    const firstReactionText = req.body.firstReactionText || '';
     
     if (!['sequential', 'pip'].includes(mode)) {
       return res.status(400).json({
@@ -258,14 +308,15 @@ router.post('/', upload.fields([
       { mode }
     );
 
-    // Upload to R2
-    const { r2Link } = await uploadToR2(result);
+    // Upload to R2 with custom filename
+    const { r2Link, fileName } = await uploadToR2(result, mode, firstReactionText);
 
     res.json({
       success: true,
       data: {
         ...result,
         r2Link,
+        fileName,
         storage: r2Link ? 'r2' : 'local'
       }
     });
