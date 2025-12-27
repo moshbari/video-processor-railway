@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const splitService = require('../services/splitService');
-const driveService = require('../services/driveService');
+const r2Service = require('../services/r2Service');
 const path = require('path');
 const fs = require('fs-extra');
 
@@ -31,26 +31,25 @@ router.post('/', async (req, res) => {
     console.log('='.repeat(50));
     console.log(`Video: ${videoPath}`);
     console.log(`Reactions: ${reactions.length}`);
-    console.log(`Google Drive enabled: ${driveService.isConfigured()}`);
+    console.log(`R2 Storage enabled: ${r2Service.isConfigured()}`);
 
     // Split the video
     const result = await splitService.splitVideoForReactions(videoPath, reactions);
 
-    // If Google Drive is configured, upload clips
-    if (driveService.isConfigured()) {
-      console.log('\nUploading clips to Google Drive...');
+    // If R2 is configured, upload clips
+    if (r2Service.isConfigured()) {
+      console.log('\nUploading clips to R2...');
       
       const clipFiles = [];
       
       // Build clip file list with verified paths
       for (const clip of result.clips) {
         const clipPath = splitService.getClipPath(result.jobId, clip.number);
-        console.log(`Clip ${clip.number} path: ${clipPath}`);
         
         if (await fs.pathExists(clipPath)) {
           clipFiles.push({
             localPath: clipPath,
-            fileName: `${result.jobId}_clip_${clip.number}.mp4`,
+            fileName: `${result.jobId}/clip_${clip.number}.mp4`,
             mimeType: 'video/mp4'
           });
         } else {
@@ -60,27 +59,25 @@ router.post('/', async (req, res) => {
 
       // Upload guide too
       const guidePath = splitService.getGuidePath(result.jobId);
-      console.log(`Guide path: ${guidePath}`);
       
       if (await fs.pathExists(guidePath)) {
         clipFiles.push({
           localPath: guidePath,
-          fileName: `${result.jobId}_reactions_guide.txt`,
+          fileName: `${result.jobId}/reactions_guide.txt`,
           mimeType: 'text/plain'
         });
       }
 
       console.log(`Files to upload: ${clipFiles.length}`);
 
-      const uploadResults = await driveService.uploadFiles(clipFiles);
+      const uploadResults = await r2Service.uploadFiles(clipFiles);
 
       // Map upload results back to clips
-      const clipsWithDriveLinks = result.clips.map((clip, index) => {
+      const clipsWithLinks = result.clips.map((clip, index) => {
         const uploadResult = uploadResults[index];
         return {
           ...clip,
-          driveLink: uploadResult?.success ? uploadResult.directLink : null,
-          driveViewLink: uploadResult?.success ? uploadResult.webViewLink : null
+          r2Link: uploadResult?.success ? uploadResult.downloadUrl : null
         };
       });
 
@@ -94,18 +91,18 @@ router.post('/', async (req, res) => {
         data: {
           jobId: result.jobId,
           totalClips: result.totalClips,
-          clips: clipsWithDriveLinks,
+          clips: clipsWithLinks,
           reactionGuide: result.reactionGuide,
           guide: {
             downloadUrl: result.guideDownloadUrl,
-            driveLink: guideUpload?.success ? guideUpload.directLink : null
+            r2Link: guideUpload?.success ? guideUpload.downloadUrl : null
           },
-          storage: 'google_drive'
+          storage: 'r2'
         }
       });
     } else {
-      // No Google Drive - return local download URLs only
-      console.log('\nGoogle Drive not configured, using local downloads');
+      // No R2 - return local download URLs only
+      console.log('\nR2 not configured, using local downloads');
       
       res.json({
         success: true,
@@ -132,7 +129,7 @@ router.post('/', async (req, res) => {
 });
 
 /**
- * GET /api/split/:jobId/clip/:clipNumber - Download individual clip
+ * GET /api/split/:jobId/clip/:clipNumber - Download individual clip (fallback)
  */
 router.get('/:jobId/clip/:clipNumber', async (req, res) => {
   try {
@@ -166,7 +163,7 @@ router.get('/:jobId/clip/:clipNumber', async (req, res) => {
 });
 
 /**
- * GET /api/split/:jobId/guide - Download reactions guide
+ * GET /api/split/:jobId/guide - Download reactions guide (fallback)
  */
 router.get('/:jobId/guide', async (req, res) => {
   try {
