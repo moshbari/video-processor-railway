@@ -7,6 +7,7 @@ const fs = require('fs-extra');
 
 /**
  * POST /api/split - Split video based on reaction timestamps
+ * Uploads clips to R2 for persistence across Railway restarts
  */
 router.post('/', async (req, res) => {
   try {
@@ -36,11 +37,12 @@ router.post('/', async (req, res) => {
     // Split the video
     const result = await splitService.splitVideoForReactions(videoPath, reactions);
 
-    // If R2 is configured, upload clips
+    // If R2 is configured, upload clips for persistence
     if (r2Service.isConfigured()) {
-      console.log('\nUploading clips to R2...');
+      console.log('\nUploading clips to R2 for persistence...');
       
       const clipFiles = [];
+      const clipR2Links = {};
       
       // Build clip file list with verified paths
       for (const clip of result.clips) {
@@ -49,8 +51,9 @@ router.post('/', async (req, res) => {
         if (await fs.pathExists(clipPath)) {
           clipFiles.push({
             localPath: clipPath,
-            fileName: `${result.jobId}/clip_${clip.number}.mp4`,
-            mimeType: 'video/mp4'
+            fileName: `splits/${result.jobId}/clip_${clip.number}.mp4`,
+            mimeType: 'video/mp4',
+            clipNumber: clip.number
           });
         } else {
           console.error(`Clip file not found: ${clipPath}`);
@@ -63,7 +66,7 @@ router.post('/', async (req, res) => {
       if (await fs.pathExists(guidePath)) {
         clipFiles.push({
           localPath: guidePath,
-          fileName: `${result.jobId}/reactions_guide.txt`,
+          fileName: `splits/${result.jobId}/reactions_guide.txt`,
           mimeType: 'text/plain'
         });
       }
@@ -71,6 +74,32 @@ router.post('/', async (req, res) => {
       console.log(`Files to upload: ${clipFiles.length}`);
 
       const uploadResults = await r2Service.uploadFiles(clipFiles);
+
+      // Build clip R2 links map
+      for (const uploadResult of uploadResults) {
+        if (uploadResult.success && uploadResult.fileName.includes('clip_')) {
+          const match = uploadResult.fileName.match(/clip_(\d+)\.mp4/);
+          if (match) {
+            clipR2Links[match[1]] = uploadResult.downloadUrl;
+          }
+        }
+      }
+
+      // Create and upload manifest for later retrieval
+      const manifest = {
+        jobId: result.jobId,
+        totalClips: result.totalClips,
+        clips: result.clips.map(clip => ({
+          number: clip.number,
+          r2Link: clipR2Links[clip.number] || null
+        })),
+        createdAt: new Date().toISOString()
+      };
+
+      // Save manifest to R2
+      const manifestPath = path.join(splitService.tempDir, result.jobId, 'manifest.json');
+      await fs.writeJson(manifestPath, manifest);
+      await r2Service.uploadFile(manifestPath, `splits/${result.jobId}/manifest.json`, 'application/json');
 
       // Map upload results back to clips
       const clipsWithLinks = result.clips.map((clip, index) => {
