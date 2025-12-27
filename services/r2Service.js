@@ -1,12 +1,14 @@
-const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const fs = require('fs-extra');
 const path = require('path');
+const https = require('https');
+const http = require('http');
 
 class R2Service {
   constructor() {
     this.client = null;
     this.bucketName = process.env.R2_BUCKET_NAME;
-    this.publicUrl = process.env.R2_PUBLIC_URL; // Optional custom domain
+    this.publicUrl = process.env.R2_PUBLIC_URL;
     this.initialized = false;
   }
 
@@ -106,6 +108,93 @@ class R2Service {
     }
 
     return results;
+  }
+
+  /**
+   * Download a file from R2 public URL
+   */
+  async downloadFile(url, localPath) {
+    console.log(`Downloading from R2: ${url}`);
+    
+    await fs.ensureDir(path.dirname(localPath));
+    
+    return new Promise((resolve, reject) => {
+      const protocol = url.startsWith('https') ? https : http;
+      
+      const file = fs.createWriteStream(localPath);
+      
+      protocol.get(url, (response) => {
+        if (response.statusCode === 301 || response.statusCode === 302) {
+          // Handle redirect
+          this.downloadFile(response.headers.location, localPath)
+            .then(resolve)
+            .catch(reject);
+          return;
+        }
+        
+        if (response.statusCode !== 200) {
+          reject(new Error(`Download failed: ${response.statusCode}`));
+          return;
+        }
+        
+        response.pipe(file);
+        
+        file.on('finish', () => {
+          file.close();
+          console.log(`✓ Downloaded: ${path.basename(localPath)}`);
+          resolve(localPath);
+        });
+        
+        file.on('error', (err) => {
+          fs.unlink(localPath).catch(() => {});
+          reject(err);
+        });
+      }).on('error', (err) => {
+        fs.unlink(localPath).catch(() => {});
+        reject(err);
+      });
+    });
+  }
+
+  /**
+   * Download manifest and clips for a split job
+   */
+  async downloadSplitJob(jobId, targetDir) {
+    console.log(`\nDownloading split job ${jobId} from R2...`);
+    
+    const manifestUrl = `${this.publicUrl}/splits/${jobId}/manifest.json`;
+    const clipsDir = path.join(targetDir, 'clips');
+    
+    await fs.ensureDir(clipsDir);
+    
+    // Download manifest
+    const manifestPath = path.join(targetDir, 'manifest.json');
+    
+    try {
+      await this.downloadFile(manifestUrl, manifestPath);
+    } catch (err) {
+      console.error(`Failed to download manifest: ${err.message}`);
+      throw new Error(`Split job ${jobId} not found in R2 storage`);
+    }
+    
+    // Read manifest
+    const manifest = await fs.readJson(manifestPath);
+    console.log(`Manifest loaded: ${manifest.totalClips} clips`);
+    
+    // Download each clip
+    for (const clip of manifest.clips) {
+      if (clip.r2Link) {
+        const clipPath = path.join(clipsDir, `clip_${clip.number}.mp4`);
+        try {
+          await this.downloadFile(clip.r2Link, clipPath);
+        } catch (err) {
+          console.error(`Failed to download clip ${clip.number}: ${err.message}`);
+        }
+      }
+    }
+    
+    console.log(`✓ Split job ${jobId} restored from R2`);
+    return manifest;
   }
 
   /**
