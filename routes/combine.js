@@ -36,44 +36,33 @@ const upload = multer({
 
 /**
  * Generate filename in format: MODE-XXX-MonYY-HHMMSSAM.mp4
- * Example: PIP-Wha-Dec25-083045PM.mp4
  */
 function generateFileName(mode, firstReactionText) {
-  // Get first 3 letters from first reaction (capitalize first letter)
   let prefix = 'Vid';
   if (firstReactionText && firstReactionText.length >= 3) {
     prefix = firstReactionText.substring(0, 3);
     prefix = prefix.charAt(0).toUpperCase() + prefix.slice(1, 3).toLowerCase();
   }
   
-  // Mode: PIP or SEQ
   const modePrefix = mode === 'pip' ? 'PIP' : 'SEQ';
   
-  // Get current time in GMT+4
   const now = new Date();
-  // Add 4 hours for GMT+4
   const gmt4 = new Date(now.getTime() + (4 * 60 * 60 * 1000));
   
-  // Month abbreviation
   const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
                   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   const month = months[gmt4.getUTCMonth()];
-  
-  // Year (2 digits)
   const year = gmt4.getUTCFullYear().toString().slice(-2);
   
-  // Time components
   let hours = gmt4.getUTCHours();
   const minutes = gmt4.getUTCMinutes().toString().padStart(2, '0');
   const seconds = gmt4.getUTCSeconds().toString().padStart(2, '0');
   
-  // AM/PM
   const ampm = hours >= 12 ? 'PM' : 'AM';
   hours = hours % 12;
-  hours = hours ? hours : 12; // 0 should be 12
+  hours = hours ? hours : 12;
   const hoursStr = hours.toString().padStart(2, '0');
   
-  // Final format: PIP-Wha-Dec25-083045PM.mp4
   return `${modePrefix}-${prefix}-${month}${year}-${hoursStr}${minutes}${seconds}${ampm}.mp4`;
 }
 
@@ -115,13 +104,48 @@ async function uploadToR2(result, mode, firstReactionText) {
 }
 
 /**
+ * Ensure split clips are available - restore from R2 if needed
+ */
+async function ensureSplitClipsAvailable(splitJobId) {
+  const tempDir = process.env.TEMP_DIR || '/app/temp';
+  const splitDir = path.join(tempDir, splitJobId, 'clips');
+  
+  // Check if clips exist locally
+  if (await fs.pathExists(splitDir)) {
+    const files = await fs.readdir(splitDir);
+    const clips = files.filter(f => f.startsWith('clip_') && f.endsWith('.mp4'));
+    if (clips.length > 0) {
+      console.log(`Found ${clips.length} local clips`);
+      return splitDir;
+    }
+  }
+  
+  // Clips not found locally - try to restore from R2
+  console.log('Local clips not found, attempting to restore from R2...');
+  
+  if (!r2Service.isConfigured()) {
+    throw new Error('Split job not found locally and R2 is not configured');
+  }
+  
+  const jobDir = path.join(tempDir, splitJobId);
+  await fs.ensureDir(jobDir);
+  
+  try {
+    await r2Service.downloadSplitJob(splitJobId, jobDir);
+    return path.join(jobDir, 'clips');
+  } catch (err) {
+    throw new Error(`Split job not found. Clips may have been cleaned up. Error: ${err.message}`);
+  }
+}
+
+/**
  * POST /api/combine/from-split/:splitJobId
  */
 router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async (req, res) => {
   try {
     const { splitJobId } = req.params;
     const mode = req.body.mode || 'sequential';
-    const firstReactionText = req.body.firstReactionText || ''; // Get from frontend
+    const firstReactionText = req.body.firstReactionText || '';
     
     console.log('\n' + '='.repeat(60));
     console.log('COMBINE FROM SPLIT');
@@ -138,15 +162,18 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
       });
     }
     
-    const splitDir = path.join(process.env.TEMP_DIR || '/app/temp', splitJobId, 'clips');
-    
-    if (!await fs.pathExists(splitDir)) {
+    // Ensure clips are available (restore from R2 if needed)
+    let splitDir;
+    try {
+      splitDir = await ensureSplitClipsAvailable(splitJobId);
+    } catch (err) {
       return res.status(404).json({
         success: false,
-        error: 'Split job not found. Clips may have been cleaned up.'
+        error: err.message
       });
     }
 
+    // Get all clip files sorted by number
     const clipFiles = await fs.readdir(splitDir);
     const originalClipPaths = clipFiles
       .filter(f => f.startsWith('clip_') && f.endsWith('.mp4'))
