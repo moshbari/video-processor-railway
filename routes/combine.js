@@ -4,7 +4,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs-extra');
 const combineService = require('../services/combineService');
-const driveService = require('../services/driveService');
+const r2Service = require('../services/r2Service');
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
@@ -46,28 +46,25 @@ function extractClipNumber(filename) {
 }
 
 /**
- * Upload result to Google Drive
+ * Upload result to R2
  */
-async function uploadToDrive(result) {
-  if (!driveService.isConfigured()) {
-    return { driveLink: null, driveViewLink: null };
+async function uploadToR2(result) {
+  if (!r2Service.isConfigured()) {
+    return { r2Link: null };
   }
 
-  console.log('\nUploading combined video to Google Drive...');
+  console.log('\nUploading combined video to R2...');
   try {
-    const uploadResult = await driveService.uploadFile(
+    const uploadResult = await r2Service.uploadFile(
       result.outputPath,
-      `reaction_video_${result.jobId}.mp4`,
+      `combined/${result.jobId}.mp4`,
       'video/mp4'
     );
-    console.log(`✓ Uploaded to Drive: ${uploadResult.directLink}`);
-    return {
-      driveLink: uploadResult.directLink,
-      driveViewLink: uploadResult.webViewLink
-    };
+    console.log(`✓ Uploaded to R2: ${uploadResult.downloadUrl}`);
+    return { r2Link: uploadResult.downloadUrl };
   } catch (error) {
-    console.error('Drive upload failed:', error.message);
-    return { driveLink: null, driveViewLink: null };
+    console.error('R2 upload failed:', error.message);
+    return { r2Link: null };
   }
 }
 
@@ -84,7 +81,7 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
     console.log('='.repeat(60));
     console.log(`Split Job ID: ${splitJobId}`);
     console.log(`Mode: ${mode}`);
-    console.log(`Google Drive: ${driveService.isConfigured() ? 'ENABLED' : 'DISABLED'}`);
+    console.log(`R2 Storage: ${r2Service.isConfigured() ? 'ENABLED' : 'DISABLED'}`);
     
     if (!['sequential', 'pip'].includes(mode)) {
       return res.status(400).json({
@@ -185,16 +182,15 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
       { mode }
     );
 
-    // Upload to Google Drive
-    const { driveLink, driveViewLink } = await uploadToDrive(result);
+    // Upload to R2
+    const { r2Link } = await uploadToR2(result);
 
     res.json({
       success: true,
       data: {
         ...result,
-        driveLink,
-        driveViewLink,
-        storage: driveLink ? 'google_drive' : 'local'
+        r2Link,
+        storage: r2Link ? 'r2' : 'local'
       }
     });
 
@@ -262,16 +258,15 @@ router.post('/', upload.fields([
       { mode }
     );
 
-    // Upload to Google Drive
-    const { driveLink, driveViewLink } = await uploadToDrive(result);
+    // Upload to R2
+    const { r2Link } = await uploadToR2(result);
 
     res.json({
       success: true,
       data: {
         ...result,
-        driveLink,
-        driveViewLink,
-        storage: driveLink ? 'google_drive' : 'local'
+        r2Link,
+        storage: r2Link ? 'r2' : 'local'
       }
     });
 
