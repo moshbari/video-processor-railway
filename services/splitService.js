@@ -19,6 +19,7 @@ class SplitService {
       console.log(`Splitting video into clips...`);
       console.log(`Job ID: ${jobId}`);
       console.log(`Clips directory: ${clipsDir}`);
+      console.log(`Using PRECISE CUTS (re-encode mode)`);
 
       const sortedReactions = reactions.sort((a, b) => a.timestamp - b.timestamp);
 
@@ -50,7 +51,7 @@ class SplitService {
         
         console.log(`Creating clip ${clipNumber}: ${currentTime}s to ${reaction.timestamp}s (${duration}s)`);
         
-        await this.extractClip(videoPath, currentTime, reaction.timestamp, clipPath);
+        await this.extractClipPrecise(videoPath, currentTime, duration, clipPath);
         
         clips.push({
           number: clipNumber,
@@ -77,7 +78,7 @@ class SplitService {
       
       console.log(`Creating final clip ${clipNumber}: ${currentTime}s to end`);
       
-      await this.extractClip(videoPath, currentTime, 999999, finalClipPath);
+      await this.extractClipPrecise(videoPath, currentTime, null, finalClipPath);
 
       clips.push({
         number: clipNumber,
@@ -122,24 +123,42 @@ class SplitService {
     }
   }
 
-  extractClip(videoPath, startTime, endTime, outputPath) {
+  /**
+   * Extract clip with PRECISE cuts using re-encoding
+   * This ensures no overlap between clips
+   */
+  extractClipPrecise(videoPath, startTime, duration, outputPath) {
     return new Promise((resolve, reject) => {
-      const duration = endTime === 999999 ? undefined : endTime - startTime;
-
-      if (duration !== undefined && duration <= 0.5) {
+      if (duration !== null && duration <= 0.5) {
         console.log(`Skipping very short clip: ${duration}s`);
         return resolve(outputPath);
       }
 
-      const command = ffmpeg(videoPath).setStartTime(startTime);
+      // Use -ss before -i for fast seeking, then re-encode for precision
+      const command = ffmpeg(videoPath)
+        .seekInput(startTime);  // Fast seek before input
 
-      if (duration !== undefined && duration > 0) {
-        command.setDuration(duration);
+      if (duration !== null && duration > 0) {
+        command.duration(duration);
       }
 
+      // Re-encode for precise frame-accurate cuts
       command
-        .outputOptions(['-c copy', '-avoid_negative_ts make_zero'])
-        .on('start', cmd => console.log(`Extracting clip: ${startTime}s to ${endTime === 999999 ? 'end' : endTime + 's'}`))
+        .outputOptions([
+          '-c:v', 'libx264',      // Re-encode video
+          '-preset', 'fast',      // Fast encoding
+          '-crf', '23',           // Good quality
+          '-c:a', 'aac',          // Re-encode audio
+          '-ar', '44100',         // Audio sample rate
+          '-ac', '2',             // Stereo
+          '-b:a', '128k',         // Audio bitrate
+          '-avoid_negative_ts', 'make_zero',
+          '-y'
+        ])
+        .on('start', cmd => {
+          const endStr = duration ? `${startTime + duration}s` : 'end';
+          console.log(`Extracting clip: ${startTime}s to ${endStr}`);
+        })
         .on('end', () => {
           console.log(`✓ Clip created: ${outputPath}`);
           resolve(outputPath);
