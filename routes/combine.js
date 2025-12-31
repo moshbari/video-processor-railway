@@ -456,10 +456,10 @@ function getExpiredPageHtml() {
       Our system automatically removes videos after a short period to manage storage.
     </p>
     <div class="info-box">
-      <p>💡 Videos are automatically deleted after 7 days</p>
+      <p>💡 Videos are automatically deleted to manage storage</p>
     </div>
-    <a href="javascript:history.back()" class="btn">← Go Back & Create New Video</a>
-    <p class="footer">Need help? Contact support or try creating your video again.</p>
+    <a href="https://rantsquad.99dfy.com/video-editor" class="btn">← Go Back & Create New Video</a>
+    <p class="footer">Your video link has expired. Please create a new video.</p>
   </div>
 </body>
 </html>
