@@ -358,6 +358,115 @@ router.post('/', upload.fields([
 });
 
 /**
+ * Generate nice error page HTML
+ */
+function getExpiredPageHtml() {
+  return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Video Link Expired</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .container {
+      background: rgba(255, 255, 255, 0.05);
+      backdrop-filter: blur(10px);
+      border-radius: 20px;
+      padding: 50px 40px;
+      max-width: 500px;
+      text-align: center;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      box-shadow: 0 25px 50px rgba(0, 0, 0, 0.3);
+    }
+    .icon {
+      font-size: 80px;
+      margin-bottom: 20px;
+    }
+    h1 {
+      color: #fff;
+      font-size: 28px;
+      margin-bottom: 15px;
+      font-weight: 600;
+    }
+    .message {
+      color: rgba(255, 255, 255, 0.7);
+      font-size: 16px;
+      line-height: 1.6;
+      margin-bottom: 30px;
+    }
+    .info-box {
+      background: rgba(0, 200, 150, 0.1);
+      border: 1px solid rgba(0, 200, 150, 0.3);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 30px;
+    }
+    .info-box p {
+      color: rgba(0, 200, 150, 0.9);
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    .btn {
+      display: inline-block;
+      background: linear-gradient(135deg, #00c896 0%, #00a67d 100%);
+      color: #fff;
+      text-decoration: none;
+      padding: 15px 40px;
+      border-radius: 30px;
+      font-size: 16px;
+      font-weight: 600;
+      transition: transform 0.2s, box-shadow 0.2s;
+      box-shadow: 0 10px 30px rgba(0, 200, 150, 0.3);
+    }
+    .btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 15px 40px rgba(0, 200, 150, 0.4);
+    }
+    .footer {
+      margin-top: 30px;
+      color: rgba(255, 255, 255, 0.4);
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon">⏰</div>
+    <h1>Video Link Expired</h1>
+    <p class="message">
+      The video you're trying to download is no longer available. 
+      Our system automatically removes videos after a short period to manage storage.
+    </p>
+    <div class="info-box">
+      <p>💡 Videos are automatically deleted after 7 days</p>
+    </div>
+    <a href="javascript:history.back()" class="btn">← Go Back & Create New Video</a>
+    <p class="footer">Need help? Contact support or try creating your video again.</p>
+  </div>
+</body>
+</html>
+  `;
+}
+
+/**
  * GET /api/combine/:jobId/download - Fallback local download
  */
 router.get('/:jobId/download', async (req, res) => {
@@ -366,10 +475,8 @@ router.get('/:jobId/download', async (req, res) => {
     const outputPath = combineService.getOutputPath(jobId);
 
     if (!await fs.pathExists(outputPath)) {
-      return res.status(404).json({
-        success: false,
-        error: 'Combined video not found'
-      });
+      res.status(404).send(getExpiredPageHtml());
+      return;
     }
 
     const stats = await fs.stat(outputPath);
@@ -383,10 +490,7 @@ router.get('/:jobId/download', async (req, res) => {
 
   } catch (error) {
     console.error('Download error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    res.status(500).send(getExpiredPageHtml());
   }
 });
 
