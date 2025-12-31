@@ -257,10 +257,10 @@ function getExpiredPageHtml(type = 'clip') {
       Our system automatically removes files after a short period to manage storage.
     </p>
     <div class="info-box">
-      <p>💡 Files are automatically deleted after 7 days</p>
+      <p>💡 Files are automatically deleted to manage storage</p>
     </div>
-    <a href="javascript:history.back()" class="btn">← Go Back & Try Again</a>
-    <p class="footer">Need help? Try splitting your video again to get fresh download links.</p>
+    <a href="https://rantsquad.99dfy.com/video-editor" class="btn">← Go Back & Try Again</a>
+    <p class="footer">Your file link has expired. Please split your video again.</p>
   </div>
 </body>
 </html>
