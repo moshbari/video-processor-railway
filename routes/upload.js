@@ -140,7 +140,7 @@ router.post('/with-reactions', upload.single('video'), async (req, res) => {
     // Import and use splitService
     const splitService = require('../services/splitService');
     
-    const result = await splitService.splitVideo(videoPath, reactions, jobId);
+    const result = await splitService.splitVideoForReactions(videoPath, reactions, jobId);
 
     res.json({
       success: true,
