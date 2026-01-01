@@ -36,6 +36,7 @@ const upload = multer({
 
 /**
  * Generate filename in format: MODE-XXX-MonYY-HHMMSSAM.mp4
+ * Example: PIP-Wha-Dec25-083045PM.mp4
  */
 function generateFileName(mode, firstReactionText) {
   let prefix = 'Vid';
@@ -134,17 +135,38 @@ async function ensureSplitClipsAvailable(splitJobId) {
     await r2Service.downloadSplitJob(splitJobId, jobDir);
     return path.join(jobDir, 'clips');
   } catch (err) {
-    throw new Error(`Split job not found. Clips may have been cleaned up. Error: ${err.message}`);
+    throw new Error(`Split job not found. Clips may have been cleaned up. Please re-split the video.`);
   }
 }
 
 /**
+ * Validate pipPosition parameter
+ */
+function validatePipPosition(position) {
+  const validPositions = ['top-right', 'bottom-right', 'bottom-left', 'top-left', 'random'];
+  if (!position) return 'top-right'; // default
+  if (!validPositions.includes(position)) {
+    console.warn(`Invalid pipPosition "${position}", defaulting to top-right`);
+    return 'top-right';
+  }
+  return position;
+}
+
+/**
  * POST /api/combine/from-split/:splitJobId
+ * 
+ * Body parameters:
+ * - reactionClips[]: Array of reaction video files
+ * - mode: 'sequential' or 'pip' (default: 'sequential')
+ * - pipPosition: 'top-right', 'bottom-right', 'bottom-left', 'top-left', 'random' (default: 'top-right')
+ * - firstReactionText: Text for filename generation
+ * - reactionIndices: JSON array of indices mapping reactions to clips
  */
 router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async (req, res) => {
   try {
     const { splitJobId } = req.params;
     const mode = req.body.mode || 'sequential';
+    const pipPosition = validatePipPosition(req.body.pipPosition);
     const firstReactionText = req.body.firstReactionText || '';
     
     console.log('\n' + '='.repeat(60));
@@ -152,6 +174,9 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
     console.log('='.repeat(60));
     console.log(`Split Job ID: ${splitJobId}`);
     console.log(`Mode: ${mode}`);
+    if (mode === 'pip') {
+      console.log(`PiP Position: ${pipPosition}`);
+    }
     console.log(`First reaction text: ${firstReactionText}`);
     console.log(`R2 Storage: ${r2Service.isConfigured() ? 'ENABLED' : 'DISABLED'}`);
     
@@ -162,111 +187,83 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
       });
     }
     
-    // Ensure clips are available (restore from R2 if needed)
-    let splitDir;
-    try {
-      splitDir = await ensureSplitClipsAvailable(splitJobId);
-    } catch (err) {
-      return res.status(404).json({
-        success: false,
-        error: err.message
-      });
-    }
-
-    // Get all clip files sorted by number
-    const clipFiles = await fs.readdir(splitDir);
-    const originalClipPaths = clipFiles
+    // Get original clips from split job directory (restore from R2 if needed)
+    const splitDir = await ensureSplitClipsAvailable(splitJobId);
+    
+    // Read and sort original clips
+    const files = await fs.readdir(splitDir);
+    const originalClipFiles = files
       .filter(f => f.startsWith('clip_') && f.endsWith('.mp4'))
       .sort((a, b) => {
-        const numA = parseInt(a.match(/clip_(\d+)/)[1]);
-        const numB = parseInt(b.match(/clip_(\d+)/)[1]);
+        const numA = extractClipNumber(a) || 0;
+        const numB = extractClipNumber(b) || 0;
         return numA - numB;
-      })
-      .map(f => path.join(splitDir, f));
-
-    if (originalClipPaths.length === 0) {
+      });
+    
+    if (originalClipFiles.length === 0) {
       return res.status(404).json({
         success: false,
-        error: 'No clips found in split job directory'
+        error: 'No clips found in split job'
       });
     }
-
-    console.log(`\nORIGINAL CLIPS (${originalClipPaths.length}):`);
-    originalClipPaths.forEach((p, i) => {
-      console.log(`  Index ${i} (Clip ${i + 1}): ${path.basename(p)}`);
-    });
-
-    const uploadedReactions = req.files || [];
     
-    console.log(`\nUPLOADED REACTIONS (${uploadedReactions.length}):`);
-    uploadedReactions.forEach((f, i) => {
-      const clipNum = extractClipNumber(f.originalname);
-      console.log(`  [${i}] originalname: "${f.originalname}" → extracted number: ${clipNum}`);
-    });
-
-    const extractedNumbers = uploadedReactions
-      .map(f => extractClipNumber(f.originalname))
-      .filter(n => n !== null);
+    const originalClipPaths = originalClipFiles.map(f => path.join(splitDir, f));
+    console.log(`Found ${originalClipPaths.length} original clips`);
     
-    const minNumber = extractedNumbers.length > 0 ? Math.min(...extractedNumbers) : 1;
-    const isZeroIndexed = minNumber === 0;
-    
-    console.log(`\nDETECTED INDEXING:`);
-    console.log(`  Min number in filenames: ${minNumber}`);
-    console.log(`  Indexing style: ${isZeroIndexed ? '0-indexed (0,1,2...)' : '1-indexed (1,2,3...)'}`);
-
+    // Process reaction clips - map them to the correct original clips
     const reactionClipPaths = new Array(originalClipPaths.length).fill(null);
-
-    console.log(`\nMAPPING REACTIONS TO CLIPS:`);
     
-    uploadedReactions.forEach((file) => {
-      const clipNum = extractClipNumber(file.originalname);
-      
-      if (clipNum !== null) {
-        let arrayIndex;
-        if (isZeroIndexed) {
-          arrayIndex = clipNum;
-        } else {
-          arrayIndex = clipNum - 1;
+    if (req.files && req.files.length > 0) {
+      // Check if reactionIndices was provided
+      let indices = null;
+      if (req.body.reactionIndices) {
+        try {
+          indices = JSON.parse(req.body.reactionIndices);
+        } catch (e) {
+          console.warn('Failed to parse reactionIndices, using sequential mapping');
         }
-        
-        if (arrayIndex >= 0 && arrayIndex < originalClipPaths.length) {
-          reactionClipPaths[arrayIndex] = file.path;
-          console.log(`  ✓ "${file.originalname}" (number ${clipNum}) → Clip ${arrayIndex + 1} (index ${arrayIndex})`);
-        } else {
-          console.log(`  ✗ "${file.originalname}" (number ${clipNum}) → OUT OF RANGE (index ${arrayIndex}, max: ${originalClipPaths.length - 1})`);
-        }
-      } else {
-        console.log(`  ✗ "${file.originalname}" → NO NUMBER FOUND`);
       }
-    });
-
-    console.log(`\nFINAL MAPPING:`);
-    console.log('-'.repeat(50));
-    for (let i = 0; i < originalClipPaths.length; i++) {
-      const origName = path.basename(originalClipPaths[i]);
-      const reactName = reactionClipPaths[i] ? path.basename(reactionClipPaths[i]) : '(none)';
-      console.log(`  Clip ${i + 1} [${origName}] ← Reaction: ${reactName}`);
+      
+      if (indices && Array.isArray(indices)) {
+        // Map reactions using provided indices
+        req.files.forEach((file, i) => {
+          const clipIndex = indices[i];
+          if (typeof clipIndex === 'number' && clipIndex >= 0 && clipIndex < originalClipPaths.length) {
+            reactionClipPaths[clipIndex] = file.path;
+            console.log(`Mapped reaction ${i} to clip ${clipIndex}`);
+          }
+        });
+      } else {
+        // Sequential mapping (reaction 0 -> clip 0, reaction 1 -> clip 1, etc.)
+        req.files.forEach((file, i) => {
+          if (i < originalClipPaths.length) {
+            reactionClipPaths[i] = file.path;
+          }
+        });
+      }
     }
-    console.log('-'.repeat(50));
+    
+    const reactionCount = reactionClipPaths.filter(p => p !== null).length;
+    console.log(`Mapped ${reactionCount} reactions to clips`);
 
+    // Combine clips with reactions
     const result = await combineService.combineClipsWithReactions(
       originalClipPaths,
       reactionClipPaths,
       null,
-      { mode }
+      { mode, pipPosition }
     );
 
-    // Upload to R2 with custom filename
+    // Upload to R2
     const { r2Link, fileName } = await uploadToR2(result, mode, firstReactionText);
 
     res.json({
       success: true,
       data: {
         ...result,
+        pipPosition: mode === 'pip' ? pipPosition : null,
         r2Link,
-        fileName,
-        storage: r2Link ? 'r2' : 'local'
+        fileName
       }
     });
 
@@ -280,7 +277,7 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
 });
 
 /**
- * POST /api/combine - Direct combine with uploaded clips
+ * POST /api/combine - Combine with direct file uploads
  */
 router.post('/', upload.fields([
   { name: 'originalClips', maxCount: 20 },
@@ -291,6 +288,7 @@ router.post('/', upload.fields([
     let reactionClipPaths = [];
     
     const mode = req.body.mode || 'sequential';
+    const pipPosition = validatePipPosition(req.body.pipPosition);
     const firstReactionText = req.body.firstReactionText || '';
     
     if (!['sequential', 'pip'].includes(mode)) {
@@ -326,25 +324,25 @@ router.post('/', upload.fields([
       });
     }
 
-    console.log(`Combining ${originalClipPaths.length} clips with ${reactionClipPaths.length} reactions (mode: ${mode})`);
+    console.log(`Combining ${originalClipPaths.length} clips with ${reactionClipPaths.length} reactions (mode: ${mode}, pipPosition: ${pipPosition})`);
 
     const result = await combineService.combineClipsWithReactions(
       originalClipPaths,
       reactionClipPaths,
       null,
-      { mode }
+      { mode, pipPosition }
     );
 
-    // Upload to R2 with custom filename
+    // Upload to R2
     const { r2Link, fileName } = await uploadToR2(result, mode, firstReactionText);
 
     res.json({
       success: true,
       data: {
         ...result,
+        pipPosition: mode === 'pip' ? pipPosition : null,
         r2Link,
-        fileName,
-        storage: r2Link ? 'r2' : 'local'
+        fileName
       }
     });
 
@@ -358,116 +356,7 @@ router.post('/', upload.fields([
 });
 
 /**
- * Generate nice error page HTML
- */
-function getExpiredPageHtml() {
-  return `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Video Link Expired</title>
-  <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
-    }
-    .container {
-      background: rgba(255, 255, 255, 0.05);
-      backdrop-filter: blur(10px);
-      border-radius: 20px;
-      padding: 50px 40px;
-      max-width: 500px;
-      text-align: center;
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      box-shadow: 0 25px 50px rgba(0, 0, 0, 0.3);
-    }
-    .icon {
-      font-size: 80px;
-      margin-bottom: 20px;
-    }
-    h1 {
-      color: #fff;
-      font-size: 28px;
-      margin-bottom: 15px;
-      font-weight: 600;
-    }
-    .message {
-      color: rgba(255, 255, 255, 0.7);
-      font-size: 16px;
-      line-height: 1.6;
-      margin-bottom: 30px;
-    }
-    .info-box {
-      background: rgba(0, 200, 150, 0.1);
-      border: 1px solid rgba(0, 200, 150, 0.3);
-      border-radius: 12px;
-      padding: 20px;
-      margin-bottom: 30px;
-    }
-    .info-box p {
-      color: rgba(0, 200, 150, 0.9);
-      font-size: 14px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-    }
-    .btn {
-      display: inline-block;
-      background: linear-gradient(135deg, #00c896 0%, #00a67d 100%);
-      color: #fff;
-      text-decoration: none;
-      padding: 15px 40px;
-      border-radius: 30px;
-      font-size: 16px;
-      font-weight: 600;
-      transition: transform 0.2s, box-shadow 0.2s;
-      box-shadow: 0 10px 30px rgba(0, 200, 150, 0.3);
-    }
-    .btn:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 15px 40px rgba(0, 200, 150, 0.4);
-    }
-    .footer {
-      margin-top: 30px;
-      color: rgba(255, 255, 255, 0.4);
-      font-size: 13px;
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="icon">⏰</div>
-    <h1>Video Link Expired</h1>
-    <p class="message">
-      The video you're trying to download is no longer available. 
-      Our system automatically removes videos after a short period to manage storage.
-    </p>
-    <div class="info-box">
-      <p>💡 Videos are automatically deleted to manage storage</p>
-    </div>
-    <a href="https://rantsquad.99dfy.com/video-editor" class="btn">← Go Back & Create New Video</a>
-    <p class="footer">Your video link has expired. Please create a new video.</p>
-  </div>
-</body>
-</html>
-  `;
-}
-
-/**
- * GET /api/combine/:jobId/download - Fallback local download
+ * GET /api/combine/:jobId/download - Download the combined video
  */
 router.get('/:jobId/download', async (req, res) => {
   try {
@@ -475,8 +364,33 @@ router.get('/:jobId/download', async (req, res) => {
     const outputPath = combineService.getOutputPath(jobId);
 
     if (!await fs.pathExists(outputPath)) {
-      res.status(404).send(getExpiredPageHtml());
-      return;
+      // Return a nice HTML error page
+      return res.status(404).send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <title>File Not Found</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+            .container { text-align: center; background: white; padding: 40px 60px; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); max-width: 500px; }
+            h1 { color: #e74c3c; margin-bottom: 10px; }
+            p { color: #666; line-height: 1.6; }
+            .icon { font-size: 64px; margin-bottom: 20px; }
+            a { display: inline-block; margin-top: 20px; padding: 12px 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; text-decoration: none; border-radius: 8px; font-weight: 600; transition: transform 0.2s; }
+            a:hover { transform: translateY(-2px); }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="icon">📁</div>
+            <h1>File Not Found</h1>
+            <p>This video has been automatically deleted after 24 hours, or the job ID is invalid.</p>
+            <p>Please go back to the video editor and create a new render.</p>
+            <a href="https://rantsquad.99dfy.com/video-editor">← Back to Video Editor</a>
+          </div>
+        </body>
+        </html>
+      `);
     }
 
     const stats = await fs.stat(outputPath);
@@ -490,12 +404,15 @@ router.get('/:jobId/download', async (req, res) => {
 
   } catch (error) {
     console.error('Download error:', error);
-    res.status(500).send(getExpiredPageHtml());
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
 });
 
 /**
- * DELETE /api/combine/:jobId
+ * DELETE /api/combine/:jobId - Cleanup job files
  */
 router.delete('/:jobId', async (req, res) => {
   try {
