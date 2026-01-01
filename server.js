@@ -11,6 +11,7 @@ const jobsRoutes = require('./routes/jobs');
 const splitRoutes = require('./routes/split');
 const combineRoutes = require('./routes/combine');
 const adminRoutes = require('./routes/admin');
+const uploadRoutes = require('./routes/upload');  // NEW: Direct video upload
 
 // Import services
 const cleanupService = require('./services/cleanupService');
@@ -50,7 +51,8 @@ app.get('/health', (req, res) => {
       render: 'active',
       split: 'active',
       combine: 'active',
-      cleanup: 'active'
+      cleanup: 'active',
+      upload: 'active'  // NEW
     }
   });
 });
@@ -63,19 +65,26 @@ app.use('/api/jobs', jobsRoutes);
 app.use('/api/split', splitRoutes);
 app.use('/api/combine', combineRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/upload', uploadRoutes);  // NEW: Direct video upload
 
 // Error handling for multer
 app.use((err, req, res, next) => {
   if (err.code === 'LIMIT_FILE_SIZE') {
     return res.status(413).json({
       success: false,
-      error: 'File too large. Maximum size is 100MB per file.'
+      error: 'File too large. Maximum size is 500MB.'
     });
   }
   if (err.code === 'LIMIT_FILE_COUNT') {
     return res.status(400).json({
       success: false,
       error: 'Too many files. Maximum is 20 files.'
+    });
+  }
+  if (err.message && err.message.includes('Invalid file type')) {
+    return res.status(400).json({
+      success: false,
+      error: err.message
     });
   }
   console.error('Error:', err);
@@ -95,6 +104,8 @@ app.listen(PORT, () => {
   console.log('  POST /api/split');
   console.log('  POST /api/combine');
   console.log('  POST /api/combine/from-split/:splitJobId');
+  console.log('  POST /api/upload                    ← NEW: Direct video upload');
+  console.log('  POST /api/upload/with-reactions     ← NEW: Upload + split in one step');
   console.log('  GET  /api/combine/:jobId/download');
   console.log('  GET  /api/split/:jobId/download');
   console.log('  GET  /api/jobs/:jobId/download');
