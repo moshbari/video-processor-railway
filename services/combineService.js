@@ -85,6 +85,78 @@ class CombineService {
   }
 
   /**
+   * Create a video from a still image (for background)
+   * This is PASS 2 of the three-pass method
+   */
+  async createVideoFromImage(imagePath, outputPath, duration, targetWidth, targetHeight) {
+    return new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(imagePath)
+        .inputOptions(['-loop', '1'])
+        .outputOptions([
+          '-vf', `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+          '-c:v', 'libx264',
+          '-preset', 'fast',
+          '-crf', '23',
+          '-t', String(duration),
+          '-pix_fmt', 'yuv420p',
+          '-r', '30',
+          '-y'
+        ])
+        .on('start', cmd => console.log('Creating background video:', cmd))
+        .on('end', () => {
+          console.log(`Background video created: ${duration}s`);
+          resolve(outputPath);
+        })
+        .on('error', reject)
+        .save(outputPath);
+    });
+  }
+
+  /**
+   * Overlay PiP on background video
+   * This is PASS 3 of the three-pass method
+   */
+  async overlayPipOnBackground(backgroundPath, reactionPath, outputPath, pipWidth, pipHeight, pipX, pipY, hasAudio) {
+    return new Promise((resolve, reject) => {
+      const filterComplex = [
+        `[1:v]scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,setsar=1[pip]`,
+        `[0:v][pip]overlay=${pipX}:${pipY}[outv]`
+      ].join(';');
+
+      const outputOptions = [
+        '-filter_complex', filterComplex,
+        '-map', '[outv]',
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-movflags', '+faststart',
+        '-y'
+      ];
+
+      // Add audio mapping - use reaction audio if available
+      if (hasAudio) {
+        outputOptions.push('-map', '1:a', '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '128k');
+      }
+
+      ffmpeg()
+        .input(backgroundPath)
+        .input(reactionPath)
+        .outputOptions(outputOptions)
+        .on('start', cmd => console.log('Overlay PiP:', cmd))
+        .on('progress', p => {
+          if (p.percent) console.log(`  Overlay: ${Math.round(p.percent)}%`);
+        })
+        .on('end', () => {
+          console.log('PiP overlay complete');
+          resolve(outputPath);
+        })
+        .on('error', reject)
+        .save(outputPath);
+    });
+  }
+
+  /**
    * Calculate PiP coordinates based on position
    * @param {string} position - 'top-right', 'bottom-right', 'bottom-left', 'top-left', or 'random'
    * @param {number} targetWidth - Width of the target video
@@ -135,11 +207,10 @@ class CombineService {
   }
 
   /**
-   * Create PiP segment: frozen last frame with reaction overlay
-   * - Reaction video is 35% width
-   * - Configurable position (top-right, bottom-right, bottom-left, top-left, random)
-   * - Maintains reaction video aspect ratio
-   * - Only reaction audio plays
+   * Create PiP segment using THREE-PASS method for reliable audio/video sync:
+   * - PASS 1: Extract last frame as JPG
+   * - PASS 2: Create background video from that frame (exact duration matching audio)
+   * - PASS 3: Overlay reaction video on background
    * 
    * @param {string} originalClipPath - Path to original clip
    * @param {string} reactionPath - Path to reaction video
@@ -150,123 +221,98 @@ class CombineService {
    */
   async createPipSegment(originalClipPath, reactionPath, outputPath, targetWidth = 1080, targetHeight = 1920, pipPosition = 'top-right') {
     const workDir = path.dirname(outputPath);
-    const lastFramePath = path.join(workDir, `lastframe_${Date.now()}.jpg`);
+    const timestamp = Date.now();
+    const lastFramePath = path.join(workDir, `lastframe_${timestamp}.jpg`);
+    const backgroundVideoPath = path.join(workDir, `background_${timestamp}.mp4`);
     
     try {
-      console.log('=== Starting PiP Segment Creation ===');
-      console.log(`Original clip: ${originalClipPath}`);
+      console.log('\n=== THREE-PASS PiP Creation ===');
+      console.log(`Original: ${originalClipPath}`);
       console.log(`Reaction: ${reactionPath}`);
-      console.log(`Output: ${outputPath}`);
-      console.log(`Requested PiP position: ${pipPosition}`);
+      console.log(`Requested position: ${pipPosition}`);
       
-      // Extract last frame
-      console.log('Step 1: Extracting last frame...');
-      await this.extractLastFrame(originalClipPath, lastFramePath);
-      
-      if (!await fs.pathExists(lastFramePath)) {
-        throw new Error(`Last frame file not found after extraction: ${lastFramePath}`);
+      // Verify reaction file exists
+      if (!await fs.pathExists(reactionPath)) {
+        throw new Error(`Reaction file not found: ${reactionPath}`);
       }
-      console.log('Step 1: Complete - frame extracted');
       
-      // Get reaction video metadata
-      console.log('Step 2: Getting reaction video info...');
+      // Get reaction metadata FIRST to know the duration
       const reactionMeta = await this.getVideoMetadata(reactionPath);
-      
       console.log(`Reaction metadata:`);
-      console.log(`  - Duration: ${reactionMeta.duration}s`);
+      console.log(`  - Video duration: ${reactionMeta.videoDuration}s`);
+      console.log(`  - Audio duration: ${reactionMeta.audioDuration}s`);
+      console.log(`  - Max duration (used): ${reactionMeta.duration}s`);
       console.log(`  - Dimensions: ${reactionMeta.width}x${reactionMeta.height}`);
-      console.log(`  - Has video: ${reactionMeta.hasVideo}, Has audio: ${reactionMeta.hasAudio}`);
+      console.log(`  - Has audio: ${reactionMeta.hasAudio}`);
       
-      if (!reactionMeta.hasVideo) {
-        throw new Error('Reaction file has no video stream');
+      if (!reactionMeta.hasVideo || reactionMeta.width <= 0 || reactionMeta.height <= 0) {
+        throw new Error('Reaction has no valid video');
       }
       
-      if (reactionMeta.width <= 0 || reactionMeta.height <= 0) {
-        throw new Error(`Invalid reaction dimensions: ${reactionMeta.width}x${reactionMeta.height}`);
-      }
-      
+      // Use the MAX duration (ensures audio doesn't get cut)
       const totalDuration = reactionMeta.duration;
-      
       if (totalDuration <= 0 || isNaN(totalDuration)) {
-        throw new Error(`Invalid reaction duration: ${totalDuration}`);
+        throw new Error(`Invalid duration: ${totalDuration}`);
       }
       
-      // Calculate PiP size (35% of target width, maintain aspect ratio)
+      // Calculate PiP dimensions (35% width, maintain aspect ratio)
       const pipWidth = Math.round(targetWidth * 0.35);
-      const aspectRatio = reactionMeta.height / reactionMeta.width;
-      const pipHeight = Math.round(pipWidth * aspectRatio);
+      const pipHeight = Math.round(pipWidth * (reactionMeta.height / reactionMeta.width));
       
-      if (pipWidth <= 0 || pipHeight <= 0 || isNaN(pipWidth) || isNaN(pipHeight)) {
-        throw new Error(`Invalid calculated PiP dimensions: ${pipWidth}x${pipHeight}`);
-      }
-      
-      // Get PiP coordinates based on position
+      // Get coordinates based on position
       const coords = this.getPipCoordinates(pipPosition, targetWidth, targetHeight, pipWidth, pipHeight);
       const pipX = coords.x;
       const pipY = coords.y;
       
-      console.log(`PiP dimensions: ${pipWidth}x${pipHeight}`);
-      console.log(`PiP position: ${coords.position} at (${pipX}, ${pipY})`);
-      console.log(`Total segment duration: ${totalDuration}s`);
+      console.log(`PiP: ${pipWidth}x${pipHeight} at ${coords.position} (${pipX}, ${pipY})`);
       
-      // Build filter_complex string
-      const filterComplex = [
-        `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[bg]`,
-        `[1:v]scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,setsar=1[pip]`,
-        `[bg][pip]overlay=${pipX}:${pipY}:eof_action=repeat[outv]`
-      ].join(';');
+      // PASS 1: Extract last frame
+      console.log('\n--- Pass 1: Extract frame ---');
+      await this.extractLastFrame(originalClipPath, lastFramePath);
       
-      console.log('Step 3: Rendering PiP segment...');
+      if (!await fs.pathExists(lastFramePath)) {
+        throw new Error('Failed to extract last frame');
+      }
+      console.log('Pass 1 complete: Frame extracted');
       
-      return new Promise((resolve, reject) => {
-        ffmpeg()
-          .input(lastFramePath)
-          .inputOptions(['-loop', '1'])
-          .input(reactionPath)
-          .outputOptions([
-            '-filter_complex', filterComplex,
-            '-map', '[outv]',
-            '-map', '1:a',
-            '-c:v', 'libx264',
-            '-preset', 'fast',
-            '-crf', '23',
-            '-c:a', 'aac',
-            '-ar', '44100',
-            '-ac', '2',
-            '-b:a', '128k',
-            '-t', String(totalDuration),
-            '-movflags', '+faststart',
-            '-y'
-          ])
-          .on('start', (cmd) => {
-            console.log('Creating PiP segment with command:', cmd);
-          })
-          .on('progress', (progress) => {
-            if (progress.percent) {
-              console.log(`  PiP rendering: ${Math.round(progress.percent)}%`);
-            }
-          })
-          .on('end', async () => {
-            await fs.remove(lastFramePath).catch(() => {});
-            
-            if (await fs.pathExists(outputPath)) {
-              const stats = await fs.stat(outputPath);
-              console.log(`PiP segment created: ${(stats.size/1024/1024).toFixed(2)} MB`);
-              resolve(outputPath);
-            } else {
-              reject(new Error('PiP output file not created'));
-            }
-          })
-          .on('error', async (err) => {
-            await fs.remove(lastFramePath).catch(() => {});
-            console.error('PiP segment error:', err);
-            reject(err);
-          })
-          .save(outputPath);
-      });
+      // PASS 2: Create background video from frame (EXACT duration to match audio)
+      console.log('\n--- Pass 2: Create background video ---');
+      await this.createVideoFromImage(lastFramePath, backgroundVideoPath, totalDuration, targetWidth, targetHeight);
+      
+      if (!await fs.pathExists(backgroundVideoPath)) {
+        throw new Error('Failed to create background video');
+      }
+      console.log('Pass 2 complete: Background video created');
+      
+      // PASS 3: Overlay PiP on background
+      console.log('\n--- Pass 3: Overlay PiP ---');
+      await this.overlayPipOnBackground(
+        backgroundVideoPath, 
+        reactionPath, 
+        outputPath, 
+        pipWidth, 
+        pipHeight, 
+        pipX, 
+        pipY, 
+        reactionMeta.hasAudio
+      );
+      
+      // Cleanup temp files
+      await fs.remove(lastFramePath).catch(() => {});
+      await fs.remove(backgroundVideoPath).catch(() => {});
+      
+      if (await fs.pathExists(outputPath)) {
+        const stats = await fs.stat(outputPath);
+        console.log(`\n=== PiP Complete: ${(stats.size/1024/1024).toFixed(2)} MB ===\n`);
+        return outputPath;
+      } else {
+        throw new Error('PiP output file not created');
+      }
       
     } catch (error) {
+      // Cleanup on error
       await fs.remove(lastFramePath).catch(() => {});
+      await fs.remove(backgroundVideoPath).catch(() => {});
       console.error('createPipSegment error:', error);
       throw error;
     }
@@ -368,7 +414,7 @@ class CombineService {
         // Process reaction based on mode
         if (reactionPath) {
           if (mode === 'pip') {
-            // PiP mode: frozen frame + reaction overlay
+            // PiP mode: frozen frame + reaction overlay (THREE-PASS method)
             const pipOutputPath = path.join(workDir, `pip_${i}.mp4`);
             console.log(`Creating PiP segment (position: ${pipPosition})...`);
             await this.createPipSegment(
