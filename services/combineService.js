@@ -33,328 +33,365 @@ class CombineService {
         const videoDuration = videoStream ? parseValidDuration(videoStream.duration) || formatDuration : 0;
         const audioDuration = audioStream ? parseValidDuration(audioStream.duration) || formatDuration : 0;
         
-        let maxDuration = Math.max(videoDuration, audioDuration, formatDuration);
-        if (maxDuration <= 0) {
-          maxDuration = formatDuration || 1;
-        }
-        
-        const width = videoStream?.width || 0;
-        const height = videoStream?.height || 0;
+        // Use the maximum of all durations
+        const duration = Math.max(formatDuration, videoDuration, audioDuration);
         
         resolve({
-          duration: maxDuration,
+          duration,
+          formatDuration,
           videoDuration,
           audioDuration,
-          formatDuration,
-          width,
-          height,
-          hasVideo: !!videoStream && width > 0 && height > 0,
+          width: videoStream?.width || 0,
+          height: videoStream?.height || 0,
+          hasVideo: !!videoStream,
           hasAudio: !!audioStream
         });
       });
     });
   }
 
+  /**
+   * Get video duration using ffprobe
+   */
   async getVideoDuration(videoPath) {
-    const metadata = await this.getVideoMetadata(videoPath);
-    return metadata.duration;
+    const meta = await this.getVideoMetadata(videoPath);
+    return meta.duration;
+  }
+
+  /**
+   * Get video dimensions using ffprobe
+   */
+  async getVideoDimensions(videoPath) {
+    const meta = await this.getVideoMetadata(videoPath);
+    return { width: meta.width, height: meta.height };
   }
 
   /**
    * Extract the last frame from a video as an image
    */
   async extractLastFrame(videoPath, outputPath) {
-    console.log(`Extracting last frame from: ${videoPath}`);
-    
     const duration = await this.getVideoDuration(videoPath);
-    let seekTime = duration < 1 ? Math.max(0, duration * 0.8) : Math.max(0, duration - 0.1);
+    const seekTime = Math.max(0, duration - 0.1);
     
     return new Promise((resolve, reject) => {
       ffmpeg(videoPath)
         .seekInput(seekTime)
         .frames(1)
         .outputOptions(['-q:v', '2', '-y'])
-        .on('end', async () => {
-          if (await fs.pathExists(outputPath)) {
-            console.log(`✓ Frame extracted`);
-            resolve(outputPath);
-          } else {
-            reject(new Error('Frame file not found'));
-          }
-        })
+        .on('end', () => resolve(outputPath))
         .on('error', reject)
         .save(outputPath);
     });
   }
 
   /**
-   * Create reaction segment: Frozen frame background with reaction video overlay
-   * Audio comes from REACTION only
+   * Calculate PiP coordinates based on position
+   * @param {string} position - 'top-right', 'bottom-right', 'bottom-left', 'top-left', or 'random'
+   * @param {number} targetWidth - Width of the target video
+   * @param {number} targetHeight - Height of the target video
+   * @param {number} pipWidth - Width of the PiP overlay
+   * @param {number} pipHeight - Height of the PiP overlay
+   * @param {number} padding - Padding from edges (default: 20)
+   * @returns {object} - { x, y, position } coordinates and resolved position name
    */
-  async createReactionSegment(lastFramePath, reactionPath, outputPath, targetWidth = 1080, targetHeight = 1920) {
-    console.log('\n=== Creating Reaction Segment (Frozen Frame + Reaction) ===');
+  getPipCoordinates(position, targetWidth, targetHeight, pipWidth, pipHeight, padding = 20) {
+    const positions = {
+      'top-right': { 
+        x: targetWidth - pipWidth - padding, 
+        y: padding 
+      },
+      'bottom-right': { 
+        x: targetWidth - pipWidth - padding, 
+        y: targetHeight - pipHeight - padding 
+      },
+      'bottom-left': { 
+        x: padding, 
+        y: targetHeight - pipHeight - padding 
+      },
+      'top-left': { 
+        x: padding, 
+        y: padding 
+      }
+    };
     
-    const reactionMeta = await this.getVideoMetadata(reactionPath);
-    console.log(`Reaction duration: ${reactionMeta.duration.toFixed(2)}s`);
+    // Handle random position
+    let resolvedPosition = position;
+    if (position === 'random') {
+      const positionKeys = Object.keys(positions);
+      resolvedPosition = positionKeys[Math.floor(Math.random() * positionKeys.length)];
+      console.log(`Random position selected: ${resolvedPosition}`);
+    }
     
-    // Calculate PiP dimensions (35% of width)
-    const pipWidth = Math.round(targetWidth * 0.35);
-    const pipHeight = Math.round(pipWidth * (reactionMeta.height / reactionMeta.width));
-    const pipX = targetWidth - pipWidth - 20;  // Top-right with padding
-    const pipY = 20;
+    // Default to top-right if invalid position
+    if (!positions[resolvedPosition]) {
+      console.warn(`Invalid position "${resolvedPosition}", defaulting to top-right`);
+      resolvedPosition = 'top-right';
+    }
     
-    console.log(`PiP size: ${pipWidth}x${pipHeight} at position (${pipX}, ${pipY})`);
+    return {
+      ...positions[resolvedPosition],
+      position: resolvedPosition
+    };
+  }
+
+  /**
+   * Create PiP segment: frozen last frame with reaction overlay
+   * - Reaction video is 35% width
+   * - Configurable position (top-right, bottom-right, bottom-left, top-left, random)
+   * - Maintains reaction video aspect ratio
+   * - Only reaction audio plays
+   * 
+   * @param {string} originalClipPath - Path to original clip
+   * @param {string} reactionPath - Path to reaction video
+   * @param {string} outputPath - Path for output file
+   * @param {number} targetWidth - Target video width (default: 1080)
+   * @param {number} targetHeight - Target video height (default: 1920)
+   * @param {string} pipPosition - PiP position: 'top-right', 'bottom-right', 'bottom-left', 'top-left', 'random'
+   */
+  async createPipSegment(originalClipPath, reactionPath, outputPath, targetWidth = 1080, targetHeight = 1920, pipPosition = 'top-right') {
+    const workDir = path.dirname(outputPath);
+    const lastFramePath = path.join(workDir, `lastframe_${Date.now()}.jpg`);
     
-    return new Promise((resolve, reject) => {
-      // Filter: 
-      // - Create video from frozen image (looped for duration of reaction)
-      // - Scale reaction for PiP
-      // - Overlay reaction on frozen frame
-      const filterComplex = [
-        // Scale and pad the frozen frame to target dimensions
-        `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,loop=loop=-1:size=1:start=0[bg]`,
-        // Scale reaction for PiP corner
-        `[1:v]scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,setsar=1[pip]`,
-        // Overlay PiP on background
-        `[bg][pip]overlay=${pipX}:${pipY}:shortest=1[outv]`
-      ].join(';');
+    try {
+      console.log('=== Starting PiP Segment Creation ===');
+      console.log(`Original clip: ${originalClipPath}`);
+      console.log(`Reaction: ${reactionPath}`);
+      console.log(`Output: ${outputPath}`);
+      console.log(`Requested PiP position: ${pipPosition}`);
       
-      const command = ffmpeg()
-        .input(lastFramePath)
-        .inputOptions(['-loop', '1'])  // Loop the image
-        .input(reactionPath);
+      // Extract last frame
+      console.log('Step 1: Extracting last frame...');
+      await this.extractLastFrame(originalClipPath, lastFramePath);
       
-      const outputOptions = [
-        '-filter_complex', filterComplex,
-        '-map', '[outv]',
-        '-t', String(reactionMeta.duration),  // Duration matches reaction
-        '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
-        '-r', '30'
-      ];
+      if (!await fs.pathExists(lastFramePath)) {
+        throw new Error(`Last frame file not found after extraction: ${lastFramePath}`);
+      }
+      console.log('Step 1: Complete - frame extracted');
       
-      // Audio from reaction
-      if (reactionMeta.hasAudio) {
-        outputOptions.push('-map', '1:a', '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '128k');
+      // Get reaction video metadata
+      console.log('Step 2: Getting reaction video info...');
+      const reactionMeta = await this.getVideoMetadata(reactionPath);
+      
+      console.log(`Reaction metadata:`);
+      console.log(`  - Duration: ${reactionMeta.duration}s`);
+      console.log(`  - Dimensions: ${reactionMeta.width}x${reactionMeta.height}`);
+      console.log(`  - Has video: ${reactionMeta.hasVideo}, Has audio: ${reactionMeta.hasAudio}`);
+      
+      if (!reactionMeta.hasVideo) {
+        throw new Error('Reaction file has no video stream');
       }
       
-      outputOptions.push('-movflags', '+faststart', '-y');
+      if (reactionMeta.width <= 0 || reactionMeta.height <= 0) {
+        throw new Error(`Invalid reaction dimensions: ${reactionMeta.width}x${reactionMeta.height}`);
+      }
       
-      command
-        .outputOptions(outputOptions)
-        .on('start', cmd => console.log('Reaction segment command:', cmd))
-        .on('progress', p => {
-          if (p.percent) console.log(`  Progress: ${Math.round(p.percent)}%`);
-        })
-        .on('end', async () => {
-          if (await fs.pathExists(outputPath)) {
-            const stats = await fs.stat(outputPath);
-            console.log(`✓ Reaction segment created: ${(stats.size/1024/1024).toFixed(2)} MB`);
-            resolve(outputPath);
-          } else {
-            reject(new Error('Reaction segment not created'));
-          }
-        })
-        .on('error', reject)
-        .save(outputPath);
-    });
+      const totalDuration = reactionMeta.duration;
+      
+      if (totalDuration <= 0 || isNaN(totalDuration)) {
+        throw new Error(`Invalid reaction duration: ${totalDuration}`);
+      }
+      
+      // Calculate PiP size (35% of target width, maintain aspect ratio)
+      const pipWidth = Math.round(targetWidth * 0.35);
+      const aspectRatio = reactionMeta.height / reactionMeta.width;
+      const pipHeight = Math.round(pipWidth * aspectRatio);
+      
+      if (pipWidth <= 0 || pipHeight <= 0 || isNaN(pipWidth) || isNaN(pipHeight)) {
+        throw new Error(`Invalid calculated PiP dimensions: ${pipWidth}x${pipHeight}`);
+      }
+      
+      // Get PiP coordinates based on position
+      const coords = this.getPipCoordinates(pipPosition, targetWidth, targetHeight, pipWidth, pipHeight);
+      const pipX = coords.x;
+      const pipY = coords.y;
+      
+      console.log(`PiP dimensions: ${pipWidth}x${pipHeight}`);
+      console.log(`PiP position: ${coords.position} at (${pipX}, ${pipY})`);
+      console.log(`Total segment duration: ${totalDuration}s`);
+      
+      // Build filter_complex string
+      const filterComplex = [
+        `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[bg]`,
+        `[1:v]scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,setsar=1[pip]`,
+        `[bg][pip]overlay=${pipX}:${pipY}:eof_action=repeat[outv]`
+      ].join(';');
+      
+      console.log('Step 3: Rendering PiP segment...');
+      
+      return new Promise((resolve, reject) => {
+        ffmpeg()
+          .input(lastFramePath)
+          .inputOptions(['-loop', '1'])
+          .input(reactionPath)
+          .outputOptions([
+            '-filter_complex', filterComplex,
+            '-map', '[outv]',
+            '-map', '1:a',
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-ar', '44100',
+            '-ac', '2',
+            '-b:a', '128k',
+            '-t', String(totalDuration),
+            '-movflags', '+faststart',
+            '-y'
+          ])
+          .on('start', (cmd) => {
+            console.log('Creating PiP segment with command:', cmd);
+          })
+          .on('progress', (progress) => {
+            if (progress.percent) {
+              console.log(`  PiP rendering: ${Math.round(progress.percent)}%`);
+            }
+          })
+          .on('end', async () => {
+            await fs.remove(lastFramePath).catch(() => {});
+            
+            if (await fs.pathExists(outputPath)) {
+              const stats = await fs.stat(outputPath);
+              console.log(`PiP segment created: ${(stats.size/1024/1024).toFixed(2)} MB`);
+              resolve(outputPath);
+            } else {
+              reject(new Error('PiP output file not created'));
+            }
+          })
+          .on('error', async (err) => {
+            await fs.remove(lastFramePath).catch(() => {});
+            console.error('PiP segment error:', err);
+            reject(err);
+          })
+          .save(outputPath);
+      });
+      
+    } catch (error) {
+      await fs.remove(lastFramePath).catch(() => {});
+      console.error('createPipSegment error:', error);
+      throw error;
+    }
   }
 
   /**
    * Normalize a clip to consistent format
    */
   async normalizeClip(inputPath, outputPath, targetWidth = 1080, targetHeight = 1920) {
-    const metadata = await this.getVideoMetadata(inputPath);
-    const videoFilter = `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`;
-    
-    if (metadata.hasAudio) {
-      return new Promise((resolve, reject) => {
-        ffmpeg(inputPath)
-          .outputOptions([
-            '-vf', videoFilter,
-            '-r', '30',
-            '-c:v', 'libx264',
-            '-preset', 'fast',
-            '-crf', '23',
-            '-c:a', 'aac',
-            '-ar', '44100',
-            '-ac', '2',
-            '-b:a', '128k',
-            '-movflags', '+faststart',
-            '-y'
-          ])
-          .on('start', cmd => console.log('Normalize:', cmd))
-          .on('progress', p => {
-            if (p.percent) console.log(`  Normalizing: ${Math.round(p.percent)}%`);
-          })
-          .on('end', () => {
-            console.log('Normalized successfully');
-            resolve(outputPath);
-          })
-          .on('error', reject)
-          .save(outputPath);
-      });
-    } else {
-      // Add silent audio
-      console.log('Adding silent audio track');
-      const filterComplex = `[0:v]${videoFilter}[v];anullsrc=r=44100:cl=stereo[a]`;
-      
-      return new Promise((resolve, reject) => {
-        ffmpeg(inputPath)
-          .outputOptions([
-            '-filter_complex', filterComplex,
-            '-map', '[v]',
-            '-map', '[a]',
-            '-r', '30',
-            '-c:v', 'libx264',
-            '-preset', 'fast',
-            '-crf', '23',
-            '-c:a', 'aac',
-            '-ar', '44100',
-            '-ac', '2',
-            '-b:a', '128k',
-            '-shortest',
-            '-movflags', '+faststart',
-            '-y'
-          ])
-          .on('start', cmd => console.log('Normalize (add audio):', cmd))
-          .on('progress', p => {
-            if (p.percent) console.log(`  Normalizing: ${Math.round(p.percent)}%`);
-          })
-          .on('end', () => {
-            console.log('Normalized successfully (silent audio added)');
-            resolve(outputPath);
-          })
-          .on('error', reject)
-          .save(outputPath);
-      });
-    }
+    return new Promise((resolve, reject) => {
+      ffmpeg(inputPath)
+        .outputOptions([
+          '-vf', `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+          '-r', '30',
+          '-c:v', 'libx264',
+          '-preset', 'fast',
+          '-crf', '23',
+          '-c:a', 'aac',
+          '-ar', '44100',
+          '-ac', '2',
+          '-b:a', '128k',
+          '-movflags', '+faststart',
+          '-y'
+        ])
+        .on('start', (cmd) => {
+          console.log('Normalizing with command:', cmd);
+        })
+        .on('progress', (progress) => {
+          if (progress.percent) {
+            console.log(`  Normalizing: ${Math.round(progress.percent)}%`);
+          }
+        })
+        .on('end', () => {
+          console.log('Clip normalized successfully');
+          resolve(outputPath);
+        })
+        .on('error', (err) => {
+          console.error('Normalization error:', err);
+          reject(err);
+        })
+        .save(outputPath);
+    });
   }
 
   /**
-   * Combine clips with reactions
+   * Combine original clips with reaction clips
    * 
-   * SEQUENTIAL MODE: Clip 1 → Reaction 1 (full screen) → Clip 2 → Reaction 2 → ...
-   * PIP MODE (Watch then React): Clip 1 → [Frozen Frame + Reaction 1 in corner] → Clip 2 → [Frozen Frame + Reaction 2 in corner] → ...
+   * Supports two modes:
+   * - 'sequential' (default): clip1 → reaction1_fullscreen → clip2 → reaction2_fullscreen
+   * - 'pip': clip1 → frozen_frame + reaction1_pip → clip2 → frozen_frame + reaction2_pip
+   * 
+   * For 'pip' mode, supports pipPosition:
+   * - 'top-right' (default), 'bottom-right', 'bottom-left', 'top-left', 'random'
    */
-  async combineClipsWithReactions(originalClips, reactionClips, jobId = null, options = {}) {
-    jobId = jobId || uuidv4();
-    const workDir = path.join(this.tempDir, jobId);
-    await fs.ensureDir(workDir);
-
+  async combineClipsWithReactions(originalClips, reactionClips, outputFileName = null, options = {}) {
     const mode = options.mode || 'sequential';
-    const targetWidth = options.targetWidth || 1080;
-    const targetHeight = options.targetHeight || 1920;
-
-    console.log(`\n${'='.repeat(50)}`);
-    console.log(`COMBINE MODE: ${mode.toUpperCase()}`);
-    console.log(`${'='.repeat(50)}\n`);
-
+    const pipPosition = options.pipPosition || 'top-right';
+    const jobId = uuidv4();
+    const workDir = path.join(this.tempDir, jobId);
+    
+    await fs.ensureDir(workDir);
+    
+    console.log('\n' + '='.repeat(60));
+    console.log('COMBINE CLIPS WITH REACTIONS');
+    console.log('='.repeat(60));
+    console.log(`Job ID: ${jobId}`);
+    console.log(`Mode: ${mode}`);
+    if (mode === 'pip') {
+      console.log(`PiP Position: ${pipPosition}`);
+    }
+    console.log(`Original clips: ${originalClips.length}`);
+    console.log(`Reaction clips: ${reactionClips.length}`);
+    
     try {
-      if (!Array.isArray(originalClips) || originalClips.length === 0) {
-        throw new Error('No original clips provided');
+      // Build array of reactions matching original clips
+      const reactions = [];
+      for (let i = 0; i < originalClips.length; i++) {
+        reactions.push(reactionClips[i] || null);
       }
       
-      const reactions = Array.isArray(reactionClips) ? reactionClips : [];
-      console.log(`Processing ${originalClips.length} clips with ${reactions.filter(r => r).length} reactions`);
-
       const processedClips = [];
+      const targetWidth = 1080;
+      const targetHeight = 1920;
       
       for (let i = 0; i < originalClips.length; i++) {
         const originalPath = originalClips[i];
-        const reactionPath = reactions[i] || null;
+        const reactionPath = reactions[i];
         
-        console.log(`\n${'─'.repeat(40)}`);
-        console.log(`CLIP ${i + 1}/${originalClips.length}`);
-        console.log(`${'─'.repeat(40)}`);
-        console.log(`Original: ${originalPath}`);
-        console.log(`Reaction: ${reactionPath || 'none'}`);
+        console.log(`\n--- Processing clip ${i + 1}/${originalClips.length} ---`);
+        console.log(`Original: ${path.basename(originalPath)}`);
+        console.log(`Reaction: ${reactionPath ? path.basename(reactionPath) : 'NONE'}`);
         
-        // Verify original exists
-        if (!await fs.pathExists(originalPath)) {
-          console.error(`Original not found, skipping`);
-          continue;
-        }
-        
-        // Step 1: Normalize and add original clip (WATCH phase)
-        const normalizedOriginalPath = path.join(workDir, `clip_${i}.mp4`);
-        console.log('\n[WATCH] Normalizing original clip...');
+        // Normalize the original clip
+        const normalizedOriginalPath = path.join(workDir, `normalized_original_${i}.mp4`);
+        console.log('Normalizing original clip...');
         await this.normalizeClip(originalPath, normalizedOriginalPath, targetWidth, targetHeight);
-        
-        if (!await fs.pathExists(normalizedOriginalPath)) {
-          console.error('Failed to normalize original, skipping');
-          continue;
-        }
         processedClips.push(normalizedOriginalPath);
-        console.log(`✓ Added clip ${i + 1} (WATCH phase)`);
         
-        // Step 2: If there's a reaction, create REACT phase
-        const hasReaction = reactionPath && typeof reactionPath === 'string' && await fs.pathExists(reactionPath);
-        
-        if (hasReaction) {
-          console.log('\n[REACT] Processing reaction...');
-          
-          // Normalize reaction first
-          const normalizedReactionPath = path.join(workDir, `reaction_${i}.mp4`);
-          
-          try {
+        // Process reaction based on mode
+        if (reactionPath) {
+          if (mode === 'pip') {
+            // PiP mode: frozen frame + reaction overlay
+            const pipOutputPath = path.join(workDir, `pip_${i}.mp4`);
+            console.log(`Creating PiP segment (position: ${pipPosition})...`);
+            await this.createPipSegment(
+              normalizedOriginalPath, 
+              reactionPath, 
+              pipOutputPath, 
+              targetWidth, 
+              targetHeight,
+              pipPosition
+            );
+            processedClips.push(pipOutputPath);
+          } else {
+            // Sequential mode: full-screen reaction
+            const normalizedReactionPath = path.join(workDir, `normalized_reaction_${i}.mp4`);
+            console.log('Normalizing reaction clip...');
             await this.normalizeClip(reactionPath, normalizedReactionPath, targetWidth, targetHeight);
-            
-            if (!await fs.pathExists(normalizedReactionPath)) {
-              throw new Error('Normalized reaction not created');
-            }
-            
-            if (mode === 'pip') {
-              // PIP MODE: Frozen frame + reaction overlay in corner
-              const lastFramePath = path.join(workDir, `frame_${i}.jpg`);
-              const reactSegmentPath = path.join(workDir, `react_segment_${i}.mp4`);
-              
-              // Extract last frame of the clip we just watched
-              await this.extractLastFrame(normalizedOriginalPath, lastFramePath);
-              
-              // Create reaction segment (frozen frame + reaction in corner)
-              await this.createReactionSegment(
-                lastFramePath,
-                normalizedReactionPath,
-                reactSegmentPath,
-                targetWidth,
-                targetHeight
-              );
-              
-              if (await fs.pathExists(reactSegmentPath)) {
-                const stats = await fs.stat(reactSegmentPath);
-                if (stats.size > 1000) {
-                  processedClips.push(reactSegmentPath);
-                  console.log(`✓ Added reaction ${i + 1} (REACT phase - PiP)`);
-                } else {
-                  throw new Error('Reaction segment too small');
-                }
-              } else {
-                throw new Error('Reaction segment not created');
-              }
-              
-              // Cleanup frame
-              await fs.remove(lastFramePath).catch(() => {});
-              
-            } else {
-              // SEQUENTIAL MODE: Full screen reaction
-              processedClips.push(normalizedReactionPath);
-              console.log(`✓ Added reaction ${i + 1} (REACT phase - full screen)`);
-            }
-          } catch (err) {
-            console.error(`Reaction processing failed: ${err.message}`);
+            processedClips.push(normalizedReactionPath);
           }
         }
       }
-
-      if (processedClips.length === 0) {
-        throw new Error('No clips processed successfully');
-      }
-
-      console.log(`\n${'─'.repeat(40)}`);
-      console.log(`FINAL SEQUENCE (${processedClips.length} segments):`);
-      console.log(`${'─'.repeat(40)}`);
+      
+      console.log('\n--- Creating final video ---');
+      console.log('Clips to concatenate:');
       processedClips.forEach((p, i) => {
         console.log(`  ${i + 1}. ${path.basename(p)}`);
       });
@@ -378,6 +415,7 @@ class CombineService {
       return {
         jobId,
         mode,
+        pipPosition: mode === 'pip' ? pipPosition : null,
         outputPath,
         segmentCount: processedClips.length,
         originalCount: originalClips.length,
