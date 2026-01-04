@@ -45,13 +45,14 @@ router.post('/', async (req, res) => {
       const clipR2Links = {};
       
       // Build clip file list with verified paths
+      // IMPORTANT: Use consistent path format: {jobId}/clip_N.mp4
       for (const clip of result.clips) {
         const clipPath = splitService.getClipPath(result.jobId, clip.number);
         
         if (await fs.pathExists(clipPath)) {
           clipFiles.push({
             localPath: clipPath,
-            fileName: `splits/${result.jobId}/clip_${clip.number}.mp4`,
+            fileName: `${result.jobId}/clip_${clip.number}.mp4`,  // Consistent path
             mimeType: 'video/mp4',
             clipNumber: clip.number
           });
@@ -66,7 +67,7 @@ router.post('/', async (req, res) => {
       if (await fs.pathExists(guidePath)) {
         clipFiles.push({
           localPath: guidePath,
-          fileName: `splits/${result.jobId}/reactions_guide.txt`,
+          fileName: `${result.jobId}/reactions_guide.txt`,  // Consistent path
           mimeType: 'text/plain'
         });
       }
@@ -86,34 +87,38 @@ router.post('/', async (req, res) => {
       }
 
       // Create and upload manifest for later retrieval
+      // IMPORTANT: Manifest goes to same path as clips: {jobId}/manifest.json
       const manifest = {
         jobId: result.jobId,
         totalClips: result.totalClips,
         clips: result.clips.map(clip => ({
           number: clip.number,
+          filename: `clip_${clip.number}.mp4`,
           r2Link: clipR2Links[clip.number] || null
         })),
+        reactionGuide: result.reactionGuide,
         createdAt: new Date().toISOString()
       };
 
-      // Save manifest to R2
+      // Save manifest locally first
       const manifestPath = path.join(splitService.tempDir, result.jobId, 'manifest.json');
       await fs.writeJson(manifestPath, manifest);
-      await r2Service.uploadFile(manifestPath, `splits/${result.jobId}/manifest.json`, 'application/json');
+      
+      // Upload manifest to R2 - same folder as clips
+      await r2Service.uploadFile(manifestPath, `${result.jobId}/manifest.json`, 'application/json');
+      console.log(`Manifest uploaded to: ${result.jobId}/manifest.json`);
 
       // Map upload results back to clips
-      const clipsWithLinks = result.clips.map((clip, index) => {
-        const uploadResult = uploadResults[index];
+      const clipsWithLinks = result.clips.map((clip) => {
         return {
           ...clip,
-          r2Link: uploadResult?.success ? uploadResult.downloadUrl : null
+          r2Link: clipR2Links[clip.number] || null
         };
       });
 
-      // Get guide upload result
       const guideUpload = uploadResults.find(r => r.fileName.endsWith('.txt'));
 
-      console.log(`\nUpload complete: ${uploadResults.filter(r => r.success).length}/${uploadResults.length} files`);
+      console.log(`Upload complete: ${uploadResults.filter(r => r.success).length}/${uploadResults.length} files`);
 
       res.json({
         success: true,
@@ -129,10 +134,9 @@ router.post('/', async (req, res) => {
           storage: 'r2'
         }
       });
+
     } else {
-      // No R2 - return local download URLs only
-      console.log('\nR2 not configured, using local downloads');
-      
+      // No R2 - return local download URLs
       res.json({
         success: true,
         data: {
@@ -140,9 +144,7 @@ router.post('/', async (req, res) => {
           totalClips: result.totalClips,
           clips: result.clips,
           reactionGuide: result.reactionGuide,
-          guide: {
-            downloadUrl: result.guideDownloadUrl
-          },
+          guideDownloadUrl: result.guideDownloadUrl,
           storage: 'local'
         }
       });
@@ -158,194 +160,31 @@ router.post('/', async (req, res) => {
 });
 
 /**
- * Generate nice error page HTML for expired clips
- */
-function getExpiredPageHtml(type = 'clip') {
-  const title = type === 'clip' ? 'Clip Link Expired' : 'File Link Expired';
-  return `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${title}</title>
-  <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
-    }
-    .container {
-      background: rgba(255, 255, 255, 0.05);
-      backdrop-filter: blur(10px);
-      border-radius: 20px;
-      padding: 50px 40px;
-      max-width: 500px;
-      text-align: center;
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      box-shadow: 0 25px 50px rgba(0, 0, 0, 0.3);
-    }
-    .icon {
-      font-size: 80px;
-      margin-bottom: 20px;
-    }
-    h1 {
-      color: #fff;
-      font-size: 28px;
-      margin-bottom: 15px;
-      font-weight: 600;
-    }
-    .message {
-      color: rgba(255, 255, 255, 0.7);
-      font-size: 16px;
-      line-height: 1.6;
-      margin-bottom: 30px;
-    }
-    .info-box {
-      background: rgba(0, 200, 150, 0.1);
-      border: 1px solid rgba(0, 200, 150, 0.3);
-      border-radius: 12px;
-      padding: 20px;
-      margin-bottom: 30px;
-    }
-    .info-box p {
-      color: rgba(0, 200, 150, 0.9);
-      font-size: 14px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-    }
-    .btn {
-      display: inline-block;
-      background: linear-gradient(135deg, #00c896 0%, #00a67d 100%);
-      color: #fff;
-      text-decoration: none;
-      padding: 15px 40px;
-      border-radius: 30px;
-      font-size: 16px;
-      font-weight: 600;
-      transition: transform 0.2s, box-shadow 0.2s;
-      box-shadow: 0 10px 30px rgba(0, 200, 150, 0.3);
-    }
-    .btn:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 15px 40px rgba(0, 200, 150, 0.4);
-    }
-    .footer {
-      margin-top: 30px;
-      color: rgba(255, 255, 255, 0.4);
-      font-size: 13px;
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="icon">⏰</div>
-    <h1>${title}</h1>
-    <p class="message">
-      The file you're trying to download is no longer available. 
-      Our system automatically removes files after a short period to manage storage.
-    </p>
-    <div class="info-box">
-      <p>💡 Files are automatically deleted to manage storage</p>
-    </div>
-    <a href="https://rantsquad.99dfy.com/video-editor" class="btn">← Go Back & Try Again</a>
-    <p class="footer">Your file link has expired. Please split your video again.</p>
-  </div>
-</body>
-</html>
-  `;
-}
-
-/**
- * GET /api/split/:jobId/clip/:clipNumber - Download individual clip (fallback)
+ * GET /api/split/:jobId/clip/:clipNumber - Download individual clip
  */
 router.get('/:jobId/clip/:clipNumber', async (req, res) => {
   try {
     const { jobId, clipNumber } = req.params;
-    const clipPath = splitService.getClipPath(jobId, parseInt(clipNumber));
+    const clipPath = splitService.getClipPath(jobId, clipNumber);
 
     if (!await fs.pathExists(clipPath)) {
-      res.status(404).send(getExpiredPageHtml('clip'));
-      return;
+      return res.status(404).json({
+        success: false,
+        error: `Clip ${clipNumber} not found`
+      });
     }
 
     const stats = await fs.stat(clipPath);
-    const fileName = `clip_${clipNumber}.mp4`;
-
+    
     res.setHeader('Content-Length', stats.size);
     res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="clip_${clipNumber}.mp4"`);
 
     const readStream = fs.createReadStream(clipPath);
     readStream.pipe(res);
 
   } catch (error) {
-    console.error('Download error:', error);
-    res.status(500).send(getExpiredPageHtml('clip'));
-  }
-});
-
-/**
- * GET /api/split/:jobId/guide - Download reactions guide (fallback)
- */
-router.get('/:jobId/guide', async (req, res) => {
-  try {
-    const { jobId } = req.params;
-    const guidePath = splitService.getGuidePath(jobId);
-
-    if (!await fs.pathExists(guidePath)) {
-      res.status(404).send(getExpiredPageHtml('guide'));
-      return;
-    }
-
-    res.download(guidePath, 'reactions_guide.txt');
-
-  } catch (error) {
-    console.error('Download error:', error);
-    res.status(500).send(getExpiredPageHtml('guide'));
-  }
-});
-
-/**
- * GET /api/split/:jobId/status - Check job status
- */
-router.get('/:jobId/status', async (req, res) => {
-  try {
-    const { jobId } = req.params;
-    const clipsDir = path.join(process.env.TEMP_DIR || '/app/temp', jobId, 'clips');
-
-    if (!await fs.pathExists(clipsDir)) {
-      return res.status(404).json({
-        success: false,
-        error: 'Job not found'
-      });
-    }
-
-    const files = await fs.readdir(clipsDir);
-    const clips = files.filter(f => f.startsWith('clip_') && f.endsWith('.mp4'));
-
-    res.json({
-      success: true,
-      data: {
-        jobId,
-        clipCount: clips.length,
-        clips: clips.sort()
-      }
-    });
-
-  } catch (error) {
-    console.error('Status error:', error);
+    console.error('Clip download error:', error);
     res.status(500).json({
       success: false,
       error: error.message
@@ -354,21 +193,67 @@ router.get('/:jobId/status', async (req, res) => {
 });
 
 /**
- * DELETE /api/split/:jobId - Cleanup job files
+ * GET /api/split/:jobId/guide - Download reactions guide
  */
-router.delete('/:jobId', async (req, res) => {
+router.get('/:jobId/guide', async (req, res) => {
   try {
     const { jobId } = req.params;
-    const jobDir = path.join(process.env.TEMP_DIR || '/app/temp', jobId);
-    await fs.remove(jobDir);
+    const guidePath = splitService.getGuidePath(jobId);
+
+    if (!await fs.pathExists(guidePath)) {
+      return res.status(404).json({
+        success: false,
+        error: 'Reactions guide not found'
+      });
+    }
+
+    res.setHeader('Content-Type', 'text/plain');
+    res.setHeader('Content-Disposition', `attachment; filename="reactions_guide_${jobId}.txt"`);
+
+    const readStream = fs.createReadStream(guidePath);
+    readStream.pipe(res);
+
+  } catch (error) {
+    console.error('Guide download error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * GET /api/split/:jobId/download - Download all clips as individual files info
+ */
+router.get('/:jobId/download', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const clipsDir = path.join(splitService.tempDir, jobId, 'clips');
+
+    if (!await fs.pathExists(clipsDir)) {
+      return res.status(404).json({
+        success: false,
+        error: 'Split job not found'
+      });
+    }
+
+    const files = await fs.readdir(clipsDir);
+    const clips = files
+      .filter(f => f.endsWith('.mp4'))
+      .map(f => ({
+        filename: f,
+        downloadUrl: `/api/split/${jobId}/clip/${f.replace('clip_', '').replace('.mp4', '')}`
+      }));
 
     res.json({
       success: true,
-      message: `Job ${jobId} cleaned up`
+      jobId,
+      clips,
+      guideDownloadUrl: `/api/split/${jobId}/guide`
     });
 
   } catch (error) {
-    console.error('Cleanup error:', error);
+    console.error('Download info error:', error);
     res.status(500).json({
       success: false,
       error: error.message
