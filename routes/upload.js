@@ -1,91 +1,165 @@
 const express = require('express');
 const router = express.Router();
-const multer = require('multer');
+const combineService = require('../services/combineService');
+const splitService = require('../services/splitService');
+const r2Service = require('../services/r2Service');
 const path = require('path');
 const fs = require('fs-extra');
-const { v4: uuidv4 } = require('uuid');
-
-// Configure multer for video uploads - save to a dedicated uploads folder
-const storage = multer.diskStorage({
-  destination: async (req, file, cb) => {
-    // Save uploads to a dedicated uploads subfolder
-    const uploadsDir = path.join(process.env.TEMP_DIR || '/app/temp', 'uploads');
-    await fs.ensureDir(uploadsDir);
-    cb(null, uploadsDir);
-  },
-  filename: (req, file, cb) => {
-    // Generate unique filename to avoid conflicts
-    const uniqueId = uuidv4();
-    const ext = path.extname(file.originalname).toLowerCase() || '.mp4';
-    cb(null, `${uniqueId}${ext}`);
-  }
-});
-
-const upload = multer({
-  storage,
-  limits: {
-    fileSize: 500 * 1024 * 1024, // 500MB max
-  },
-  fileFilter: (req, file, cb) => {
-    // Accept video files
-    const allowedMimes = [
-      'video/mp4',
-      'video/webm',
-      'video/quicktime',
-      'video/x-msvideo',
-      'video/x-matroska',
-      'video/mpeg'
-    ];
-    const allowedExts = ['.mp4', '.webm', '.mov', '.avi', '.mkv', '.mpeg'];
-    
-    const ext = path.extname(file.originalname).toLowerCase();
-    
-    if (allowedMimes.includes(file.mimetype) || allowedExts.includes(ext)) {
-      cb(null, true);
-    } else {
-      cb(new Error(`Invalid file type: ${file.mimetype}. Please upload a video file.`), false);
-    }
-  }
-});
+const https = require('https');
+const http = require('http');
 
 /**
- * POST /api/upload
- * Upload a video file directly (fallback when yt-dlp fails)
- * Returns videoPath that can be used with the standard /api/split endpoint
+ * Download a file from URL to local path
  */
-router.post('/', upload.single('video'), async (req, res) => {
+async function downloadFile(url, destPath) {
+  return new Promise((resolve, reject) => {
+    const protocol = url.startsWith('https') ? https : http;
+    const file = fs.createWriteStream(destPath);
+    
+    protocol.get(url, (response) => {
+      if (response.statusCode === 301 || response.statusCode === 302) {
+        // Handle redirect
+        downloadFile(response.headers.location, destPath)
+          .then(resolve)
+          .catch(reject);
+        return;
+      }
+      
+      if (response.statusCode !== 200) {
+        reject(new Error(`Download failed: ${response.statusCode}`));
+        return;
+      }
+      
+      response.pipe(file);
+      file.on('finish', () => {
+        file.close();
+        resolve(destPath);
+      });
+    }).on('error', (err) => {
+      fs.unlink(destPath, () => {});
+      reject(err);
+    });
+  });
+}
+
+/**
+ * Ensure split clips are available locally
+ * If not found locally, try to restore from R2
+ */
+async function ensureSplitClipsAvailable(splitJobId, clipCount) {
+  const clipsDir = path.join(splitService.tempDir, splitJobId, 'clips');
+  
+  // Check if clips exist locally
+  if (await fs.pathExists(clipsDir)) {
+    const files = await fs.readdir(clipsDir);
+    const clipFiles = files.filter(f => f.startsWith('clip_') && f.endsWith('.mp4'));
+    if (clipFiles.length >= clipCount) {
+      console.log(`Local clips found: ${clipFiles.length} clips`);
+      return true;
+    }
+  }
+
+  console.log('Local clips not found, attempting to restore from R2...');
+
+  // Try to restore from R2
+  if (!r2Service.isConfigured()) {
+    throw new Error('Split job not found and R2 not configured for restore');
+  }
+
+  // Build R2 public URL base
+  const r2PublicUrl = process.env.R2_PUBLIC_URL || 
+    `https://pub-${process.env.R2_ACCOUNT_ID}.r2.dev`;
+
+  // Try to download manifest from R2
+  // IMPORTANT: Manifest is at {jobId}/manifest.json (same folder as clips)
+  const manifestUrl = `${r2PublicUrl}/${splitJobId}/manifest.json`;
+  console.log(`Downloading split job ${splitJobId} from R2...`);
+  console.log(`Downloading manifest from R2: ${manifestUrl}`);
+
+  await fs.ensureDir(clipsDir);
+  const manifestPath = path.join(clipsDir, 'manifest.json');
+
   try {
-    if (!req.file) {
+    await downloadFile(manifestUrl, manifestPath);
+  } catch (err) {
+    console.error('Failed to download manifest:', err.message);
+    throw new Error('Split job not found. Clips may have been cleaned up. Please re-split the video.');
+  }
+
+  const manifest = await fs.readJson(manifestPath);
+  console.log(`Manifest loaded: ${manifest.totalClips} clips`);
+
+  // Download each clip from R2
+  for (const clip of manifest.clips) {
+    const clipUrl = clip.r2Link || `${r2PublicUrl}/${splitJobId}/clip_${clip.number}.mp4`;
+    const clipPath = path.join(clipsDir, `clip_${clip.number}.mp4`);
+    
+    console.log(`Downloading clip ${clip.number}: ${clipUrl}`);
+    
+    try {
+      await downloadFile(clipUrl, clipPath);
+      console.log(`✓ Clip ${clip.number} restored`);
+    } catch (err) {
+      console.error(`Failed to download clip ${clip.number}:`, err.message);
+      throw new Error(`Failed to restore clip ${clip.number} from R2`);
+    }
+  }
+
+  console.log('All clips restored from R2');
+  return true;
+}
+
+/**
+ * POST /api/combine - Combine clips with reactions
+ */
+router.post('/', async (req, res) => {
+  try {
+    const { originalClips, reactionClips, mode, pipPosition } = req.body;
+
+    if (!originalClips || !Array.isArray(originalClips) || originalClips.length === 0) {
       return res.status(400).json({
         success: false,
-        error: 'No video file provided'
+        error: 'originalClips array is required'
       });
     }
 
-    const videoPath = req.file.path;
-    const originalName = req.file.originalname;
-    const fileSize = req.file.size;
+    console.log('\n' + '='.repeat(60));
+    console.log('COMBINE REQUEST');
+    console.log('='.repeat(60));
+    console.log(`Mode: ${mode || 'sequential'}`);
+    console.log(`PiP Position: ${pipPosition || 'top-right'}`);
+    console.log(`Original clips: ${originalClips.length}`);
+    console.log(`Reaction clips: ${reactionClips?.length || 0}`);
 
-    console.log(`\n${'='.repeat(50)}`);
-    console.log('VIDEO UPLOAD');
-    console.log('='.repeat(50));
-    console.log(`Original name: ${originalName}`);
-    console.log(`Saved to: ${videoPath}`);
-    console.log(`Size: ${(fileSize / (1024 * 1024)).toFixed(2)} MB`);
-    console.log('='.repeat(50));
+    const result = await combineService.combineClipsWithReactions(
+      originalClips,
+      reactionClips || [],
+      null,
+      { mode: mode || 'sequential', pipPosition: pipPosition || 'top-right' }
+    );
 
-    // Return the videoPath - user can then call /api/split with this path
+    // Upload to R2 if configured
+    if (r2Service.isConfigured()) {
+      console.log('\nUploading final video to R2...');
+      const r2Result = await r2Service.uploadFile(
+        result.outputPath,
+        `combined/${result.jobId}/final.mp4`,
+        'video/mp4'
+      );
+      
+      if (r2Result.success) {
+        result.r2Link = r2Result.downloadUrl;
+        console.log(`Uploaded to R2: ${r2Result.downloadUrl}`);
+      }
+    }
+
     res.json({
       success: true,
-      videoPath,
-      originalName,
-      fileSize,
-      fileSizeMB: (fileSize / (1024 * 1024)).toFixed(2),
-      message: 'Video uploaded successfully. Use this videoPath with /api/split endpoint.'
+      data: result
     });
 
   } catch (error) {
-    console.error('Upload error:', error);
+    console.error('Combine error:', error);
     res.status(500).json({
       success: false,
       error: error.message
@@ -94,186 +168,142 @@ router.post('/', upload.single('video'), async (req, res) => {
 });
 
 /**
- * POST /api/upload/with-reactions
- * Upload video AND immediately split with reactions in one step
- * This is the main endpoint for the frontend upload feature
+ * POST /api/combine/from-split/:splitJobId - Combine using existing split job
  */
-router.post('/with-reactions', upload.single('video'), async (req, res) => {
+router.post('/from-split/:splitJobId', async (req, res) => {
   try {
-    if (!req.file) {
+    const { splitJobId } = req.params;
+    const { reactions, mode, pipPosition } = req.body;
+
+    if (!reactions || !Array.isArray(reactions)) {
       return res.status(400).json({
         success: false,
-        error: 'No video file provided'
+        error: 'reactions array is required'
       });
     }
 
-    // Parse reactions from form data
-    let reactions;
-    try {
-      reactions = JSON.parse(req.body.reactions || '[]');
-    } catch (e) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid reactions JSON'
+    console.log('\n' + '='.repeat(60));
+    console.log('COMBINE FROM SPLIT');
+    console.log('='.repeat(60));
+    console.log(`Split Job ID: ${splitJobId}`);
+    console.log(`Mode: ${mode || 'sequential'}`);
+    console.log(`PiP Position: ${pipPosition || 'top-right'}`);
+    console.log(`First reaction text: ${reactions[0]?.text?.substring(0, 80) || 'N/A'}...`);
+    console.log(`R2 Storage: ${r2Service.isConfigured() ? 'ENABLED' : 'DISABLED'}`);
+
+    // Count how many clips we expect
+    const expectedClips = reactions.length;
+    
+    // Ensure clips are available (restore from R2 if needed)
+    await ensureSplitClipsAvailable(splitJobId, expectedClips);
+
+    // Build original clips paths
+    const clipsDir = path.join(splitService.tempDir, splitJobId, 'clips');
+    const files = await fs.readdir(clipsDir);
+    const clipFiles = files
+      .filter(f => f.startsWith('clip_') && f.endsWith('.mp4'))
+      .sort((a, b) => {
+        const numA = parseInt(a.match(/clip_(\d+)/)[1]);
+        const numB = parseInt(b.match(/clip_(\d+)/)[1]);
+        return numA - numB;
       });
-    }
 
-    if (!reactions || !Array.isArray(reactions) || reactions.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'Reactions array is required'
-      });
-    }
+    const originalClips = clipFiles.map(f => path.join(clipsDir, f));
+    console.log(`Found ${originalClips.length} original clips`);
 
-    const videoPath = req.file.path;
-    const originalName = req.file.originalname;
-    const fileSize = req.file.size;
+    // Build reaction clips array (some may be null if not uploaded)
+    const reactionClips = reactions.map(r => r.path || null);
+    console.log(`Reaction clips: ${reactionClips.filter(r => r).length} uploaded`);
 
-    console.log(`\n${'='.repeat(50)}`);
-    console.log('VIDEO UPLOAD + SPLIT');
-    console.log('='.repeat(50));
-    console.log(`Original name: ${originalName}`);
-    console.log(`Video path: ${videoPath}`);
-    console.log(`Size: ${(fileSize / (1024 * 1024)).toFixed(2)} MB`);
-    console.log(`Reactions count: ${reactions.length}`);
-    console.log('='.repeat(50));
+    // Combine
+    const result = await combineService.combineClipsWithReactions(
+      originalClips,
+      reactionClips,
+      null,
+      { mode: mode || 'sequential', pipPosition: pipPosition || 'top-right' }
+    );
 
-    // Import services
-    const splitService = require('../services/splitService');
-    const r2Service = require('../services/r2Service');
-
-    // Call the EXISTING splitVideoForReactions function
-    const result = await splitService.splitVideoForReactions(videoPath, reactions);
-
-    console.log(`Split complete. Job ID: ${result.jobId}`);
-    console.log(`Total clips: ${result.totalClips}`);
-
-    // If R2 is configured, upload clips AND manifest (same as split.js)
+    // Upload to R2 if configured
     if (r2Service.isConfigured()) {
-      console.log('\nUploading clips to R2...');
+      console.log('\nUploading final video to R2...');
+      const r2Result = await r2Service.uploadFile(
+        result.outputPath,
+        `combined/${result.jobId}/final.mp4`,
+        'video/mp4'
+      );
       
-      const clipFiles = [];
-      const clipR2Links = {};
-      
-      for (const clip of result.clips) {
-        const clipPath = splitService.getClipPath(result.jobId, clip.number);
-        
-        if (await fs.pathExists(clipPath)) {
-          clipFiles.push({
-            localPath: clipPath,
-            fileName: `${result.jobId}/clip_${clip.number}.mp4`,
-            mimeType: 'video/mp4',
-            clipNumber: clip.number
-          });
-        } else {
-          console.error(`Clip file not found: ${clipPath}`);
-        }
+      if (r2Result.success) {
+        result.r2Link = r2Result.downloadUrl;
+        console.log(`Uploaded to R2: ${r2Result.downloadUrl}`);
       }
-
-      // Upload guide too
-      const guidePath = splitService.getGuidePath(result.jobId);
-      if (await fs.pathExists(guidePath)) {
-        clipFiles.push({
-          localPath: guidePath,
-          fileName: `${result.jobId}/reactions_guide.txt`,
-          mimeType: 'text/plain'
-        });
-      }
-
-      console.log(`Files to upload: ${clipFiles.length}`);
-
-      const uploadResults = await r2Service.uploadFiles(clipFiles);
-
-      // Build clip R2 links map
-      for (const uploadResult of uploadResults) {
-        if (uploadResult.success && uploadResult.fileName.includes('clip_')) {
-          const match = uploadResult.fileName.match(/clip_(\d+)\.mp4/);
-          if (match) {
-            clipR2Links[match[1]] = uploadResult.downloadUrl;
-          }
-        }
-      }
-
-      // *** CREATE AND UPLOAD MANIFEST - THIS WAS MISSING! ***
-      const manifest = {
-        jobId: result.jobId,
-        totalClips: result.totalClips,
-        clips: result.clips.map(clip => ({
-          number: clip.number,
-          filename: `clip_${clip.number}.mp4`,
-          r2Link: clipR2Links[clip.number] || null
-        })),
-        reactionGuide: result.reactionGuide,
-        createdAt: new Date().toISOString()
-      };
-
-      // Save manifest locally
-      const manifestPath = path.join(splitService.tempDir, result.jobId, 'manifest.json');
-      await fs.ensureDir(path.dirname(manifestPath));
-      await fs.writeJson(manifestPath, manifest);
-      
-      // Upload manifest to R2
-      await r2Service.uploadFile(manifestPath, `${result.jobId}/manifest.json`, 'application/json');
-      console.log(`✓ Manifest uploaded to: ${result.jobId}/manifest.json`);
-
-      // Map upload results back to clips
-      const clipsWithLinks = result.clips.map((clip) => {
-        return {
-          ...clip,
-          r2Link: clipR2Links[clip.number] || null
-        };
-      });
-
-      const guideUpload = uploadResults.find(r => r.fileName.endsWith('.txt'));
-
-      console.log(`Upload complete: ${uploadResults.filter(r => r.success).length}/${uploadResults.length} files`);
-
-      // Clean up uploaded source video
-      await fs.remove(videoPath).catch(() => {});
-
-      // Return same format as split.js for frontend compatibility
-      res.json({
-        success: true,
-        data: {
-          jobId: result.jobId,
-          totalClips: result.totalClips,
-          clips: clipsWithLinks,
-          reactionGuide: result.reactionGuide,
-          guide: {
-            downloadUrl: result.guideDownloadUrl,
-            r2Link: guideUpload?.success ? guideUpload.downloadUrl : null
-          },
-          storage: 'r2',
-          source: 'upload'
-        }
-      });
-
-    } else {
-      // No R2 - return local download URLs
-      await fs.remove(videoPath).catch(() => {});
-
-      res.json({
-        success: true,
-        data: {
-          jobId: result.jobId,
-          totalClips: result.totalClips,
-          clips: result.clips,
-          reactionGuide: result.reactionGuide,
-          guideDownloadUrl: result.guideDownloadUrl,
-          storage: 'local',
-          source: 'upload'
-        }
-      });
     }
+
+    res.json({
+      success: true,
+      data: {
+        ...result,
+        splitJobId,
+        storage: r2Service.isConfigured() ? 'r2' : 'local'
+      }
+    });
 
   } catch (error) {
-    console.error('Upload+split error:', error);
-    
-    // Clean up uploaded file on error
-    if (req.file && req.file.path) {
-      await fs.remove(req.file.path).catch(() => {});
+    console.error('Combine from split error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * GET /api/combine/:jobId/download - Download combined video
+ */
+router.get('/:jobId/download', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const outputPath = combineService.getOutputPath(jobId);
+
+    if (!await fs.pathExists(outputPath)) {
+      return res.status(404).json({
+        success: false,
+        error: 'Combined video not found'
+      });
     }
+
+    const stats = await fs.stat(outputPath);
     
+    res.setHeader('Content-Length', stats.size);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="reaction_video_${jobId}.mp4"`);
+
+    const readStream = fs.createReadStream(outputPath);
+    readStream.pipe(res);
+
+  } catch (error) {
+    console.error('Download error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * DELETE /api/combine/:jobId - Cleanup job files
+ */
+router.delete('/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    await combineService.cleanup(jobId);
+    
+    res.json({
+      success: true,
+      message: `Job ${jobId} cleaned up`
+    });
+
+  } catch (error) {
+    console.error('Cleanup error:', error);
     res.status(500).json({
       success: false,
       error: error.message
