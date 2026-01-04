@@ -2,6 +2,7 @@ const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs-extra');
 const { v4: uuidv4 } = require('uuid');
+const { exec } = require('child_process');
 
 class CombineService {
   constructor() {
@@ -68,19 +69,79 @@ class CombineService {
 
   /**
    * Extract the last frame from a video as an image
+   * Uses exec with raw ffmpeg command for reliability
    */
   async extractLastFrame(videoPath, outputPath) {
+    console.log(`Extracting last frame from: ${videoPath}`);
+    console.log(`Output path: ${outputPath}`);
+    
+    // Verify input exists
+    if (!await fs.pathExists(videoPath)) {
+      throw new Error(`Input video does not exist: ${videoPath}`);
+    }
+    
     const duration = await this.getVideoDuration(videoPath);
-    const seekTime = Math.max(0, duration - 0.1);
+    console.log(`Video duration: ${duration}s`);
+    
+    if (duration <= 0 || isNaN(duration)) {
+      throw new Error(`Invalid video duration: ${duration}`);
+    }
+    
+    // Calculate seek time - handle very short videos
+    let seekTime;
+    if (duration < 1) {
+      seekTime = Math.max(0, duration * 0.5);
+    } else {
+      seekTime = Math.max(0, duration - 0.5);
+    }
+    console.log(`Seeking to: ${seekTime}s`);
     
     return new Promise((resolve, reject) => {
-      ffmpeg(videoPath)
-        .seekInput(seekTime)
-        .frames(1)
-        .outputOptions(['-q:v', '2', '-y'])
-        .on('end', () => resolve(outputPath))
-        .on('error', reject)
-        .save(outputPath);
+      // Use raw ffmpeg command via exec for reliability
+      const cmd = `ffmpeg -y -ss ${seekTime} -i "${videoPath}" -frames:v 1 -q:v 2 "${outputPath}"`;
+      console.log(`Extract frame command: ${cmd}`);
+      
+      exec(cmd, async (error, stdout, stderr) => {
+        if (error) {
+          console.error('Frame extraction error:', stderr);
+          reject(new Error(`Frame extraction failed: ${error.message}`));
+          return;
+        }
+        
+        // Verify the file was created
+        if (await fs.pathExists(outputPath)) {
+          const stats = await fs.stat(outputPath);
+          if (stats.size > 0) {
+            console.log(`Frame extracted successfully: ${outputPath} (${stats.size} bytes)`);
+            resolve(outputPath);
+          } else {
+            reject(new Error(`Frame extracted but file is empty: ${outputPath}`));
+          }
+        } else {
+          // Try alternative method - extract from start if end fails
+          console.log('Frame extraction from end failed, trying from start...');
+          const altCmd = `ffmpeg -y -i "${videoPath}" -frames:v 1 -q:v 2 "${outputPath}"`;
+          
+          exec(altCmd, async (altError, altStdout, altStderr) => {
+            if (altError) {
+              reject(new Error(`Frame extraction failed (both attempts): ${altError.message}`));
+              return;
+            }
+            
+            if (await fs.pathExists(outputPath)) {
+              const stats = await fs.stat(outputPath);
+              if (stats.size > 0) {
+                console.log(`Frame extracted (from start): ${outputPath} (${stats.size} bytes)`);
+                resolve(outputPath);
+              } else {
+                reject(new Error('Frame extraction produced empty file'));
+              }
+            } else {
+              reject(new Error('Frame extraction completed but file not found'));
+            }
+          });
+        }
+      });
     });
   }
 
@@ -89,27 +150,28 @@ class CombineService {
    * This is PASS 2 of the three-pass method
    */
   async createVideoFromImage(imagePath, outputPath, duration, targetWidth, targetHeight) {
+    console.log(`Creating background video: ${duration}s at ${targetWidth}x${targetHeight}`);
+    
     return new Promise((resolve, reject) => {
-      ffmpeg()
-        .input(imagePath)
-        .inputOptions(['-loop', '1'])
-        .outputOptions([
-          '-vf', `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
-          '-c:v', 'libx264',
-          '-preset', 'fast',
-          '-crf', '23',
-          '-t', String(duration),
-          '-pix_fmt', 'yuv420p',
-          '-r', '30',
-          '-y'
-        ])
-        .on('start', cmd => console.log('Creating background video:', cmd))
-        .on('end', () => {
-          console.log(`Background video created: ${duration}s`);
+      // Use raw ffmpeg command via exec for reliability
+      const cmd = `ffmpeg -y -loop 1 -i "${imagePath}" -vf "scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1" -c:v libx264 -preset fast -crf 23 -t ${duration} -pix_fmt yuv420p -r 30 "${outputPath}"`;
+      console.log(`Background video command: ${cmd}`);
+      
+      exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, async (error, stdout, stderr) => {
+        if (error) {
+          console.error('Background video error:', stderr);
+          reject(new Error(`Background video creation failed: ${error.message}`));
+          return;
+        }
+        
+        if (await fs.pathExists(outputPath)) {
+          const stats = await fs.stat(outputPath);
+          console.log(`Background video created: ${outputPath} (${(stats.size/1024/1024).toFixed(2)} MB)`);
           resolve(outputPath);
-        })
-        .on('error', reject)
-        .save(outputPath);
+        } else {
+          reject(new Error('Background video creation completed but file not found'));
+        }
+      });
     });
   }
 
@@ -118,53 +180,37 @@ class CombineService {
    * This is PASS 3 of the three-pass method
    */
   async overlayPipOnBackground(backgroundPath, reactionPath, outputPath, pipWidth, pipHeight, pipX, pipY, hasAudio) {
+    console.log(`Overlay PiP: ${pipWidth}x${pipHeight} at (${pipX}, ${pipY})`);
+    
     return new Promise((resolve, reject) => {
-      const filterComplex = [
-        `[1:v]scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,setsar=1[pip]`,
-        `[0:v][pip]overlay=${pipX}:${pipY}[outv]`
-      ].join(';');
-
-      const outputOptions = [
-        '-filter_complex', filterComplex,
-        '-map', '[outv]',
-        '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
-        '-movflags', '+faststart',
-        '-y'
-      ];
-
-      // Add audio mapping - use reaction audio if available
-      if (hasAudio) {
-        outputOptions.push('-map', '1:a', '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '128k');
-      }
-
-      ffmpeg()
-        .input(backgroundPath)
-        .input(reactionPath)
-        .outputOptions(outputOptions)
-        .on('start', cmd => console.log('Overlay PiP:', cmd))
-        .on('progress', p => {
-          if (p.percent) console.log(`  Overlay: ${Math.round(p.percent)}%`);
-        })
-        .on('end', () => {
-          console.log('PiP overlay complete');
+      const filterComplex = `[1:v]scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,setsar=1[pip];[0:v][pip]overlay=${pipX}:${pipY}[outv]`;
+      
+      // Build audio mapping
+      const audioArgs = hasAudio ? '-map 1:a -c:a aac -ar 44100 -ac 2 -b:a 128k' : '';
+      
+      const cmd = `ffmpeg -y -i "${backgroundPath}" -i "${reactionPath}" -filter_complex "${filterComplex}" -map "[outv]" ${audioArgs} -c:v libx264 -preset fast -crf 23 -movflags +faststart "${outputPath}"`;
+      console.log(`Overlay command: ${cmd}`);
+      
+      exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, async (error, stdout, stderr) => {
+        if (error) {
+          console.error('Overlay error:', stderr);
+          reject(new Error(`PiP overlay failed: ${error.message}`));
+          return;
+        }
+        
+        if (await fs.pathExists(outputPath)) {
+          const stats = await fs.stat(outputPath);
+          console.log(`PiP overlay complete: ${outputPath} (${(stats.size/1024/1024).toFixed(2)} MB)`);
           resolve(outputPath);
-        })
-        .on('error', reject)
-        .save(outputPath);
+        } else {
+          reject(new Error('PiP overlay completed but file not found'));
+        }
+      });
     });
   }
 
   /**
    * Calculate PiP coordinates based on position
-   * @param {string} position - 'top-right', 'bottom-right', 'bottom-left', 'top-left', or 'random'
-   * @param {number} targetWidth - Width of the target video
-   * @param {number} targetHeight - Height of the target video
-   * @param {number} pipWidth - Width of the PiP overlay
-   * @param {number} pipHeight - Height of the PiP overlay
-   * @param {number} padding - Padding from edges (default: 20)
-   * @returns {object} - { x, y, position } coordinates and resolved position name
    */
   getPipCoordinates(position, targetWidth, targetHeight, pipWidth, pipHeight, padding = 20) {
     const positions = {
@@ -207,17 +253,7 @@ class CombineService {
   }
 
   /**
-   * Create PiP segment using THREE-PASS method for reliable audio/video sync:
-   * - PASS 1: Extract last frame as JPG
-   * - PASS 2: Create background video from that frame (exact duration matching audio)
-   * - PASS 3: Overlay reaction video on background
-   * 
-   * @param {string} originalClipPath - Path to original clip
-   * @param {string} reactionPath - Path to reaction video
-   * @param {string} outputPath - Path for output file
-   * @param {number} targetWidth - Target video width (default: 1080)
-   * @param {number} targetHeight - Target video height (default: 1920)
-   * @param {string} pipPosition - PiP position: 'top-right', 'bottom-right', 'bottom-left', 'top-left', 'random'
+   * Create PiP segment using THREE-PASS method for reliable audio/video sync
    */
   async createPipSegment(originalClipPath, reactionPath, outputPath, targetWidth = 1080, targetHeight = 1920, pipPosition = 'top-right') {
     const workDir = path.dirname(outputPath);
@@ -231,7 +267,10 @@ class CombineService {
       console.log(`Reaction: ${reactionPath}`);
       console.log(`Requested position: ${pipPosition}`);
       
-      // Verify reaction file exists
+      // Verify files exist
+      if (!await fs.pathExists(originalClipPath)) {
+        throw new Error(`Original clip not found: ${originalClipPath}`);
+      }
       if (!await fs.pathExists(reactionPath)) {
         throw new Error(`Reaction file not found: ${reactionPath}`);
       }
@@ -271,16 +310,17 @@ class CombineService {
       await this.extractLastFrame(originalClipPath, lastFramePath);
       
       if (!await fs.pathExists(lastFramePath)) {
-        throw new Error('Failed to extract last frame');
+        throw new Error('Failed to extract last frame - file not created');
       }
-      console.log('Pass 1 complete: Frame extracted');
+      const frameStats = await fs.stat(lastFramePath);
+      console.log(`Pass 1 complete: Frame extracted (${frameStats.size} bytes)`);
       
       // PASS 2: Create background video from frame (EXACT duration to match audio)
       console.log('\n--- Pass 2: Create background video ---');
       await this.createVideoFromImage(lastFramePath, backgroundVideoPath, totalDuration, targetWidth, targetHeight);
       
       if (!await fs.pathExists(backgroundVideoPath)) {
-        throw new Error('Failed to create background video');
+        throw new Error('Failed to create background video - file not created');
       }
       console.log('Pass 2 complete: Background video created');
       
@@ -359,13 +399,6 @@ class CombineService {
 
   /**
    * Combine original clips with reaction clips
-   * 
-   * Supports two modes:
-   * - 'sequential' (default): clip1 → reaction1_fullscreen → clip2 → reaction2_fullscreen
-   * - 'pip': clip1 → frozen_frame + reaction1_pip → clip2 → frozen_frame + reaction2_pip
-   * 
-   * For 'pip' mode, supports pipPosition:
-   * - 'top-right' (default), 'bottom-right', 'bottom-left', 'top-left', 'random'
    */
   async combineClipsWithReactions(originalClips, reactionClips, outputFileName = null, options = {}) {
     const mode = options.mode || 'sequential';
