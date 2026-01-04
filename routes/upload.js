@@ -143,17 +143,17 @@ router.post('/with-reactions', upload.single('video'), async (req, res) => {
     const r2Service = require('../services/r2Service');
 
     // Call the EXISTING splitVideoForReactions function
-    // It will create its own jobId and work directory
     const result = await splitService.splitVideoForReactions(videoPath, reactions);
 
     console.log(`Split complete. Job ID: ${result.jobId}`);
     console.log(`Total clips: ${result.totalClips}`);
 
-    // If R2 is configured, upload clips (same logic as split.js route)
+    // If R2 is configured, upload clips AND manifest (same as split.js)
     if (r2Service.isConfigured()) {
       console.log('\nUploading clips to R2...');
       
       const clipFiles = [];
+      const clipR2Links = {};
       
       for (const clip of result.clips) {
         const clipPath = splitService.getClipPath(result.jobId, clip.number);
@@ -162,7 +162,8 @@ router.post('/with-reactions', upload.single('video'), async (req, res) => {
           clipFiles.push({
             localPath: clipPath,
             fileName: `${result.jobId}/clip_${clip.number}.mp4`,
-            mimeType: 'video/mp4'
+            mimeType: 'video/mp4',
+            clipNumber: clip.number
           });
         } else {
           console.error(`Clip file not found: ${clipPath}`);
@@ -183,12 +184,43 @@ router.post('/with-reactions', upload.single('video'), async (req, res) => {
 
       const uploadResults = await r2Service.uploadFiles(clipFiles);
 
+      // Build clip R2 links map
+      for (const uploadResult of uploadResults) {
+        if (uploadResult.success && uploadResult.fileName.includes('clip_')) {
+          const match = uploadResult.fileName.match(/clip_(\d+)\.mp4/);
+          if (match) {
+            clipR2Links[match[1]] = uploadResult.downloadUrl;
+          }
+        }
+      }
+
+      // *** CREATE AND UPLOAD MANIFEST - THIS WAS MISSING! ***
+      const manifest = {
+        jobId: result.jobId,
+        totalClips: result.totalClips,
+        clips: result.clips.map(clip => ({
+          number: clip.number,
+          filename: `clip_${clip.number}.mp4`,
+          r2Link: clipR2Links[clip.number] || null
+        })),
+        reactionGuide: result.reactionGuide,
+        createdAt: new Date().toISOString()
+      };
+
+      // Save manifest locally
+      const manifestPath = path.join(splitService.tempDir, result.jobId, 'manifest.json');
+      await fs.ensureDir(path.dirname(manifestPath));
+      await fs.writeJson(manifestPath, manifest);
+      
+      // Upload manifest to R2
+      await r2Service.uploadFile(manifestPath, `${result.jobId}/manifest.json`, 'application/json');
+      console.log(`✓ Manifest uploaded to: ${result.jobId}/manifest.json`);
+
       // Map upload results back to clips
-      const clipsWithLinks = result.clips.map((clip, index) => {
-        const uploadResult = uploadResults[index];
+      const clipsWithLinks = result.clips.map((clip) => {
         return {
           ...clip,
-          r2Link: uploadResult?.success ? uploadResult.downloadUrl : null
+          r2Link: clipR2Links[clip.number] || null
         };
       });
 
@@ -196,9 +228,10 @@ router.post('/with-reactions', upload.single('video'), async (req, res) => {
 
       console.log(`Upload complete: ${uploadResults.filter(r => r.success).length}/${uploadResults.length} files`);
 
-      // Clean up the uploaded source video (clips are now in R2)
+      // Clean up uploaded source video
       await fs.remove(videoPath).catch(() => {});
 
+      // Return same format as split.js for frontend compatibility
       res.json({
         success: true,
         data: {
@@ -210,13 +243,13 @@ router.post('/with-reactions', upload.single('video'), async (req, res) => {
             downloadUrl: result.guideDownloadUrl,
             r2Link: guideUpload?.success ? guideUpload.downloadUrl : null
           },
+          storage: 'r2',
           source: 'upload'
         }
       });
 
     } else {
       // No R2 - return local download URLs
-      // Clean up uploaded source video
       await fs.remove(videoPath).catch(() => {});
 
       res.json({
@@ -227,6 +260,7 @@ router.post('/with-reactions', upload.single('video'), async (req, res) => {
           clips: result.clips,
           reactionGuide: result.reactionGuide,
           guideDownloadUrl: result.guideDownloadUrl,
+          storage: 'local',
           source: 'upload'
         }
       });
