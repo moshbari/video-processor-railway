@@ -96,7 +96,7 @@ app.use((err, req, res, next) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`Video Processor API listening on port ${PORT}`);
+  `console.log(\`Video Processor API listening on port ${PORT}\`);`
   console.log('Available endpoints:');
   console.log('  POST /api/download');
   console.log('  POST /api/transcribe');
