@@ -1,249 +1,269 @@
 const express = require('express');
 const router = express.Router();
-const combineService = require('../services/combineService');
-const splitService = require('../services/splitService');
-const r2Service = require('../services/r2Service');
+const multer = require('multer');
 const path = require('path');
 const fs = require('fs-extra');
-const https = require('https');
-const http = require('http');
+const combineService = require('../services/combineService');
+const r2Service = require('../services/r2Service');
 
-/**
- * Download a file from URL to local path
- */
-async function downloadFile(url, destPath) {
-  return new Promise((resolve, reject) => {
-    const protocol = url.startsWith('https') ? https : http;
-    const file = fs.createWriteStream(destPath);
-    
-    protocol.get(url, (response) => {
-      if (response.statusCode === 301 || response.statusCode === 302) {
-        // Handle redirect
-        downloadFile(response.headers.location, destPath)
-          .then(resolve)
-          .catch(reject);
-        return;
-      }
-      
-      if (response.statusCode !== 200) {
-        reject(new Error(`Download failed: ${response.statusCode}`));
-        return;
-      }
-      
-      response.pipe(file);
-      file.on('finish', () => {
-        file.close();
-        resolve(destPath);
-      });
-    }).on('error', (err) => {
-      fs.unlink(destPath, () => {});
-      reject(err);
-    });
-  });
-}
-
-/**
- * Ensure split clips are available locally
- * If not found locally, try to restore from R2
- */
-async function ensureSplitClipsAvailable(splitJobId, clipCount) {
-  const clipsDir = path.join(splitService.tempDir, splitJobId, 'clips');
-  
-  // Check if clips exist locally
-  if (await fs.pathExists(clipsDir)) {
-    const files = await fs.readdir(clipsDir);
-    const clipFiles = files.filter(f => f.startsWith('clip_') && f.endsWith('.mp4'));
-    if (clipFiles.length >= clipCount) {
-      console.log(`Local clips found: ${clipFiles.length} clips`);
-      return true;
-    }
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+  destination: async (req, file, cb) => {
+    const uploadDir = path.join(process.env.TEMP_DIR || '/app/temp', 'uploads');
+    await fs.ensureDir(uploadDir);
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, uniqueSuffix + '-' + file.originalname);
   }
+});
 
-  console.log('Local clips not found, attempting to restore from R2...');
-
-  // Try to restore from R2
-  if (!r2Service.isConfigured()) {
-    throw new Error('Split job not found and R2 not configured for restore');
-  }
-
-  // Build R2 public URL base
-  const r2PublicUrl = process.env.R2_PUBLIC_URL || 
-    `https://pub-${process.env.R2_ACCOUNT_ID}.r2.dev`;
-
-  // Try to download manifest from R2
-  // IMPORTANT: Manifest is at {jobId}/manifest.json (same folder as clips)
-  const manifestUrl = `${r2PublicUrl}/${splitJobId}/manifest.json`;
-  console.log(`Downloading split job ${splitJobId} from R2...`);
-  console.log(`Downloading manifest from R2: ${manifestUrl}`);
-
-  await fs.ensureDir(clipsDir);
-  const manifestPath = path.join(clipsDir, 'manifest.json');
-
-  try {
-    await downloadFile(manifestUrl, manifestPath);
-  } catch (err) {
-    console.error('Failed to download manifest:', err.message);
-    throw new Error('Split job not found. Clips may have been cleaned up. Please re-split the video.');
-  }
-
-  const manifest = await fs.readJson(manifestPath);
-  console.log(`Manifest loaded: ${manifest.totalClips} clips`);
-
-  // Download each clip from R2
-  for (const clip of manifest.clips) {
-    const clipUrl = clip.r2Link || `${r2PublicUrl}/${splitJobId}/clip_${clip.number}.mp4`;
-    const clipPath = path.join(clipsDir, `clip_${clip.number}.mp4`);
-    
-    console.log(`Downloading clip ${clip.number}: ${clipUrl}`);
-    
-    try {
-      await downloadFile(clipUrl, clipPath);
-      console.log(`✓ Clip ${clip.number} restored`);
-    } catch (err) {
-      console.error(`Failed to download clip ${clip.number}:`, err.message);
-      throw new Error(`Failed to restore clip ${clip.number} from R2`);
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: 100 * 1024 * 1024,
+    files: 20
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('video/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only video files are allowed'), false);
     }
-  }
-
-  console.log('All clips restored from R2');
-  return true;
-}
-
-/**
- * POST /api/combine - Combine clips with reactions
- */
-router.post('/', async (req, res) => {
-  try {
-    const { originalClips, reactionClips, mode, pipPosition } = req.body;
-
-    if (!originalClips || !Array.isArray(originalClips) || originalClips.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'originalClips array is required'
-      });
-    }
-
-    console.log('\n' + '='.repeat(60));
-    console.log('COMBINE REQUEST');
-    console.log('='.repeat(60));
-    console.log(`Mode: ${mode || 'sequential'}`);
-    console.log(`PiP Position: ${pipPosition || 'top-right'}`);
-    console.log(`Original clips: ${originalClips.length}`);
-    console.log(`Reaction clips: ${reactionClips?.length || 0}`);
-
-    const result = await combineService.combineClipsWithReactions(
-      originalClips,
-      reactionClips || [],
-      null,
-      { mode: mode || 'sequential', pipPosition: pipPosition || 'top-right' }
-    );
-
-    // Upload to R2 if configured
-    if (r2Service.isConfigured()) {
-      console.log('\nUploading final video to R2...');
-      const r2Result = await r2Service.uploadFile(
-        result.outputPath,
-        `combined/${result.jobId}/final.mp4`,
-        'video/mp4'
-      );
-      
-      if (r2Result.success) {
-        result.r2Link = r2Result.downloadUrl;
-        console.log(`Uploaded to R2: ${r2Result.downloadUrl}`);
-      }
-    }
-
-    res.json({
-      success: true,
-      data: result
-    });
-
-  } catch (error) {
-    console.error('Combine error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
   }
 });
 
 /**
- * POST /api/combine/from-split/:splitJobId - Combine using existing split job
+ * Generate filename in format: MODE-XXX-MonYY-HHMMSSAM.mp4
+ * Example: PIP-Wha-Dec25-083045PM.mp4
  */
-router.post('/from-split/:splitJobId', async (req, res) => {
+function generateFileName(mode, firstReactionText) {
+  let prefix = 'Vid';
+  if (firstReactionText && firstReactionText.length >= 3) {
+    prefix = firstReactionText.substring(0, 3);
+    prefix = prefix.charAt(0).toUpperCase() + prefix.slice(1, 3).toLowerCase();
+  }
+  
+  const modePrefix = mode === 'pip' ? 'PIP' : 'SEQ';
+  
+  const now = new Date();
+  const gmt4 = new Date(now.getTime() + (4 * 60 * 60 * 1000));
+  
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const month = months[gmt4.getUTCMonth()];
+  const year = gmt4.getUTCFullYear().toString().slice(-2);
+  
+  let hours = gmt4.getUTCHours();
+  const minutes = gmt4.getUTCMinutes().toString().padStart(2, '0');
+  const seconds = gmt4.getUTCSeconds().toString().padStart(2, '0');
+  
+  const ampm = hours >= 12 ? 'PM' : 'AM';
+  hours = hours % 12;
+  hours = hours ? hours : 12;
+  const hoursStr = hours.toString().padStart(2, '0');
+  
+  return `${modePrefix}-${prefix}-${month}${year}-${hoursStr}${minutes}${seconds}${ampm}.mp4`;
+}
+
+/**
+ * Extract clip number from filename
+ */
+function extractClipNumber(filename) {
+  const match = filename.match(/(\d+)/);
+  if (match) {
+    return parseInt(match[1], 10);
+  }
+  return null;
+}
+
+/**
+ * Upload result to R2 with custom filename
+ */
+async function uploadToR2(result, mode, firstReactionText) {
+  if (!r2Service.isConfigured()) {
+    return { r2Link: null, fileName: null };
+  }
+
+  const fileName = generateFileName(mode, firstReactionText);
+  console.log(`\nGenerated filename: ${fileName}`);
+  console.log('Uploading combined video to R2...');
+  
+  try {
+    const uploadResult = await r2Service.uploadFile(
+      result.outputPath,
+      `combined/${fileName}`,
+      'video/mp4'
+    );
+    console.log(`✓ Uploaded to R2: ${uploadResult.downloadUrl}`);
+    return { r2Link: uploadResult.downloadUrl, fileName };
+  } catch (error) {
+    console.error('R2 upload failed:', error.message);
+    return { r2Link: null, fileName: null };
+  }
+}
+
+/**
+ * Ensure split clips are available - restore from R2 if needed
+ */
+async function ensureSplitClipsAvailable(splitJobId) {
+  const tempDir = process.env.TEMP_DIR || '/app/temp';
+  const splitDir = path.join(tempDir, splitJobId, 'clips');
+  
+  // Check if clips exist locally
+  if (await fs.pathExists(splitDir)) {
+    const files = await fs.readdir(splitDir);
+    const clips = files.filter(f => f.startsWith('clip_') && f.endsWith('.mp4'));
+    if (clips.length > 0) {
+      console.log(`Found ${clips.length} local clips`);
+      return splitDir;
+    }
+  }
+  
+  // Clips not found locally - try to restore from R2
+  console.log('Local clips not found, attempting to restore from R2...');
+  
+  if (!r2Service.isConfigured()) {
+    throw new Error('Split job not found locally and R2 is not configured');
+  }
+  
+  const jobDir = path.join(tempDir, splitJobId);
+  await fs.ensureDir(jobDir);
+  
+  try {
+    await r2Service.downloadSplitJob(splitJobId, jobDir);
+    return path.join(jobDir, 'clips');
+  } catch (err) {
+    throw new Error(`Split job not found. Clips may have been cleaned up. Please re-split the video.`);
+  }
+}
+
+/**
+ * Validate pipPosition parameter
+ */
+function validatePipPosition(position) {
+  const validPositions = ['top-right', 'bottom-right', 'bottom-left', 'top-left', 'random'];
+  if (!position) return 'top-right'; // default
+  if (!validPositions.includes(position)) {
+    console.warn(`Invalid pipPosition "${position}", defaulting to top-right`);
+    return 'top-right';
+  }
+  return position;
+}
+
+/**
+ * POST /api/combine/from-split/:splitJobId
+ * 
+ * Body parameters:
+ * - reactionClips[]: Array of reaction video files
+ * - mode: 'sequential' or 'pip' (default: 'sequential')
+ * - pipPosition: 'top-right', 'bottom-right', 'bottom-left', 'top-left', 'random' (default: 'top-right')
+ * - firstReactionText: Text for filename generation
+ * - reactionIndices: JSON array of indices mapping reactions to clips
+ */
+router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async (req, res) => {
   try {
     const { splitJobId } = req.params;
-    const { reactions, mode, pipPosition } = req.body;
-
-    if (!reactions || !Array.isArray(reactions)) {
-      return res.status(400).json({
-        success: false,
-        error: 'reactions array is required'
-      });
-    }
-
+    const mode = req.body.mode || 'sequential';
+    const pipPosition = validatePipPosition(req.body.pipPosition);
+    const firstReactionText = req.body.firstReactionText || '';
+    
     console.log('\n' + '='.repeat(60));
     console.log('COMBINE FROM SPLIT');
     console.log('='.repeat(60));
     console.log(`Split Job ID: ${splitJobId}`);
-    console.log(`Mode: ${mode || 'sequential'}`);
-    console.log(`PiP Position: ${pipPosition || 'top-right'}`);
-    console.log(`First reaction text: ${reactions[0]?.text?.substring(0, 80) || 'N/A'}...`);
+    console.log(`Mode: ${mode}`);
+    if (mode === 'pip') {
+      console.log(`PiP Position: ${pipPosition}`);
+    }
+    console.log(`First reaction text: ${firstReactionText}`);
     console.log(`R2 Storage: ${r2Service.isConfigured() ? 'ENABLED' : 'DISABLED'}`);
-
-    // Count how many clips we expect
-    const expectedClips = reactions.length;
     
-    // Ensure clips are available (restore from R2 if needed)
-    await ensureSplitClipsAvailable(splitJobId, expectedClips);
-
-    // Build original clips paths
-    const clipsDir = path.join(splitService.tempDir, splitJobId, 'clips');
-    const files = await fs.readdir(clipsDir);
-    const clipFiles = files
+    if (!['sequential', 'pip'].includes(mode)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid mode. Use "sequential" or "pip".'
+      });
+    }
+    
+    // Get original clips from split job directory (restore from R2 if needed)
+    const splitDir = await ensureSplitClipsAvailable(splitJobId);
+    
+    // Read and sort original clips
+    const files = await fs.readdir(splitDir);
+    const originalClipFiles = files
       .filter(f => f.startsWith('clip_') && f.endsWith('.mp4'))
       .sort((a, b) => {
-        const numA = parseInt(a.match(/clip_(\d+)/)[1]);
-        const numB = parseInt(b.match(/clip_(\d+)/)[1]);
+        const numA = extractClipNumber(a) || 0;
+        const numB = extractClipNumber(b) || 0;
         return numA - numB;
       });
-
-    const originalClips = clipFiles.map(f => path.join(clipsDir, f));
-    console.log(`Found ${originalClips.length} original clips`);
-
-    // Build reaction clips array (some may be null if not uploaded)
-    const reactionClips = reactions.map(r => r.path || null);
-    console.log(`Reaction clips: ${reactionClips.filter(r => r).length} uploaded`);
-
-    // Combine
-    const result = await combineService.combineClipsWithReactions(
-      originalClips,
-      reactionClips,
-      null,
-      { mode: mode || 'sequential', pipPosition: pipPosition || 'top-right' }
-    );
-
-    // Upload to R2 if configured
-    if (r2Service.isConfigured()) {
-      console.log('\nUploading final video to R2...');
-      const r2Result = await r2Service.uploadFile(
-        result.outputPath,
-        `combined/${result.jobId}/final.mp4`,
-        'video/mp4'
-      );
+    
+    if (originalClipFiles.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'No clips found in split job'
+      });
+    }
+    
+    const originalClipPaths = originalClipFiles.map(f => path.join(splitDir, f));
+    console.log(`Found ${originalClipPaths.length} original clips`);
+    
+    // Process reaction clips - map them to the correct original clips
+    const reactionClipPaths = new Array(originalClipPaths.length).fill(null);
+    
+    if (req.files && req.files.length > 0) {
+      // Check if reactionIndices was provided
+      let indices = null;
+      if (req.body.reactionIndices) {
+        try {
+          indices = JSON.parse(req.body.reactionIndices);
+        } catch (e) {
+          console.warn('Failed to parse reactionIndices, using sequential mapping');
+        }
+      }
       
-      if (r2Result.success) {
-        result.r2Link = r2Result.downloadUrl;
-        console.log(`Uploaded to R2: ${r2Result.downloadUrl}`);
+      if (indices && Array.isArray(indices)) {
+        // Map reactions using provided indices
+        req.files.forEach((file, i) => {
+          const clipIndex = indices[i];
+          if (typeof clipIndex === 'number' && clipIndex >= 0 && clipIndex < originalClipPaths.length) {
+            reactionClipPaths[clipIndex] = file.path;
+            console.log(`Mapped reaction ${i} to clip ${clipIndex}`);
+          }
+        });
+      } else {
+        // Sequential mapping (reaction 0 -> clip 0, reaction 1 -> clip 1, etc.)
+        req.files.forEach((file, i) => {
+          if (i < originalClipPaths.length) {
+            reactionClipPaths[i] = file.path;
+          }
+        });
       }
     }
+    
+    const reactionCount = reactionClipPaths.filter(p => p !== null).length;
+    console.log(`Mapped ${reactionCount} reactions to clips`);
+
+    // Combine clips with reactions
+    const result = await combineService.combineClipsWithReactions(
+      originalClipPaths,
+      reactionClipPaths,
+      null,
+      { mode, pipPosition }
+    );
+
+    // Upload to R2
+    const { r2Link, fileName } = await uploadToR2(result, mode, firstReactionText);
 
     res.json({
       success: true,
       data: {
         ...result,
-        splitJobId,
-        storage: r2Service.isConfigured() ? 'r2' : 'local'
+        pipPosition: mode === 'pip' ? pipPosition : null,
+        r2Link,
+        fileName
       }
     });
 
@@ -257,7 +277,86 @@ router.post('/from-split/:splitJobId', async (req, res) => {
 });
 
 /**
- * GET /api/combine/:jobId/download - Download combined video
+ * POST /api/combine - Combine with direct file uploads
+ */
+router.post('/', upload.fields([
+  { name: 'originalClips', maxCount: 20 },
+  { name: 'reactionClips', maxCount: 20 }
+]), async (req, res) => {
+  try {
+    let originalClipPaths = [];
+    let reactionClipPaths = [];
+    
+    const mode = req.body.mode || 'sequential';
+    const pipPosition = validatePipPosition(req.body.pipPosition);
+    const firstReactionText = req.body.firstReactionText || '';
+    
+    if (!['sequential', 'pip'].includes(mode)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid mode. Use "sequential" or "pip".'
+      });
+    }
+
+    if (req.files && req.files.originalClips) {
+      originalClipPaths = req.files.originalClips.map(f => f.path);
+      reactionClipPaths = req.files.reactionClips 
+        ? req.files.reactionClips.map(f => f.path)
+        : [];
+    } 
+    else if (req.body.originalClipPaths) {
+      originalClipPaths = JSON.parse(req.body.originalClipPaths);
+      reactionClipPaths = req.body.reactionClipPaths 
+        ? JSON.parse(req.body.reactionClipPaths)
+        : [];
+    }
+    else {
+      return res.status(400).json({
+        success: false,
+        error: 'No clips provided.'
+      });
+    }
+
+    if (originalClipPaths.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'At least one original clip is required'
+      });
+    }
+
+    console.log(`Combining ${originalClipPaths.length} clips with ${reactionClipPaths.length} reactions (mode: ${mode}, pipPosition: ${pipPosition})`);
+
+    const result = await combineService.combineClipsWithReactions(
+      originalClipPaths,
+      reactionClipPaths,
+      null,
+      { mode, pipPosition }
+    );
+
+    // Upload to R2
+    const { r2Link, fileName } = await uploadToR2(result, mode, firstReactionText);
+
+    res.json({
+      success: true,
+      data: {
+        ...result,
+        pipPosition: mode === 'pip' ? pipPosition : null,
+        r2Link,
+        fileName
+      }
+    });
+
+  } catch (error) {
+    console.error('Combine error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * GET /api/combine/:jobId/download - Download the combined video
  */
 router.get('/:jobId/download', async (req, res) => {
   try {
@@ -265,10 +364,33 @@ router.get('/:jobId/download', async (req, res) => {
     const outputPath = combineService.getOutputPath(jobId);
 
     if (!await fs.pathExists(outputPath)) {
-      return res.status(404).json({
-        success: false,
-        error: 'Combined video not found'
-      });
+      // Return a nice HTML error page
+      return res.status(404).send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <title>File Not Found</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+            .container { text-align: center; background: white; padding: 40px 60px; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); max-width: 500px; }
+            h1 { color: #e74c3c; margin-bottom: 10px; }
+            p { color: #666; line-height: 1.6; }
+            .icon { font-size: 64px; margin-bottom: 20px; }
+            a { display: inline-block; margin-top: 20px; padding: 12px 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; text-decoration: none; border-radius: 8px; font-weight: 600; transition: transform 0.2s; }
+            a:hover { transform: translateY(-2px); }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="icon">📁</div>
+            <h1>File Not Found</h1>
+            <p>This video has been automatically deleted after 24 hours, or the job ID is invalid.</p>
+            <p>Please go back to the video editor and create a new render.</p>
+            <a href="https://rantsquad.99dfy.com/video-editor">← Back to Video Editor</a>
+          </div>
+        </body>
+        </html>
+      `);
     }
 
     const stats = await fs.stat(outputPath);
