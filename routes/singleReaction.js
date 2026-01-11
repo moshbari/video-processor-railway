@@ -785,6 +785,84 @@ router.post('/from-upload', upload.fields([
 // ============================================================
 
 /**
+ * GET /api/single-reaction/force-download/:projectId
+ * 
+ * Force download a video file (works on mobile!)
+ * Fetches from R2 and streams with download headers
+ */
+router.get('/force-download/:projectId', async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    
+    console.log(`\n=== FORCE DOWNLOAD: ${projectId} ===`);
+    
+    // Get project metadata
+    const project = await projectMetadataService.getProject(projectId);
+    
+    if (!project) {
+      return res.status(404).json({
+        success: false,
+        error: 'Project not found'
+      });
+    }
+
+    if (project.expired) {
+      return res.status(410).json({
+        success: false,
+        error: 'This video has expired'
+      });
+    }
+
+    // Get the R2 key
+    const r2Key = project.r2Key;
+    if (!r2Key) {
+      return res.status(404).json({
+        success: false,
+        error: 'Video file not found'
+      });
+    }
+
+    console.log(`Fetching from R2: ${r2Key}`);
+
+    // Fetch file from R2
+    const fileBuffer = await r2Service.getFile(r2Key);
+    
+    if (!fileBuffer) {
+      return res.status(404).json({
+        success: false,
+        error: 'Video file not found in storage'
+      });
+    }
+
+    // Generate filename
+    const safeTitle = (project.title || 'reaction_video')
+      .replace(/[^a-zA-Z0-9]/g, '_')
+      .substring(0, 50);
+    const filename = `${safeTitle}_${projectId.substring(0, 8)}.mp4`;
+
+    console.log(`Sending file: ${filename} (${(fileBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
+
+    // Set headers to FORCE download (not play in browser)
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', fileBuffer.length);
+    res.setHeader('Cache-Control', 'no-cache');
+    
+    // Send the file
+    res.send(fileBuffer);
+
+    console.log(`✓ Force download complete: ${filename}`);
+
+  } catch (error) {
+    console.error('Force download error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
  * GET /api/single-reaction/:jobId/download
  * 
  * Download the final video from temp storage
