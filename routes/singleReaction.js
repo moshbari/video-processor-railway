@@ -7,8 +7,10 @@
  * 2. "Face Cam" (faceCam): Reaction full screen, main video in PiP corner
  * 
  * Endpoints:
+ * - POST /api/single-reaction/fetch-main - Fetch main video from URL (pre-load)
  * - POST /api/single-reaction/from-url - Create from video URL + uploaded reaction
  * - POST /api/single-reaction/from-upload - Create from two uploaded videos
+ * - POST /api/single-reaction/from-fetched - Create from pre-fetched video + uploaded reaction
  * - GET /api/single-reaction/projects - List all saved projects
  * - GET /api/single-reaction/projects/:projectId - Get single project
  * - DELETE /api/single-reaction/projects/:projectId - Delete project
@@ -28,6 +30,24 @@ const singleReactionService = require('../services/singleReactionService');
 const downloadService = require('../services/downloadService');
 const r2Service = require('../services/r2Service');
 const projectMetadataService = require('../services/projectMetadataService');
+
+// Store for pre-fetched videos (in-memory, cleared on restart)
+// Key: fetchId, Value: { filePath, originalUrl, fetchedAt, title }
+const fetchedVideos = new Map();
+
+// Cleanup old fetched videos every 30 minutes
+setInterval(() => {
+  const now = Date.now();
+  const maxAge = 60 * 60 * 1000; // 1 hour
+  
+  for (const [fetchId, data] of fetchedVideos.entries()) {
+    if (now - data.fetchedAt > maxAge) {
+      console.log(`Cleaning up old fetched video: ${fetchId}`);
+      fs.remove(data.filePath).catch(() => {});
+      fetchedVideos.delete(fetchId);
+    }
+  }
+}, 30 * 60 * 1000);
 
 // Configure multer for video uploads
 const storage = multer.diskStorage({
@@ -52,6 +72,167 @@ const upload = multer({
     } else {
       cb(new Error('Only video files are allowed'), false);
     }
+  }
+});
+
+// ============================================================
+// PRE-FETCH ENDPOINT (NEW!)
+// ============================================================
+
+/**
+ * POST /api/single-reaction/fetch-main
+ * 
+ * Pre-fetch main video from URL before creating reaction
+ * This validates AND fetches the video so it's ready to use
+ * 
+ * Body (JSON):
+ * - videoUrl: URL of main video
+ * 
+ * Returns:
+ * - fetchId: ID to use when creating reaction
+ * - title: Video title (if available)
+ * - duration: Video duration (if available)
+ */
+router.post('/fetch-main', async (req, res) => {
+  try {
+    const { videoUrl } = req.body;
+
+    if (!videoUrl) {
+      return res.status(400).json({
+        success: false,
+        error: 'videoUrl is required'
+      });
+    }
+
+    console.log(`\n=== FETCHING MAIN VIDEO ===`);
+    console.log(`URL: ${videoUrl}`);
+
+    // Generate unique ID for this fetch
+    const fetchId = uuidv4();
+
+    // Fetch the video
+    console.log('Fetching video...');
+    const fetchResult = await downloadService.downloadVideo(videoUrl);
+    
+    // Handle different possible return formats from downloadService
+    const filePath = fetchResult.filePath || fetchResult.path || fetchResult.outputPath || fetchResult.videoPath;
+    
+    if (!filePath) {
+      throw new Error('Fetch failed - no file path returned');
+    }
+    
+    // Verify file exists
+    const fileExists = await fs.pathExists(filePath);
+    if (!fileExists) {
+      throw new Error('Fetch failed - file not found');
+    }
+
+    // Get file size
+    const stats = await fs.stat(filePath);
+    const fileSizeMB = (stats.size / 1024 / 1024).toFixed(2);
+
+    // Extract title from URL or result
+    const title = fetchResult.title || extractTitleFromUrl(videoUrl) || 'Main Video';
+
+    // Store in memory for later use
+    fetchedVideos.set(fetchId, {
+      filePath,
+      originalUrl: videoUrl,
+      fetchedAt: Date.now(),
+      title,
+      fileSize: stats.size,
+      fileSizeMB
+    });
+
+    console.log(`✓ Video fetched successfully`);
+    console.log(`  Fetch ID: ${fetchId}`);
+    console.log(`  File: ${filePath}`);
+    console.log(`  Size: ${fileSizeMB} MB`);
+
+    res.json({
+      success: true,
+      data: {
+        fetchId,
+        title,
+        fileSizeMB,
+        message: 'Video ready! Now upload your reaction video.'
+      }
+    });
+
+  } catch (error) {
+    console.error('Fetch main video error:', error);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch video. Please check the URL and try again.'
+    });
+  }
+});
+
+/**
+ * GET /api/single-reaction/fetch-status/:fetchId
+ * 
+ * Check if a fetched video is still available
+ */
+router.get('/fetch-status/:fetchId', async (req, res) => {
+  try {
+    const { fetchId } = req.params;
+    const fetchedVideo = fetchedVideos.get(fetchId);
+
+    if (!fetchedVideo) {
+      return res.json({
+        success: true,
+        available: false,
+        message: 'Video not found or expired'
+      });
+    }
+
+    // Verify file still exists
+    const exists = await fs.pathExists(fetchedVideo.filePath);
+
+    res.json({
+      success: true,
+      available: exists,
+      title: fetchedVideo.title,
+      fileSizeMB: fetchedVideo.fileSizeMB,
+      fetchedAt: fetchedVideo.fetchedAt
+    });
+
+  } catch (error) {
+    console.error('Fetch status error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * DELETE /api/single-reaction/fetch/:fetchId
+ * 
+ * Cancel/cleanup a fetched video
+ */
+router.delete('/fetch/:fetchId', async (req, res) => {
+  try {
+    const { fetchId } = req.params;
+    const fetchedVideo = fetchedVideos.get(fetchId);
+
+    if (fetchedVideo) {
+      await fs.remove(fetchedVideo.filePath).catch(() => {});
+      fetchedVideos.delete(fetchId);
+    }
+
+    res.json({
+      success: true,
+      message: 'Fetched video cleaned up'
+    });
+
+  } catch (error) {
+    console.error('Fetch cleanup error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
 });
 
@@ -184,9 +365,154 @@ router.post('/projects/cleanup', async (req, res) => {
 // ============================================================
 
 /**
+ * POST /api/single-reaction/from-fetched
+ * 
+ * Create single reaction video using a PRE-FETCHED main video
+ * This is the preferred method when using URL input
+ * 
+ * Body (multipart/form-data):
+ * - fetchId: ID from /fetch-main endpoint
+ * - reactionVideo: Uploaded reaction video file
+ * - layoutMode: 'watchReact' (default) | 'faceCam'
+ * - pipPosition: 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left' | 'random'
+ * - pipScale: PiP size percentage (default 35)
+ * - title: Optional project title
+ */
+router.post('/from-fetched', upload.single('reactionVideo'), async (req, res) => {
+  try {
+    // DEBUG: Log raw body
+    console.log('\n=== DEBUG: Raw req.body (from-fetched) ===');
+    console.log(JSON.stringify(req.body, null, 2));
+    
+    const { 
+      fetchId,
+      layoutMode = 'watchReact',
+      pipPosition = 'top-right', 
+      pipScale = 35,
+      title = ''
+    } = req.body;
+    const reactionVideoPath = req.file?.path;
+
+    console.log('fetchId:', fetchId);
+    console.log('layoutMode:', layoutMode);
+
+    // Validate fetchId
+    if (!fetchId) {
+      return res.status(400).json({
+        success: false,
+        error: 'fetchId is required. Please fetch the main video first.'
+      });
+    }
+
+    // Get the fetched video
+    const fetchedVideo = fetchedVideos.get(fetchId);
+    if (!fetchedVideo) {
+      return res.status(400).json({
+        success: false,
+        error: 'Fetched video not found or expired. Please fetch the video again.'
+      });
+    }
+
+    // Verify file still exists
+    const mainVideoExists = await fs.pathExists(fetchedVideo.filePath);
+    if (!mainVideoExists) {
+      fetchedVideos.delete(fetchId);
+      return res.status(400).json({
+        success: false,
+        error: 'Fetched video file not found. Please fetch the video again.'
+      });
+    }
+
+    const mainVideoPath = fetchedVideo.filePath;
+
+    if (!reactionVideoPath) {
+      return res.status(400).json({
+        success: false,
+        error: 'reactionVideo file is required'
+      });
+    }
+
+    // Validate layoutMode
+    if (!['watchReact', 'faceCam'].includes(layoutMode)) {
+      return res.status(400).json({
+        success: false,
+        error: 'layoutMode must be "watchReact" or "faceCam"'
+      });
+    }
+
+    const modeName = layoutMode === 'watchReact' ? '👀 Watch & React' : '🤳 Face Cam';
+    console.log(`\n=== SINGLE REACTION FROM FETCHED ===`);
+    console.log(`Mode: ${modeName}`);
+    console.log(`Fetch ID: ${fetchId}`);
+    console.log(`Main video: ${mainVideoPath}`);
+    console.log(`Reaction video: ${reactionVideoPath}`);
+    console.log(`Position: ${pipPosition}, Scale: ${pipScale}%`);
+
+    // Create single reaction video
+    const result = await singleReactionService.createSingleReactionVideo(
+      mainVideoPath,
+      reactionVideoPath,
+      {
+        layoutMode,
+        pipPosition,
+        pipScale: parseInt(pipScale, 10)
+      }
+    );
+
+    // Upload to R2 for persistent storage
+    console.log('Uploading to R2...');
+    const r2Key = `single-reaction/${result.jobId}/final.mp4`;
+    const r2Result = await r2Service.uploadFile(result.outputPath, r2Key);
+    console.log(`✓ Uploaded to R2: ${r2Key}`);
+
+    // Generate download URL
+    const downloadUrl = r2Result.url || `https://pub-f59b46a864a6463ea4d6747002fd515d.r2.dev/${r2Key}`;
+
+    // Save project metadata
+    console.log('Saving project metadata...');
+    const projectTitle = title || fetchedVideo.title || `Project_${Date.now()}`;
+    const savedProject = await projectMetadataService.addProject({
+      ...result,
+      title: projectTitle,
+      r2Key,
+      downloadUrl
+    });
+    console.log(`✓ Project saved: ${savedProject.id}`);
+
+    // Cleanup fetched video (it's been used)
+    fetchedVideos.delete(fetchId);
+    await fs.remove(mainVideoPath).catch(() => {});
+    await fs.remove(reactionVideoPath).catch(() => {});
+
+    res.json({
+      success: true,
+      data: {
+        ...result,
+        r2Key,
+        r2Url: downloadUrl,
+        downloadUrl,
+        project: savedProject
+      }
+    });
+
+  } catch (error) {
+    console.error('Single reaction from fetched error:', error);
+    
+    // Cleanup on error
+    if (req.file?.path) await fs.remove(req.file.path).catch(() => {});
+    
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
  * POST /api/single-reaction/from-url
  * 
  * Create single reaction video from URL (main video) + uploaded reaction
+ * NOTE: Consider using /fetch-main + /from-fetched for better UX
  * 
  * Body (multipart/form-data):
  * - videoUrl: URL of main video
@@ -244,24 +570,24 @@ router.post('/from-url', upload.single('reactionVideo'), async (req, res) => {
     console.log(`URL: ${videoUrl}`);
     console.log(`Position: ${pipPosition}, Scale: ${pipScale}%`);
 
-    // Download main video
-    console.log('Downloading main video...');
-    const downloadResult = await downloadService.downloadVideo(videoUrl);
+    // Fetch main video
+    console.log('Fetching main video...');
+    const fetchResult = await downloadService.downloadVideo(videoUrl);
     
     // Handle different possible return formats from downloadService
-    mainVideoPath = downloadResult.filePath || downloadResult.path || downloadResult.outputPath || downloadResult.videoPath;
+    mainVideoPath = fetchResult.filePath || fetchResult.path || fetchResult.outputPath || fetchResult.videoPath;
     
     if (!mainVideoPath) {
-      throw new Error(`Download succeeded but no file path returned. Result: ${JSON.stringify(downloadResult)}`);
+      throw new Error(`Fetch succeeded but no file path returned. Result: ${JSON.stringify(fetchResult)}`);
     }
     
     // Verify file exists
     const fileExists = await fs.pathExists(mainVideoPath);
     if (!fileExists) {
-      throw new Error(`Downloaded file not found at path: ${mainVideoPath}`);
+      throw new Error(`Fetched file not found at path: ${mainVideoPath}`);
     }
     
-    console.log(`✓ Downloaded: ${mainVideoPath}`);
+    console.log(`✓ Fetched: ${mainVideoPath}`);
 
     // Create single reaction video
     const result = await singleReactionService.createSingleReactionVideo(
