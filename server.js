@@ -11,7 +11,8 @@ const jobsRoutes = require('./routes/jobs');
 const splitRoutes = require('./routes/split');
 const combineRoutes = require('./routes/combine');
 const adminRoutes = require('./routes/admin');
-const uploadRoutes = require('./routes/upload');  // NEW: Direct video upload
+const uploadRoutes = require('./routes/upload');
+const singleReactionRoutes = require('./routes/singleReaction');  // NEW: Single Reaction
 
 // Import services
 const cleanupService = require('./services/cleanupService');
@@ -52,7 +53,8 @@ app.get('/health', (req, res) => {
       split: 'active',
       combine: 'active',
       cleanup: 'active',
-      upload: 'active'  // NEW
+      upload: 'active',
+      'single-reaction': 'active'  // NEW
     }
   });
 });
@@ -65,7 +67,8 @@ app.use('/api/jobs', jobsRoutes);
 app.use('/api/split', splitRoutes);
 app.use('/api/combine', combineRoutes);
 app.use('/api/admin', adminRoutes);
-app.use('/api/upload', uploadRoutes);  // NEW: Direct video upload
+app.use('/api/upload', uploadRoutes);
+app.use('/api/single-reaction', singleReactionRoutes);  // NEW: Single Reaction
 
 // Error handling for multer
 app.use((err, req, res, next) => {
@@ -104,8 +107,12 @@ app.listen(PORT, () => {
   console.log('  POST /api/split');
   console.log('  POST /api/combine');
   console.log('  POST /api/combine/from-split/:splitJobId');
-  console.log('  POST /api/upload                    ← NEW: Direct video upload');
-  console.log('  POST /api/upload/with-reactions     ← NEW: Upload + split in one step');
+  console.log('  POST /api/upload');
+  console.log('  POST /api/upload/with-reactions');
+  console.log('  POST /api/single-reaction/from-url       ← NEW: Single reaction from URL');
+  console.log('  POST /api/single-reaction/from-upload    ← NEW: Single reaction from uploads');
+  console.log('  GET  /api/single-reaction/:jobId/download');
+  console.log('  GET  /api/single-reaction/:jobId/status');
   console.log('  GET  /api/combine/:jobId/download');
   console.log('  GET  /api/split/:jobId/download');
   console.log('  GET  /api/jobs/:jobId/download');
