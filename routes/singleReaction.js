@@ -1,7 +1,10 @@
 /**
  * Single Reaction Routes
  * 
- * API endpoints for "watch first, react at end" style reaction videos
+ * API endpoints for full-length reaction videos with TWO layout modes:
+ * 
+ * 1. "Watch & React" (watchReact): Main video full screen, reaction in PiP corner
+ * 2. "Face Cam" (faceCam): Reaction full screen, main video in PiP corner
  * 
  * Endpoints:
  * - POST /api/single-reaction/from-url - Create from video URL + uploaded reaction
@@ -56,6 +59,7 @@ const upload = multer({
  * Body (multipart/form-data):
  * - videoUrl: URL of main video
  * - reactionVideo: Uploaded reaction video file
+ * - layoutMode: 'watchReact' (default) | 'faceCam'
  * - pipPosition: 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left' | 'random'
  * - pipScale: PiP size percentage (default 35)
  */
@@ -63,7 +67,12 @@ router.post('/from-url', upload.single('reactionVideo'), async (req, res) => {
   let mainVideoPath = null;
   
   try {
-    const { videoUrl, pipPosition = 'top-right', pipScale = 35 } = req.body;
+    const { 
+      videoUrl, 
+      layoutMode = 'watchReact',
+      pipPosition = 'top-right', 
+      pipScale = 35 
+    } = req.body;
     const reactionVideoPath = req.file?.path;
 
     // Validate inputs
@@ -81,14 +90,39 @@ router.post('/from-url', upload.single('reactionVideo'), async (req, res) => {
       });
     }
 
+    // Validate layoutMode
+    if (!['watchReact', 'faceCam'].includes(layoutMode)) {
+      return res.status(400).json({
+        success: false,
+        error: 'layoutMode must be "watchReact" or "faceCam"'
+      });
+    }
+
+    const modeName = layoutMode === 'watchReact' ? '👀 Watch & React' : '🤳 Face Cam';
     console.log(`\n=== SINGLE REACTION FROM URL ===`);
+    console.log(`Mode: ${modeName}`);
     console.log(`URL: ${videoUrl}`);
     console.log(`Position: ${pipPosition}, Scale: ${pipScale}%`);
 
     // Download main video
     console.log('Downloading main video...');
     const downloadResult = await downloadService.downloadVideo(videoUrl);
-    mainVideoPath = downloadResult.filePath;
+    
+    // Handle different possible return formats from downloadService
+    mainVideoPath = downloadResult.filePath || downloadResult.path || downloadResult.outputPath || downloadResult.videoPath;
+    
+    console.log('Download result:', JSON.stringify(downloadResult, null, 2));
+    
+    if (!mainVideoPath) {
+      throw new Error(`Download succeeded but no file path returned. Result: ${JSON.stringify(downloadResult)}`);
+    }
+    
+    // Verify file exists
+    const fileExists = await fs.pathExists(mainVideoPath);
+    if (!fileExists) {
+      throw new Error(`Downloaded file not found at path: ${mainVideoPath}`);
+    }
+    
     console.log(`✓ Downloaded: ${mainVideoPath}`);
 
     // Create single reaction video
@@ -96,6 +130,7 @@ router.post('/from-url', upload.single('reactionVideo'), async (req, res) => {
       mainVideoPath,
       reactionVideoPath,
       {
+        layoutMode,
         pipPosition,
         pipScale: parseInt(pipScale, 10)
       }
@@ -143,6 +178,7 @@ router.post('/from-url', upload.single('reactionVideo'), async (req, res) => {
  * Body (multipart/form-data):
  * - mainVideo: Uploaded main video file
  * - reactionVideo: Uploaded reaction video file
+ * - layoutMode: 'watchReact' (default) | 'faceCam'
  * - pipPosition: 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left' | 'random'
  * - pipScale: PiP size percentage (default 35)
  */
@@ -151,7 +187,20 @@ router.post('/from-upload', upload.fields([
   { name: 'reactionVideo', maxCount: 1 }
 ]), async (req, res) => {
   try {
-    const { pipPosition = 'top-right', pipScale = 35 } = req.body;
+    // DEBUG: Log raw body to see what's received
+    console.log('\n=== DEBUG: Raw req.body ===');
+    console.log(JSON.stringify(req.body, null, 2));
+    console.log('layoutMode from body:', req.body.layoutMode);
+    console.log('Type of layoutMode:', typeof req.body.layoutMode);
+    
+    const { 
+      layoutMode = 'watchReact',
+      pipPosition = 'top-right', 
+      pipScale = 35 
+    } = req.body;
+    
+    console.log('layoutMode after destructure:', layoutMode);
+    
     const mainVideoPath = req.files?.mainVideo?.[0]?.path;
     const reactionVideoPath = req.files?.reactionVideo?.[0]?.path;
 
@@ -170,7 +219,17 @@ router.post('/from-upload', upload.fields([
       });
     }
 
+    // Validate layoutMode
+    if (!['watchReact', 'faceCam'].includes(layoutMode)) {
+      return res.status(400).json({
+        success: false,
+        error: 'layoutMode must be "watchReact" or "faceCam"'
+      });
+    }
+
+    const modeName = layoutMode === 'watchReact' ? '👀 Watch & React' : '🤳 Face Cam';
     console.log(`\n=== SINGLE REACTION FROM UPLOAD ===`);
+    console.log(`Mode: ${modeName}`);
     console.log(`Main video: ${mainVideoPath}`);
     console.log(`Reaction video: ${reactionVideoPath}`);
     console.log(`Position: ${pipPosition}, Scale: ${pipScale}%`);
@@ -180,6 +239,7 @@ router.post('/from-upload', upload.fields([
       mainVideoPath,
       reactionVideoPath,
       {
+        layoutMode,
         pipPosition,
         pipScale: parseInt(pipScale, 10)
       }
