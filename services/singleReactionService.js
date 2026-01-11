@@ -227,7 +227,12 @@ class SingleReactionService {
   }
 
   /**
-   * Create the final PiP video
+   * Create the final PiP video using THREE-PASS METHOD
+   * This ensures proper audio/video synchronization
+   * 
+   * Pass 1: Normalize background video
+   * Pass 2: Normalize PiP video  
+   * Pass 3: Overlay PiP on background with correct audio
    * 
    * @param {string} backgroundVideoPath - Path to full-screen background video
    * @param {string} pipVideoPath - Path to PiP overlay video
@@ -236,36 +241,90 @@ class SingleReactionService {
    * @param {object} dimensions - Target dimensions (from background video)
    * @param {number} pipScale - PiP size as percentage of background width (default 35%)
    * @param {string} audioSource - Which video's audio to use: 'pip' or 'background'
+   * @param {string} workDir - Working directory for temp files
    */
-  async createPipVideo(backgroundVideoPath, pipVideoPath, outputPath, pipPosition, dimensions, pipScale = 35, audioSource = 'pip') {
+  async createPipVideo(backgroundVideoPath, pipVideoPath, outputPath, pipPosition, dimensions, pipScale = 35, audioSource = 'pip', workDir = null) {
     const { width: bgWidth, height: bgHeight } = dimensions;
     const pipWidth = Math.round(bgWidth * (pipScale / 100));
     const pipHeight = Math.round(pipWidth * (bgHeight / bgWidth)); // Maintain aspect ratio
     
     const coords = this.getPipCoordinates(pipPosition, bgWidth, bgHeight, pipWidth, pipHeight);
     
-    console.log(`PiP overlay: ${pipWidth}x${pipHeight} at position (${coords.x}, ${coords.y})`);
+    console.log(`\n=== THREE-PASS PiP Creation ===`);
+    console.log(`Background: ${bgWidth}x${bgHeight}`);
+    console.log(`PiP size: ${pipWidth}x${pipHeight}`);
+    console.log(`PiP position: (${coords.x}, ${coords.y})`);
     console.log(`Audio source: ${audioSource}`);
 
-    // Complex filter to overlay PiP on background
-    const filterComplex = [
-      `[1:v]scale=${pipWidth}:${pipHeight}[pip]`,
-      `[0:v][pip]overlay=${coords.x}:${coords.y}[outv]`
-    ].join(';');
+    // Use provided workDir or create temp directory
+    const tempDir = workDir || path.dirname(outputPath);
 
-    // Choose audio source: 0 = background, 1 = pip overlay
-    const audioMap = audioSource === 'background' ? '0:a' : '1:a';
+    try {
+      // ===== PASS 1: Normalize background video =====
+      console.log('\n--- Pass 1: Normalize background video ---');
+      const normalizedBgPath = path.join(tempDir, 'normalized_background.mp4');
+      
+      const pass1Cmd = `ffmpeg -i "${backgroundVideoPath}" -vf "scale=${bgWidth}:${bgHeight}:force_original_aspect_ratio=decrease,pad=${bgWidth}:${bgHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1" -r 30 -c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -c:a aac -ar 44100 -ac 2 -b:a 128k -y "${normalizedBgPath}"`;
+      
+      console.log('Pass 1 command:', pass1Cmd);
+      await execPromise(pass1Cmd);
+      
+      if (!await fs.pathExists(normalizedBgPath)) {
+        throw new Error('Pass 1 failed: Normalized background not created');
+      }
+      console.log('✓ Pass 1 complete');
 
-    const cmd = `ffmpeg -i "${backgroundVideoPath}" -i "${pipVideoPath}" -filter_complex "${filterComplex}" -map "[outv]" -map ${audioMap} -c:v libx264 -preset fast -crf 23 -c:a aac -ar 44100 -ac 2 -b:a 128k -movflags +faststart -y "${outputPath}"`;
-    
-    console.log('Creating PiP video:', cmd);
-    await execPromise(cmd);
+      // ===== PASS 2: Normalize PiP video =====
+      console.log('\n--- Pass 2: Normalize PiP video ---');
+      const normalizedPipPath = path.join(tempDir, 'normalized_pip.mp4');
+      
+      const pass2Cmd = `ffmpeg -i "${pipVideoPath}" -vf "scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,pad=${pipWidth}:${pipHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1" -r 30 -c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -c:a aac -ar 44100 -ac 2 -b:a 128k -y "${normalizedPipPath}"`;
+      
+      console.log('Pass 2 command:', pass2Cmd);
+      await execPromise(pass2Cmd);
+      
+      if (!await fs.pathExists(normalizedPipPath)) {
+        throw new Error('Pass 2 failed: Normalized PiP not created');
+      }
+      console.log('✓ Pass 2 complete');
 
-    if (!await fs.pathExists(outputPath)) {
-      throw new Error('Failed to create PiP video');
+      // ===== PASS 3: Overlay PiP on background =====
+      console.log('\n--- Pass 3: Overlay PiP on background ---');
+      
+      // Choose audio source: 0 = background, 1 = pip overlay
+      const audioMap = audioSource === 'background' ? '0:a' : '1:a';
+      
+      // Filter complex for overlay
+      const filterComplex = `[1:v]scale=${pipWidth}:${pipHeight}[pip];[0:v][pip]overlay=${coords.x}:${coords.y}:shortest=1[outv]`;
+      
+      const pass3Cmd = `ffmpeg -i "${normalizedBgPath}" -i "${normalizedPipPath}" -filter_complex "${filterComplex}" -map "[outv]" -map ${audioMap} -c:v libx264 -preset fast -crf 23 -c:a aac -ar 44100 -ac 2 -b:a 128k -movflags +faststart -y "${outputPath}"`;
+      
+      console.log('Pass 3 command:', pass3Cmd);
+      await execPromise(pass3Cmd);
+      
+      // Cleanup temp files
+      await fs.remove(normalizedBgPath).catch(() => {});
+      await fs.remove(normalizedPipPath).catch(() => {});
+      
+      if (!await fs.pathExists(outputPath)) {
+        throw new Error('Pass 3 failed: Final PiP video not created');
+      }
+      
+      const stats = await fs.stat(outputPath);
+      console.log(`✓ Pass 3 complete - Final video: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+      console.log('=== THREE-PASS Complete ===\n');
+
+      return outputPath;
+
+    } catch (error) {
+      // Cleanup on error
+      const normalizedBgPath = path.join(tempDir, 'normalized_background.mp4');
+      const normalizedPipPath = path.join(tempDir, 'normalized_pip.mp4');
+      await fs.remove(normalizedBgPath).catch(() => {});
+      await fs.remove(normalizedPipPath).catch(() => {});
+      
+      throw error;
     }
-
-    return outputPath;
   }
 
   /**
@@ -352,7 +411,8 @@ class SingleReactionService {
           pipPosition,
           backgroundDimensions,
           pipScale,
-          'pip'  // Audio from reaction (PiP)
+          'pip',  // Audio from reaction (PiP)
+          workDir  // Pass workDir for temp files
         );
 
         // Cleanup
@@ -415,7 +475,8 @@ class SingleReactionService {
           pipPosition,
           backgroundDimensions,
           pipScale,
-          'background'  // Audio from reaction (which is now background)
+          'background',  // Audio from reaction (which is now background)
+          workDir  // Pass workDir for temp files
         );
 
         // Cleanup
