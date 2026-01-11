@@ -73,8 +73,82 @@ class R2Service {
     return {
       fileName,
       downloadUrl,
+      url: downloadUrl,
       success: true
     };
+  }
+
+  /**
+   * Upload a Buffer directly to R2 (for JSON metadata, etc.)
+   */
+  async uploadBuffer(buffer, key, contentType = 'application/octet-stream') {
+    this.init();
+    
+    if (!this.client) {
+      throw new Error('R2 not configured');
+    }
+
+    console.log(`Uploading buffer to R2: ${key}`);
+
+    const command = new PutObjectCommand({
+      Bucket: this.bucketName,
+      Key: key,
+      Body: buffer,
+      ContentType: contentType
+    });
+
+    await this.client.send(command);
+
+    // Generate public URL
+    const url = this.publicUrl 
+      ? `${this.publicUrl}/${key}`
+      : `https://pub-${process.env.R2_ACCOUNT_ID}.r2.dev/${key}`;
+
+    console.log(`✓ Uploaded buffer: ${key}`);
+
+    return {
+      success: true,
+      key,
+      url
+    };
+  }
+
+  /**
+   * Get a file from R2 as a Buffer
+   */
+  async getFile(key) {
+    this.init();
+    
+    if (!this.client) {
+      throw new Error('R2 not configured');
+    }
+
+    try {
+      console.log(`Getting file from R2: ${key}`);
+
+      const command = new GetObjectCommand({
+        Bucket: this.bucketName,
+        Key: key
+      });
+
+      const response = await this.client.send(command);
+
+      // Convert stream to buffer
+      const chunks = [];
+      for await (const chunk of response.Body) {
+        chunks.push(chunk);
+      }
+
+      console.log(`✓ Retrieved: ${key}`);
+      return Buffer.concat(chunks);
+
+    } catch (error) {
+      if (error.name === 'NoSuchKey' || error.Code === 'NoSuchKey') {
+        console.log(`File not found in R2: ${key}`);
+        return null;
+      }
+      throw error;
+    }
   }
 
   /**
