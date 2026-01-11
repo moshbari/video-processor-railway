@@ -1,10 +1,21 @@
 /**
  * Single Reaction Service
  * 
- * Handles "watch first, react at end" style reaction videos where:
- * - One main video plays normally, then freezes on last frame
- * - One reaction video (slightly longer) overlays in PiP throughout
- * - No splitting, no timestamps - just simple overlay
+ * Handles full-length reaction videos with TWO layout modes:
+ * 
+ * 1. "Watch & React" Mode (watchReact):
+ *    - Main video is FULL SCREEN (background)
+ *    - Reaction video is small PiP in corner
+ *    - Main video freezes on last frame when it ends
+ *    - Reaction continues over frozen frame
+ * 
+ * 2. "Face Cam" Mode (faceCam):
+ *    - Reaction video is FULL SCREEN (background) - person watching phone
+ *    - Main video is small PiP in corner
+ *    - Main video freezes on last frame when it ends
+ *    - Reaction continues over frozen frame
+ * 
+ * Both modes: No splitting, no timestamps - just simple overlay
  */
 
 const ffmpeg = require('fluent-ffmpeg');
@@ -57,18 +68,92 @@ class SingleReactionService {
 
   /**
    * Extract the last frame of a video as an image
+   * Uses a more robust approach that works with various video formats
    */
   async extractLastFrame(videoPath, outputPath, duration) {
-    // Seek to 0.1 seconds before end to get last frame
-    const seekTime = Math.max(0, duration - 0.1);
+    // Method 1: Try seeking to near the end
+    // Use -sseof to seek from end of file (more reliable)
+    const seekFromEnd = -0.5; // 0.5 seconds before end
     
-    const cmd = `ffmpeg -ss ${seekTime} -i "${videoPath}" -vframes 1 -q:v 2 -y "${outputPath}"`;
-    console.log('Extracting last frame:', cmd);
-    
-    await execPromise(cmd);
-    
+    try {
+      // First attempt: Use -sseof (seek from end)
+      const cmd1 = `ffmpeg -sseof ${seekFromEnd} -i "${videoPath}" -update 1 -q:v 2 -frames:v 1 -y "${outputPath}"`;
+      console.log('Extracting last frame (method 1 - sseof):', cmd1);
+      await execPromise(cmd1);
+      
+      if (await fs.pathExists(outputPath)) {
+        const stats = await fs.stat(outputPath);
+        if (stats.size > 0) {
+          console.log('  ✓ Last frame extracted successfully (method 1)');
+          return outputPath;
+        }
+      }
+    } catch (err) {
+      console.log('  Method 1 failed, trying method 2...');
+    }
+
+    try {
+      // Second attempt: Seek to specific time near end
+      const seekTime = Math.max(0, duration - 0.5);
+      const cmd2 = `ffmpeg -ss ${seekTime} -i "${videoPath}" -frames:v 1 -q:v 2 -y "${outputPath}"`;
+      console.log('Extracting last frame (method 2 - ss time):', cmd2);
+      await execPromise(cmd2);
+      
+      if (await fs.pathExists(outputPath)) {
+        const stats = await fs.stat(outputPath);
+        if (stats.size > 0) {
+          console.log('  ✓ Last frame extracted successfully (method 2)');
+          return outputPath;
+        }
+      }
+    } catch (err) {
+      console.log('  Method 2 failed, trying method 3...');
+    }
+
+    try {
+      // Third attempt: Input seeking (slower but more compatible)
+      const seekTime = Math.max(0, duration - 0.5);
+      const cmd3 = `ffmpeg -i "${videoPath}" -ss ${seekTime} -frames:v 1 -q:v 2 -y "${outputPath}"`;
+      console.log('Extracting last frame (method 3 - input seek):', cmd3);
+      await execPromise(cmd3);
+      
+      if (await fs.pathExists(outputPath)) {
+        const stats = await fs.stat(outputPath);
+        if (stats.size > 0) {
+          console.log('  ✓ Last frame extracted successfully (method 3)');
+          return outputPath;
+        }
+      }
+    } catch (err) {
+      console.log('  Method 3 failed, trying method 4...');
+    }
+
+    try {
+      // Fourth attempt: Use select filter to get last frame
+      const cmd4 = `ffmpeg -i "${videoPath}" -vf "select='eq(n,0)'" -frames:v 1 -ss ${Math.max(0, duration - 1)} -q:v 2 -y "${outputPath}"`;
+      console.log('Extracting last frame (method 4 - select filter):', cmd4);
+      await execPromise(cmd4);
+      
+      if (await fs.pathExists(outputPath)) {
+        const stats = await fs.stat(outputPath);
+        if (stats.size > 0) {
+          console.log('  ✓ Last frame extracted successfully (method 4)');
+          return outputPath;
+        }
+      }
+    } catch (err) {
+      console.log('  Method 4 failed...');
+    }
+
+    // Final check
     if (!await fs.pathExists(outputPath)) {
-      throw new Error('Failed to extract last frame');
+      throw new Error(`Failed to extract last frame from video. Duration: ${duration}s`);
+    }
+    
+    const finalStats = await fs.stat(outputPath);
+    if (finalStats.size === 0) {
+      await fs.remove(outputPath).catch(() => {});
+      throw new Error(`Extracted frame is empty (0 bytes). Duration: ${duration}s`);
     }
     
     return outputPath;
@@ -144,30 +229,34 @@ class SingleReactionService {
   /**
    * Create the final PiP video
    * 
-   * @param {string} extendedMainPath - Path to extended main video (with frozen frame)
-   * @param {string} reactionPath - Path to reaction video
+   * @param {string} backgroundVideoPath - Path to full-screen background video
+   * @param {string} pipVideoPath - Path to PiP overlay video
    * @param {string} outputPath - Output path for final video
    * @param {string} pipPosition - Corner position for PiP
-   * @param {object} dimensions - Target dimensions
-   * @param {number} pipScale - PiP size as percentage of main video width (default 35%)
+   * @param {object} dimensions - Target dimensions (from background video)
+   * @param {number} pipScale - PiP size as percentage of background width (default 35%)
+   * @param {string} audioSource - Which video's audio to use: 'pip' or 'background'
    */
-  async createPipVideo(extendedMainPath, reactionPath, outputPath, pipPosition, dimensions, pipScale = 35) {
-    const { width: mainWidth, height: mainHeight } = dimensions;
-    const pipWidth = Math.round(mainWidth * (pipScale / 100));
-    const pipHeight = Math.round(pipWidth * (mainHeight / mainWidth)); // Maintain aspect ratio
+  async createPipVideo(backgroundVideoPath, pipVideoPath, outputPath, pipPosition, dimensions, pipScale = 35, audioSource = 'pip') {
+    const { width: bgWidth, height: bgHeight } = dimensions;
+    const pipWidth = Math.round(bgWidth * (pipScale / 100));
+    const pipHeight = Math.round(pipWidth * (bgHeight / bgWidth)); // Maintain aspect ratio
     
-    const coords = this.getPipCoordinates(pipPosition, mainWidth, mainHeight, pipWidth, pipHeight);
+    const coords = this.getPipCoordinates(pipPosition, bgWidth, bgHeight, pipWidth, pipHeight);
     
     console.log(`PiP overlay: ${pipWidth}x${pipHeight} at position (${coords.x}, ${coords.y})`);
+    console.log(`Audio source: ${audioSource}`);
 
-    // Complex filter to overlay reaction on extended main video
-    // Uses reaction video's audio
+    // Complex filter to overlay PiP on background
     const filterComplex = [
       `[1:v]scale=${pipWidth}:${pipHeight}[pip]`,
       `[0:v][pip]overlay=${coords.x}:${coords.y}[outv]`
     ].join(';');
 
-    const cmd = `ffmpeg -i "${extendedMainPath}" -i "${reactionPath}" -filter_complex "${filterComplex}" -map "[outv]" -map 1:a -c:v libx264 -preset fast -crf 23 -c:a aac -ar 44100 -ac 2 -b:a 128k -movflags +faststart -y "${outputPath}"`;
+    // Choose audio source: 0 = background, 1 = pip overlay
+    const audioMap = audioSource === 'background' ? '0:a' : '1:a';
+
+    const cmd = `ffmpeg -i "${backgroundVideoPath}" -i "${pipVideoPath}" -filter_complex "${filterComplex}" -map "[outv]" -map ${audioMap} -c:v libx264 -preset fast -crf 23 -c:a aac -ar 44100 -ac 2 -b:a 128k -movflags +faststart -y "${outputPath}"`;
     
     console.log('Creating PiP video:', cmd);
     await execPromise(cmd);
@@ -184,7 +273,7 @@ class SingleReactionService {
    * 
    * @param {string} mainVideoPath - Path to main/original video
    * @param {string} reactionVideoPath - Path to reaction video (longer than main)
-   * @param {object} options - Options including pipPosition, pipScale
+   * @param {object} options - Options including layoutMode, pipPosition, pipScale
    */
   async createSingleReactionVideo(mainVideoPath, reactionVideoPath, options = {}) {
     const jobId = options.jobId || uuidv4();
@@ -193,105 +282,191 @@ class SingleReactionService {
 
     const pipPosition = options.pipPosition || 'top-right';
     const pipScale = options.pipScale || 35;
+    
+    // NEW: Layout mode - 'watchReact' (default) or 'faceCam'
+    const layoutMode = options.layoutMode || 'watchReact';
 
     console.log(`\n${'='.repeat(60)}`);
-    console.log(`SINGLE REACTION PiP - Job: ${jobId}`);
+    console.log(`SINGLE REACTION - Job: ${jobId}`);
+    console.log(`Layout Mode: ${layoutMode === 'watchReact' ? '👀 Watch & React' : '🤳 Face Cam'}`);
     console.log(`Position: ${pipPosition}, Scale: ${pipScale}%`);
     console.log(`${'='.repeat(60)}\n`);
 
     try {
       // Step 1: Get video info
       console.log('Step 1: Analyzing videos...');
-      const [mainDuration, reactionDuration, mainDimensions] = await Promise.all([
+      const [mainDuration, reactionDuration, mainDimensions, reactionDimensions] = await Promise.all([
         this.getVideoDuration(mainVideoPath),
         this.getVideoDuration(reactionVideoPath),
-        this.getVideoDimensions(mainVideoPath)
+        this.getVideoDimensions(mainVideoPath),
+        this.getVideoDimensions(reactionVideoPath)
       ]);
 
       console.log(`  Main video: ${mainDuration.toFixed(2)}s (${mainDimensions.width}x${mainDimensions.height})`);
-      console.log(`  Reaction video: ${reactionDuration.toFixed(2)}s`);
+      console.log(`  Reaction video: ${reactionDuration.toFixed(2)}s (${reactionDimensions.width}x${reactionDimensions.height})`);
 
-      if (reactionDuration <= mainDuration) {
-        console.log('  Warning: Reaction video is shorter than or equal to main video.');
-        console.log('  The main video will not freeze - just direct overlay.');
-      }
-
+      // Determine which video needs extending (the one that ends first)
       const totalDuration = Math.max(mainDuration, reactionDuration);
-      const needsFreeze = reactionDuration > mainDuration;
+      const needsMainFreeze = reactionDuration > mainDuration;
 
-      // Step 2: Extract last frame (if needed)
-      let extendedMainPath = mainVideoPath;
-      
-      if (needsFreeze) {
-        console.log('\nStep 2: Extracting last frame...');
-        const lastFramePath = path.join(workDir, 'last_frame.jpg');
-        await this.extractLastFrame(mainVideoPath, lastFramePath, mainDuration);
-        console.log('  ✓ Last frame extracted');
+      if (layoutMode === 'watchReact') {
+        // ===== WATCH & REACT MODE =====
+        // Main video = full screen (background)
+        // Reaction = PiP overlay
+        // Main video freezes if shorter
+        
+        console.log('\n📺 WATCH & REACT MODE');
+        console.log('   Main video: FULL SCREEN');
+        console.log('   Reaction: PiP corner');
 
-        // Step 3: Create extended main video
-        console.log('\nStep 3: Creating extended main video with frozen frame...');
-        extendedMainPath = path.join(workDir, 'extended_main.mp4');
-        await this.createExtendedMainVideo(
-          mainVideoPath,
-          lastFramePath,
-          mainDuration,
-          totalDuration,
-          extendedMainPath,
-          mainDimensions
+        let backgroundPath = mainVideoPath;
+        const backgroundDimensions = mainDimensions;
+
+        if (needsMainFreeze) {
+          console.log('\nStep 2: Main video is shorter - extending with frozen frame...');
+          const lastFramePath = path.join(workDir, 'main_last_frame.jpg');
+          await this.extractLastFrame(mainVideoPath, lastFramePath, mainDuration);
+          
+          backgroundPath = path.join(workDir, 'extended_main.mp4');
+          await this.createExtendedMainVideo(
+            mainVideoPath,
+            lastFramePath,
+            mainDuration,
+            totalDuration,
+            backgroundPath,
+            mainDimensions
+          );
+          await fs.remove(lastFramePath).catch(() => {});
+          console.log('  ✓ Extended main video created');
+        } else {
+          console.log('\nStep 2: Skipped (main video is longer or equal)');
+        }
+
+        // Step 3: Create PiP overlay (reaction on top of main)
+        console.log('\nStep 3: Creating PiP overlay (reaction in corner)...');
+        const outputPath = path.join(workDir, 'final_single_reaction.mp4');
+        await this.createPipVideo(
+          backgroundPath,
+          reactionVideoPath,
+          outputPath,
+          pipPosition,
+          backgroundDimensions,
+          pipScale,
+          'pip'  // Audio from reaction (PiP)
         );
-        console.log('  ✓ Extended video created');
 
-        // Cleanup last frame
-        await fs.remove(lastFramePath).catch(() => {});
+        // Cleanup
+        if (needsMainFreeze && backgroundPath !== mainVideoPath) {
+          await fs.remove(backgroundPath).catch(() => {});
+        }
+
+        return this.buildResult(jobId, outputPath, {
+          layoutMode,
+          pipPosition,
+          pipScale,
+          mainDuration,
+          reactionDuration,
+          totalDuration,
+          frozenFrameDuration: needsMainFreeze ? totalDuration - mainDuration : 0
+        });
+
       } else {
-        console.log('\nStep 2 & 3: Skipped (reaction not longer than main)');
+        // ===== FACE CAM MODE =====
+        // Reaction video = full screen (background) - person watching phone
+        // Main video = PiP overlay
+        // Main video freezes if shorter
+        
+        console.log('\n🤳 FACE CAM MODE');
+        console.log('   Reaction: FULL SCREEN (person with phone)');
+        console.log('   Main video: PiP corner');
+
+        let pipPath = mainVideoPath;
+        const backgroundDimensions = reactionDimensions;
+
+        if (needsMainFreeze) {
+          console.log('\nStep 2: Main video is shorter - extending with frozen frame...');
+          const lastFramePath = path.join(workDir, 'main_last_frame.jpg');
+          await this.extractLastFrame(mainVideoPath, lastFramePath, mainDuration);
+          
+          // For Face Cam, we need to extend main video to match reaction length
+          // This extended main becomes the PiP
+          pipPath = path.join(workDir, 'extended_main_pip.mp4');
+          await this.createExtendedMainVideo(
+            mainVideoPath,
+            lastFramePath,
+            mainDuration,
+            totalDuration,
+            pipPath,
+            mainDimensions
+          );
+          await fs.remove(lastFramePath).catch(() => {});
+          console.log('  ✓ Extended main video (for PiP) created');
+        } else {
+          console.log('\nStep 2: Skipped (main video is longer or equal)');
+        }
+
+        // Step 3: Create PiP overlay (main video on top of reaction)
+        console.log('\nStep 3: Creating PiP overlay (main video in corner)...');
+        const outputPath = path.join(workDir, 'final_single_reaction.mp4');
+        await this.createPipVideo(
+          reactionVideoPath,  // Reaction is background (full screen)
+          pipPath,            // Main video is PiP
+          outputPath,
+          pipPosition,
+          backgroundDimensions,
+          pipScale,
+          'background'  // Audio from reaction (which is now background)
+        );
+
+        // Cleanup
+        if (needsMainFreeze && pipPath !== mainVideoPath) {
+          await fs.remove(pipPath).catch(() => {});
+        }
+
+        return this.buildResult(jobId, outputPath, {
+          layoutMode,
+          pipPosition,
+          pipScale,
+          mainDuration,
+          reactionDuration,
+          totalDuration,
+          frozenFrameDuration: needsMainFreeze ? totalDuration - mainDuration : 0
+        });
       }
-
-      // Step 4: Create PiP overlay
-      console.log('\nStep 4: Creating PiP overlay...');
-      const outputPath = path.join(workDir, 'final_single_reaction.mp4');
-      await this.createPipVideo(
-        extendedMainPath,
-        reactionVideoPath,
-        outputPath,
-        pipPosition,
-        mainDimensions,
-        pipScale
-      );
-      console.log('  ✓ PiP video created');
-
-      // Cleanup extended main if we created it
-      if (needsFreeze && extendedMainPath !== mainVideoPath) {
-        await fs.remove(extendedMainPath).catch(() => {});
-      }
-
-      // Get final file info
-      const stats = await fs.stat(outputPath);
-
-      console.log(`\n${'='.repeat(60)}`);
-      console.log(`✓ COMPLETE - ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
-      console.log(`${'='.repeat(60)}\n`);
-
-      return {
-        success: true,
-        jobId,
-        outputPath,
-        pipPosition,
-        pipScale,
-        mainDuration,
-        reactionDuration,
-        totalDuration,
-        frozenFrameDuration: needsFreeze ? totalDuration - mainDuration : 0,
-        fileSize: stats.size,
-        fileSizeMB: (stats.size / 1024 / 1024).toFixed(2),
-        downloadUrl: `/api/single-reaction/${jobId}/download`
-      };
 
     } catch (error) {
       console.error('Single reaction error:', error);
       await fs.remove(workDir).catch(() => {});
       throw error;
     }
+  }
+
+  /**
+   * Build the result object
+   */
+  async buildResult(jobId, outputPath, stats) {
+    const fileStats = await fs.stat(outputPath);
+
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`✓ COMPLETE - ${(fileStats.size / 1024 / 1024).toFixed(2)} MB`);
+    console.log(`${'='.repeat(60)}\n`);
+
+    return {
+      success: true,
+      jobId,
+      outputPath,
+      layoutMode: stats.layoutMode,
+      layoutModeName: stats.layoutMode === 'watchReact' ? 'Watch & React' : 'Face Cam',
+      pipPosition: stats.pipPosition,
+      pipScale: stats.pipScale,
+      mainDuration: stats.mainDuration,
+      reactionDuration: stats.reactionDuration,
+      totalDuration: stats.totalDuration,
+      frozenFrameDuration: stats.frozenFrameDuration,
+      fileSize: fileStats.size,
+      fileSizeMB: (fileStats.size / 1024 / 1024).toFixed(2),
+      downloadUrl: `/api/single-reaction/${jobId}/download`
+    };
   }
 
   /**
