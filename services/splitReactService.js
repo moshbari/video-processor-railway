@@ -328,22 +328,29 @@ class TwoClipReactionService {
     const audioMap = layoutMode === 'watchReact' ? '0:a?' : '1:a?';
 
     // Calculate PiP dimensions
+    // For portrait output (1080x1920), pipScale represents % of WIDTH
+    // PiP will maintain its aspect ratio via scale=-2
     const pipWidth = Math.round(targetWidth * (pipScale / 100));
-    const pipHeight = Math.round(pipWidth * (9/16)); // Assuming 16:9 aspect ratio for PiP
+    
+    // For coordinate calculation, estimate PiP height based on 16:9 aspect ratio
+    // (the actual height will be determined by FFmpeg's scale=-2)
+    const pipHeightEstimate = Math.round(pipWidth * (16/9)); // For portrait PiP in portrait output
 
     // Get PiP coordinates
-    const coords = this.getPipCoordinates(pipPosition, targetWidth, targetHeight, pipWidth, pipHeight);
+    const coords = this.getPipCoordinates(pipPosition, targetWidth, targetHeight, pipWidth, pipHeightEstimate);
 
     console.log(`  Background: ${layoutMode === 'watchReact' ? 'Original' : 'Watch Clip'}`);
     console.log(`  PiP: ${layoutMode === 'watchReact' ? 'Watch Clip' : 'Original'}`);
     console.log(`  Audio Source: Original video (${audioMap})`);
-    console.log(`  PiP Size: ${pipWidth}x${pipHeight} at (${coords.x}, ${coords.y})`);
+    console.log(`  PiP Width: ${pipWidth}px (${pipScale}% of ${targetWidth})`);
+    console.log(`  PiP Position: (${coords.x}, ${coords.y})`);
 
     // FFmpeg command with complex filter
+    // Use scale=WIDTH:-2 to maintain aspect ratio automatically
     const filterComplex = [
       // Scale background to target size
       `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1[bg]`,
-      // Scale PiP video
+      // Scale PiP video - width is set, height auto-calculated to maintain aspect ratio
       `[1:v]scale=${pipWidth}:-2,setsar=1[pip]`,
       // Overlay PiP on background
       `[bg][pip]overlay=${coords.x}:${coords.y}:shortest=1[outv]`
@@ -471,17 +478,20 @@ class TwoClipReactionService {
 
   /**
    * Create freeze frame video with reaction clip overlay
-   * Uses two-step approach for reliable audio-video sync
+   * Uses simple approach: scale react clip and overlay freeze frame
    */
   async createFreezeWithReaction(framePath, reactClipPath, outputPath, options) {
     const { layoutMode, pipPosition, pipScale, targetWidth, targetHeight, duration } = options;
 
-    // Calculate PiP dimensions
+    // Calculate PiP dimensions - same logic as createPipOverlay
     const pipWidth = Math.round(targetWidth * (pipScale / 100));
-    const pipHeight = Math.round(pipWidth * (9/16));
+    const pipHeightEstimate = Math.round(pipWidth * (16/9)); // For portrait PiP
 
     // Get PiP coordinates
-    const coords = this.getPipCoordinates(pipPosition, targetWidth, targetHeight, pipWidth, pipHeight);
+    const coords = this.getPipCoordinates(pipPosition, targetWidth, targetHeight, pipWidth, pipHeightEstimate);
+
+    console.log(`  PiP Width: ${pipWidth}px (${pipScale}% of ${targetWidth})`);
+    console.log(`  PiP Position: (${coords.x}, ${coords.y})`);
 
     const workDir = path.dirname(outputPath);
     
@@ -489,56 +499,43 @@ class TwoClipReactionService {
       // Face Cam: React clip full screen, freeze frame as PiP
       console.log(`  Creating Face Cam layout (React full screen, freeze as PiP)...`);
       
-      // Step 1: Create a video from the freeze frame image (same duration as react clip)
-      const freezeVideoPath = path.join(workDir, 'freeze_video.mp4');
-      const freezeArgs = [
-        '-y',
-        '-loop', '1',
-        '-i', framePath,
-        '-c:v', 'libx264',
-        '-t', duration.toString(),
-        '-pix_fmt', 'yuv420p',
-        '-r', '30',
-        freezeVideoPath
-      ];
-      await runFFmpegCommand(freezeArgs);
-      console.log(`  ✓ Freeze video created`);
+      // Simple single-pass approach: 
+      // Scale react clip to full screen, overlay static image as PiP
+      // This keeps audio perfectly synced since we don't touch the audio stream
       
-      // Step 2: Overlay freeze frame PiP on scaled react clip, copy audio directly
       const filterComplex = [
         // Scale react clip to full screen
         `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1[bg]`,
-        // Scale freeze frame video to PiP size
-        `[1:v]scale=${pipWidth}:-2,setsar=1[pip]`,
+        // Scale freeze frame image to PiP size
+        `[1:v]scale=${pipWidth}:-2[pip]`,
         // Overlay PiP on background
         `[bg][pip]overlay=${coords.x}:${coords.y}[outv]`
       ].join(';');
 
-      const overlayArgs = [
+      const args = [
         '-y',
-        '-i', reactClipPath,
-        '-i', freezeVideoPath,
+        '-i', reactClipPath,        // Input 0: React clip (has audio)
+        '-i', framePath,            // Input 1: Freeze frame image
         '-filter_complex', filterComplex,
         '-map', '[outv]',
-        '-map', '0:a',
+        '-map', '0:a',              // Use audio from react clip
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
-        '-c:a', 'copy',  // Copy audio directly without re-encoding
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-ar', '48000',             // Standard audio sample rate
         outputPath
       ];
       
-      await runFFmpegCommand(overlayArgs);
-      
-      // Cleanup temp freeze video
-      await fs.remove(freezeVideoPath).catch(() => {});
+      await runFFmpegCommand(args);
       
     } else {
       // Watch & React: Freeze frame full screen, react clip as PiP
       console.log(`  Creating Watch & React layout (Freeze full screen, React as PiP)...`);
       
-      // Step 1: Create background video from freeze frame
-      const bgVideoPath = outputPath.replace('.mp4', '_bg.mp4');
+      // Step 1: Create background video from freeze frame (no audio)
+      const bgVideoPath = path.join(workDir, 'freeze_bg.mp4');
       const bgArgs = [
         '-y',
         '-loop', '1',
@@ -553,7 +550,7 @@ class TwoClipReactionService {
       await runFFmpegCommand(bgArgs);
       console.log(`  ✓ Background video created`);
 
-      // Step 2: Overlay react clip on background, copy audio directly
+      // Step 2: Overlay react clip as PiP, use react clip's audio
       const filterComplex = [
         `[1:v]scale=${pipWidth}:-2,setsar=1[pip]`,
         `[0:v][pip]overlay=${coords.x}:${coords.y}[outv]`
@@ -561,15 +558,18 @@ class TwoClipReactionService {
 
       const overlayArgs = [
         '-y',
-        '-i', bgVideoPath,
-        '-i', reactClipPath,
+        '-i', bgVideoPath,          // Input 0: Background (no audio)
+        '-i', reactClipPath,        // Input 1: React clip (has audio)
         '-filter_complex', filterComplex,
         '-map', '[outv]',
-        '-map', '1:a',
+        '-map', '1:a',              // Use audio from react clip
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
-        '-c:a', 'copy',  // Copy audio directly without re-encoding
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-ar', '48000',
+        '-shortest',
         outputPath
       ];
       await runFFmpegCommand(overlayArgs);
