@@ -248,7 +248,7 @@ router.post('/from-url', upload.fields([
     // Save project metadata for Recent Projects
     console.log('Saving project metadata...');
     const projectTitle = title || downloadResult.title || 'Split React Project';
-    const projectId = await projectMetadataService.saveProject({
+    const savedProject = await projectMetadataService.addProject({
       type: 'split-react',
       title: projectTitle,
       jobId: result.jobId,
@@ -279,7 +279,7 @@ router.post('/from-url', upload.fields([
       success: true,
       data: {
         ...result,
-        projectId,
+        projectId: savedProject?.id,
         projectTitle,
         downloadUrl,
         r2Key
@@ -401,7 +401,7 @@ router.post('/from-upload', upload.fields([
     // Save project metadata for Recent Projects
     console.log('Saving project metadata...');
     const projectTitle = title || mainVideoName.replace(/\.[^.]+$/, '') || 'Split React Project';
-    const projectId = await projectMetadataService.saveProject({
+    const savedProject = await projectMetadataService.addProject({
       type: 'split-react',
       title: projectTitle,
       jobId: result.jobId,
@@ -431,7 +431,7 @@ router.post('/from-upload', upload.fields([
       success: true,
       data: {
         ...result,
-        projectId,
+        projectId: savedProject?.id,
         projectTitle,
         downloadUrl,
         r2Key
@@ -557,7 +557,7 @@ router.post('/from-fetched', upload.fields([
     // Save project metadata for Recent Projects
     console.log('Saving project metadata...');
     const projectTitle = title || fetchedData.title || 'Split React Project';
-    const projectId = await projectMetadataService.saveProject({
+    const savedProject = await projectMetadataService.addProject({
       type: 'split-react',
       title: projectTitle,
       jobId: result.jobId,
@@ -591,7 +591,7 @@ router.post('/from-fetched', upload.fields([
       success: true,
       data: {
         ...result,
-        projectId,
+        projectId: savedProject?.id,
         projectTitle,
         downloadUrl,
         r2Key
@@ -622,10 +622,15 @@ router.post('/from-fetched', upload.fields([
  */
 router.get('/projects', async (req, res) => {
   try {
-    const projects = await projectMetadataService.listProjects('split-react');
+    const limit = parseInt(req.query.limit) || 20;
+    const projects = await projectMetadataService.getProjects({ limit });
+    
+    // Filter to only split-react type projects
+    const splitReactProjects = projects.filter(p => p.type === 'split-react');
+    
     res.json({
       success: true,
-      data: projects
+      data: splitReactProjects
     });
   } catch (error) {
     console.error('[Split React] List projects error:', error);
