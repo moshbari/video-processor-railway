@@ -19,9 +19,38 @@ const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs-extra');
 const { v4: uuidv4 } = require('uuid');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
+
+/**
+ * Run FFmpeg command safely with spawn (handles spaces in filenames better)
+ */
+function runFFmpegCommand(args) {
+  return new Promise((resolve, reject) => {
+    console.log(`  Running: ffmpeg ${args.slice(0, 5).join(' ')}...`);
+    
+    const ffmpegProcess = spawn('ffmpeg', args);
+    
+    let stderr = '';
+    
+    ffmpegProcess.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+    
+    ffmpegProcess.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`FFmpeg exited with code ${code}: ${stderr.slice(-500)}`));
+      }
+    });
+    
+    ffmpegProcess.on('error', (err) => {
+      reject(err);
+    });
+  });
+}
 
 class TwoClipReactionService {
   constructor() {
@@ -352,29 +381,56 @@ class TwoClipReactionService {
       // Face Cam: React clip full screen, freeze frame as PiP
       console.log(`  Creating Face Cam layout (React full screen, freeze as PiP)...`);
       
-      // Escape the frame path for FFmpeg movie filter (replace spaces and special chars)
-      const escapedFramePath = framePath.replace(/\\/g, '/').replace(/'/g, "'\\''");
-      
       const filterComplex = [
         // Scale react clip to full screen
         `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1[bg]`,
-        // Loop freeze frame and scale to PiP size - use input instead of movie filter
+        // Loop freeze frame and scale to PiP size
         `[1:v]scale=${pipWidth}:-2,setsar=1[pip]`,
         // Overlay PiP on background
         `[bg][pip]overlay=${coords.x}:${coords.y}:shortest=1[outv]`
       ].join(';');
 
-      // Use two inputs instead of movie filter to avoid path escaping issues
-      const cmd = `ffmpeg -y -i "${reactClipPath}" -loop 1 -t ${duration} -i "${framePath}" -filter_complex "${filterComplex}" -map "[outv]" -map 0:a? -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -t ${duration} "${outputPath}"`;
+      // Use spawn with array args to handle spaces in filenames properly
+      const args = [
+        '-y',
+        '-i', reactClipPath,
+        '-loop', '1',
+        '-t', duration.toString(),
+        '-i', framePath,
+        '-filter_complex', filterComplex,
+        '-map', '[outv]',
+        '-map', '0:a?',
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-t', duration.toString(),
+        outputPath
+      ];
 
-      await execPromise(cmd);
+      await runFFmpegCommand(args);
     } else {
       // Watch & React: Freeze frame full screen, react clip as PiP
       console.log(`  Creating Watch & React layout (Freeze full screen, React as PiP)...`);
       
-      // Step 1: Create background video from freeze frame
-      const bgCmd = `ffmpeg -y -loop 1 -i "${framePath}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -c:v libx264 -preset fast -crf 23 -t ${duration} -pix_fmt yuv420p -c:a aac -shortest "${bgVideoPath}"`;
-      await execPromise(bgCmd);
+      // Step 1: Create background video from freeze frame using spawn
+      const bgArgs = [
+        '-y',
+        '-loop', '1',
+        '-i', framePath,
+        '-f', 'lavfi',
+        '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-t', duration.toString(),
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-shortest',
+        bgVideoPath
+      ];
+      await runFFmpegCommand(bgArgs);
 
       // Step 2: Overlay react clip on background
       const filterComplex = [
@@ -382,9 +438,21 @@ class TwoClipReactionService {
         `[0:v][pip]overlay=${coords.x}:${coords.y}:shortest=1[outv]`
       ].join(';');
 
-      const cmd = `ffmpeg -y -i "${bgVideoPath}" -i "${reactClipPath}" -filter_complex "${filterComplex}" -map "[outv]" -map 1:a? -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
-
-      await execPromise(cmd);
+      const overlayArgs = [
+        '-y',
+        '-i', bgVideoPath,
+        '-i', reactClipPath,
+        '-filter_complex', filterComplex,
+        '-map', '[outv]',
+        '-map', '1:a?',
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        outputPath
+      ];
+      await runFFmpegCommand(overlayArgs);
 
       // Cleanup background video
       await fs.remove(bgVideoPath).catch(() => {});
