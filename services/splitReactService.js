@@ -98,10 +98,20 @@ class TwoClipReactionService {
   async trimVideo(inputPath, outputPath, duration) {
     console.log(`Trimming video to ${duration}s: ${inputPath}`);
     
-    const cmd = `ffmpeg -y -i "${inputPath}" -t ${duration} -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
+    const args = [
+      '-y',
+      '-i', inputPath,
+      '-t', duration.toString(),
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-crf', '23',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      outputPath
+    ];
     
     try {
-      await execPromise(cmd);
+      await runFFmpegCommand(args);
       console.log(`✓ Trimmed video saved: ${outputPath}`);
       return outputPath;
     } catch (error) {
@@ -326,10 +336,24 @@ class TwoClipReactionService {
       `[bg][pip]overlay=${coords.x}:${coords.y}:shortest=1[outv]`
     ].join(';');
 
-    const cmd = `ffmpeg -y -i "${bgVideo}" -i "${pipVideo}" -filter_complex "${filterComplex}" -map "[outv]" -map 0:a? -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -shortest "${outputPath}"`;
+    const args = [
+      '-y',
+      '-i', bgVideo,
+      '-i', pipVideo,
+      '-filter_complex', filterComplex,
+      '-map', '[outv]',
+      '-map', '0:a?',
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-crf', '23',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-shortest',
+      outputPath
+    ];
 
     try {
-      await execPromise(cmd);
+      await runFFmpegCommand(args);
       console.log(`  ✓ Part 1 created: ${outputPath}`);
       return outputPath;
     } catch (error) {
@@ -339,16 +363,30 @@ class TwoClipReactionService {
   }
 
   /**
-   * Extract last frame using raw ffmpeg command
+   * Extract last frame using spawn for better path handling
    */
   async extractLastFrameRaw(videoPath, outputPath) {
     const duration = await this.getVideoDuration(videoPath);
     const seekTime = Math.max(0, duration - 0.1);
 
-    const cmd = `ffmpeg -y -ss ${seekTime} -i "${videoPath}" -vframes 1 -q:v 2 "${outputPath}"`;
+    const args = [
+      '-y',
+      '-ss', seekTime.toString(),
+      '-i', videoPath,
+      '-vframes', '1',
+      '-q:v', '2',
+      outputPath
+    ];
 
     try {
-      await execPromise(cmd);
+      await runFFmpegCommand(args);
+      
+      // Verify the file was created
+      const exists = await fs.pathExists(outputPath);
+      if (!exists) {
+        throw new Error(`Frame extraction completed but file not found: ${outputPath}`);
+      }
+      
       console.log(`  ✓ Last frame extracted: ${outputPath}`);
       return outputPath;
     } catch (error) {
@@ -473,10 +511,21 @@ class TwoClipReactionService {
     const concatContent = videoPaths.map(p => `file '${p}'`).join('\n');
     await fs.writeFile(concatListPath, concatContent);
 
-    const cmd = `ffmpeg -y -f concat -safe 0 -i "${concatListPath}" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
+    const args = [
+      '-y',
+      '-f', 'concat',
+      '-safe', '0',
+      '-i', concatListPath,
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-crf', '23',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      outputPath
+    ];
 
     try {
-      await execPromise(cmd);
+      await runFFmpegCommand(args);
       console.log(`  ✓ Final video created: ${outputPath}`);
       return outputPath;
     } catch (error) {
