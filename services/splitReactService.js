@@ -478,147 +478,205 @@ class TwoClipReactionService {
 
   /**
    * Create freeze frame video with reaction clip overlay
-   * Uses 3-pass approach for perfect audio-video sync
+   * Uses proven THREE-PASS method (same as singleReactionService)
    */
   async createFreezeWithReaction(framePath, reactClipPath, outputPath, options) {
     const { layoutMode, pipPosition, pipScale, targetWidth, targetHeight, duration } = options;
 
-    // Calculate PiP dimensions - same logic as createPipOverlay
+    // Calculate PiP dimensions
     const pipWidth = Math.round(targetWidth * (pipScale / 100));
     const pipHeightEstimate = Math.round(pipWidth * (16/9)); // For portrait PiP
 
     // Get PiP coordinates
     const coords = this.getPipCoordinates(pipPosition, targetWidth, targetHeight, pipWidth, pipHeightEstimate);
 
-    console.log(`  PiP Width: ${pipWidth}px (${pipScale}% of ${targetWidth})`);
-    console.log(`  PiP Position: (${coords.x}, ${coords.y})`);
+    console.log(`\n=== THREE-PASS Part 2 Creation ===`);
+    console.log(`Target: ${targetWidth}x${targetHeight}`);
+    console.log(`PiP Width: ${pipWidth}px (${pipScale}%)`);
+    console.log(`PiP Position: (${coords.x}, ${coords.y})`);
+    console.log(`Layout: ${layoutMode}`);
 
     const workDir = path.dirname(outputPath);
     
     if (layoutMode === 'faceCam') {
       // Face Cam: React clip full screen, freeze frame as PiP
-      console.log(`  Creating Face Cam layout (React full screen, freeze as PiP)...`);
-      console.log(`  Using 3-pass method for perfect audio sync...`);
+      console.log(`\nMode: Face Cam (React full screen, freeze as PiP)`);
       
-      // PASS 1: Scale react clip to target dimensions, preserve audio exactly
-      const pass1Path = path.join(workDir, 'part2_pass1.mp4');
-      console.log(`  Pass 1: Scaling react clip...`);
+      // ===== PASS 1: Normalize react clip (will be background) =====
+      console.log('\n--- Pass 1: Normalize react clip ---');
+      const normalizedBgPath = path.join(workDir, 'normalized_background.mp4');
+      
       const pass1Args = [
         '-y',
         '-i', reactClipPath,
-        '-vf', `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1`,
+        '-vf', `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+        '-r', '30',
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
-        '-c:a', 'copy',  // Copy audio exactly as-is
-        pass1Path
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-ar', '44100',
+        '-ac', '2',
+        '-b:a', '128k',
+        '-async', '1',  // Force audio sync
+        normalizedBgPath
       ];
       await runFFmpegCommand(pass1Args);
       
-      // PASS 2: Create freeze frame video (PiP size, same duration as react clip)
-      const pass2Path = path.join(workDir, 'part2_pass2.mp4');
-      console.log(`  Pass 2: Creating freeze frame video...`);
+      const bgExists = await fs.pathExists(normalizedBgPath);
+      if (!bgExists) throw new Error('Pass 1 failed: Normalized background not created');
+      console.log('✓ Pass 1 complete');
+
+      // ===== PASS 2: Create PiP video from freeze frame =====
+      console.log('\n--- Pass 2: Create freeze frame PiP video ---');
+      const normalizedPipPath = path.join(workDir, 'normalized_pip.mp4');
       
-      // Get exact duration from pass 1 to match perfectly
-      const exactDuration = await this.getVideoDuration(pass1Path);
+      // Get exact duration from normalized background
+      const exactDuration = await this.getVideoDuration(normalizedBgPath);
+      console.log(`  Exact duration from Pass 1: ${exactDuration}s`);
       
+      // Simple scale for PiP - just set width, auto height
       const pass2Args = [
         '-y',
         '-loop', '1',
         '-i', framePath,
         '-t', exactDuration.toString(),
-        '-vf', `scale=${pipWidth}:-2`,
+        '-vf', `scale=${pipWidth}:-2,setsar=1`,
+        '-r', '30',
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
         '-pix_fmt', 'yuv420p',
-        '-r', '30',
-        '-an',  // No audio
-        pass2Path
+        '-an',
+        normalizedPipPath
       ];
       await runFFmpegCommand(pass2Args);
       
-      // PASS 3: Overlay pass2 on pass1, copy audio from pass1
-      console.log(`  Pass 3: Overlaying and preserving audio...`);
+      const pipExists = await fs.pathExists(normalizedPipPath);
+      if (!pipExists) throw new Error('Pass 2 failed: Normalized PiP not created');
+      console.log('✓ Pass 2 complete');
+
+      // ===== PASS 3: Overlay PiP on background =====
+      console.log('\n--- Pass 3: Overlay PiP on background ---');
+      
+      // Simple overlay - no additional scaling needed since Pass 2 already sized PiP
+      const filterComplex = `[0:v][1:v]overlay=${coords.x}:${coords.y}:shortest=1[outv]`;
+      
       const pass3Args = [
         '-y',
-        '-i', pass1Path,   // Background with audio
-        '-i', pass2Path,   // PiP overlay (no audio)
-        '-filter_complex', `[1:v]setsar=1[pip];[0:v][pip]overlay=${coords.x}:${coords.y}[outv]`,
+        '-i', normalizedBgPath,   // Input 0: Background (full screen react)
+        '-i', normalizedPipPath,  // Input 1: PiP (freeze frame)
+        '-filter_complex', filterComplex,
         '-map', '[outv]',
-        '-map', '0:a',     // Audio from pass1 (the scaled react clip)
+        '-map', '0:a',
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
-        '-c:a', 'copy',    // Copy audio exactly
+        '-c:a', 'copy',  // Just copy the already-normalized audio
+        '-movflags', '+faststart',
         outputPath
       ];
       await runFFmpegCommand(pass3Args);
       
-      // Cleanup intermediate files
-      await fs.remove(pass1Path).catch(() => {});
-      await fs.remove(pass2Path).catch(() => {});
+      // Cleanup temp files
+      await fs.remove(normalizedBgPath).catch(() => {});
+      await fs.remove(normalizedPipPath).catch(() => {});
+      
+      const finalExists = await fs.pathExists(outputPath);
+      if (!finalExists) throw new Error('Pass 3 failed: Final video not created');
+      
+      const stats = await fs.stat(outputPath);
+      console.log(`✓ Pass 3 complete - Final video: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+      console.log('=== THREE-PASS Complete ===\n');
       
     } else {
       // Watch & React: Freeze frame full screen, react clip as PiP
-      console.log(`  Creating Watch & React layout (Freeze full screen, React as PiP)...`);
-      console.log(`  Using 3-pass method for perfect audio sync...`);
+      console.log(`\nMode: Watch & React (Freeze full screen, React as PiP)`);
       
-      // PASS 1: Create freeze frame background video (no audio)
-      const pass1Path = path.join(workDir, 'part2_pass1.mp4');
-      console.log(`  Pass 1: Creating freeze frame background...`);
+      // ===== PASS 1: Create background video from freeze frame =====
+      console.log('\n--- Pass 1: Create freeze frame background ---');
+      const normalizedBgPath = path.join(workDir, 'normalized_background.mp4');
+      
       const pass1Args = [
         '-y',
         '-loop', '1',
         '-i', framePath,
         '-t', duration.toString(),
-        '-vf', `scale=${targetWidth}:${targetHeight}`,
+        '-vf', `scale=${targetWidth}:${targetHeight},setsar=1`,
+        '-r', '30',
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
         '-pix_fmt', 'yuv420p',
-        '-r', '30',
-        '-an',
-        pass1Path
+        '-an',  // No audio
+        normalizedBgPath
       ];
       await runFFmpegCommand(pass1Args);
       
-      // PASS 2: Scale react clip to PiP size, preserve audio
-      const pass2Path = path.join(workDir, 'part2_pass2.mp4');
-      console.log(`  Pass 2: Scaling react clip to PiP size...`);
+      const bgExists = await fs.pathExists(normalizedBgPath);
+      if (!bgExists) throw new Error('Pass 1 failed: Background not created');
+      console.log('✓ Pass 1 complete');
+
+      // ===== PASS 2: Normalize react clip (will be PiP) =====
+      console.log('\n--- Pass 2: Normalize react clip for PiP ---');
+      const normalizedPipPath = path.join(workDir, 'normalized_pip.mp4');
+      
       const pass2Args = [
         '-y',
         '-i', reactClipPath,
         '-vf', `scale=${pipWidth}:-2,setsar=1`,
+        '-r', '30',
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
-        '-c:a', 'copy',
-        pass2Path
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-ar', '44100',
+        '-ac', '2',
+        '-b:a', '128k',
+        '-async', '1',  // Force audio sync
+        normalizedPipPath
       ];
       await runFFmpegCommand(pass2Args);
       
-      // PASS 3: Overlay pass2 on pass1, use audio from pass2
-      console.log(`  Pass 3: Overlaying and preserving audio...`);
+      const pipExists = await fs.pathExists(normalizedPipPath);
+      if (!pipExists) throw new Error('Pass 2 failed: Normalized PiP not created');
+      console.log('✓ Pass 2 complete');
+
+      // ===== PASS 3: Overlay PiP on background =====
+      console.log('\n--- Pass 3: Overlay PiP on background ---');
+      
+      // Simple overlay - PiP already scaled in Pass 2
+      const filterComplex = `[0:v][1:v]overlay=${coords.x}:${coords.y}:shortest=1[outv]`;
+      
       const pass3Args = [
         '-y',
-        '-i', pass1Path,   // Background (no audio)
-        '-i', pass2Path,   // PiP with audio
-        '-filter_complex', `[1:v][0:v]scale2ref[pip][bg];[bg][pip]overlay=${coords.x}:${coords.y}[outv]`,
+        '-i', normalizedBgPath,
+        '-i', normalizedPipPath,
+        '-filter_complex', filterComplex,
         '-map', '[outv]',
-        '-map', '1:a',     // Audio from pass2 (the react clip)
+        '-map', '1:a',  // Audio from PiP (the react clip)
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
-        '-c:a', 'copy',
+        '-c:a', 'copy',  // Just copy already-normalized audio
+        '-movflags', '+faststart',
         '-shortest',
         outputPath
       ];
       await runFFmpegCommand(pass3Args);
       
-      // Cleanup intermediate files
-      await fs.remove(pass1Path).catch(() => {});
-      await fs.remove(pass2Path).catch(() => {});
+      // Cleanup temp files
+      await fs.remove(normalizedBgPath).catch(() => {});
+      await fs.remove(normalizedPipPath).catch(() => {});
+      
+      const finalExists = await fs.pathExists(outputPath);
+      if (!finalExists) throw new Error('Pass 3 failed: Final video not created');
+      
+      const stats = await fs.stat(outputPath);
+      console.log(`✓ Pass 3 complete - Final video: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+      console.log('=== THREE-PASS Complete ===\n');
     }
 
     console.log(`  ✓ Part 2 created: ${outputPath}`);
