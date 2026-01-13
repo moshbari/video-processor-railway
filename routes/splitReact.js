@@ -268,7 +268,7 @@ router.post('/from-url', upload.fields([
       r2Key,
       createdAt: new Date().toISOString()
     });
-    console.log(`✓ Project saved: ${projectId}`);
+    console.log(`✓ Project saved: ${savedProject?.id || 'unknown'}`);
 
     // Cleanup temp files
     await fs.remove(mainVideoPath).catch(() => {});
@@ -420,7 +420,7 @@ router.post('/from-upload', upload.fields([
       r2Key,
       createdAt: new Date().toISOString()
     });
-    console.log(`✓ Project saved: ${projectId}`);
+    console.log(`✓ Project saved: ${savedProject?.id || 'unknown'}`);
 
     // Cleanup temp files
     await fs.remove(mainVideoPath).catch(() => {});
@@ -577,7 +577,7 @@ router.post('/from-fetched', upload.fields([
       r2Key,
       createdAt: new Date().toISOString()
     });
-    console.log(`✓ Project saved: ${projectId}`);
+    console.log(`✓ Project saved: ${savedProject?.id || 'unknown'}`);
 
     // Cleanup fetched video from memory store (already used)
     fetchedVideos.delete(fetchId);
