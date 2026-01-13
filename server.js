@@ -1,3 +1,9 @@
+/**
+ * ⚡ RANT SQUAD VIDEO PROCESSOR API ⚡
+ * 
+ * Complete server.js with all routes including Split React
+ */
+
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -12,7 +18,9 @@ const splitRoutes = require('./routes/split');
 const combineRoutes = require('./routes/combine');
 const adminRoutes = require('./routes/admin');
 const uploadRoutes = require('./routes/upload');
-const singleReactionRoutes = require('./routes/singleReaction');  // NEW: Single Reaction
+const overlayRoutes = require('./routes/overlay');
+const singleReactionRoutes = require('./routes/singleReaction');
+const splitReactRoutes = require('./routes/splitReact');  // ⚡ SPLIT REACT (NEW!)
 
 // Import services
 const cleanupService = require('./services/cleanupService');
@@ -54,7 +62,9 @@ app.get('/health', (req, res) => {
       combine: 'active',
       cleanup: 'active',
       upload: 'active',
-      'single-reaction': 'active'  // NEW
+      overlay: 'active',
+      'single-reaction': 'active',
+      'split-react': 'active'  // ⚡ SPLIT REACT (NEW!)
     }
   });
 });
@@ -68,7 +78,9 @@ app.use('/api/split', splitRoutes);
 app.use('/api/combine', combineRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/upload', uploadRoutes);
-app.use('/api/single-reaction', singleReactionRoutes);  // NEW: Single Reaction
+app.use('/api/overlay', overlayRoutes);
+app.use('/api/single-reaction', singleReactionRoutes);
+app.use('/api/split-react', splitReactRoutes);  // ⚡ SPLIT REACT (NEW!)
 
 // Error handling for multer
 app.use((err, req, res, next) => {
@@ -99,23 +111,27 @@ app.use((err, req, res, next) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`Video Processor API listening on port ${PORT}`);
+  console.log('');
+  console.log('⚡ RANT SQUAD VIDEO PROCESSOR API ⚡');
+  console.log(`Listening on port ${PORT}`);
+  console.log('');
   console.log('Available endpoints:');
   console.log('  POST /api/download');
   console.log('  POST /api/transcribe');
   console.log('  POST /api/render');
+  console.log('  POST /api/admin/cleanup');
   console.log('  POST /api/split');
   console.log('  POST /api/combine');
   console.log('  POST /api/combine/from-split/:splitJobId');
   console.log('  POST /api/upload');
-  console.log('  POST /api/upload/with-reactions');
-  console.log('  POST /api/single-reaction/from-url       ← NEW: Single reaction from URL');
-  console.log('  POST /api/single-reaction/from-upload    ← NEW: Single reaction from uploads');
-  console.log('  GET  /api/single-reaction/:jobId/download');
-  console.log('  GET  /api/single-reaction/:jobId/status');
+  console.log('  POST /api/overlay');
+  console.log('  POST /api/single-reaction/*');
+  console.log('  POST /api/split-react/*        ← ⚡ SPLIT REACT (NEW!)');
   console.log('  GET  /api/combine/:jobId/download');
   console.log('  GET  /api/split/:jobId/download');
   console.log('  GET  /api/jobs/:jobId/download');
   console.log('  GET  /api/admin/status');
-  console.log('  POST /api/admin/cleanup');
+  console.log('  GET  /health');
 });
+
+module.exports = app;
