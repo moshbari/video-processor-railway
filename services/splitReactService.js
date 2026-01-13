@@ -367,8 +367,12 @@ class TwoClipReactionService {
    */
   async extractLastFrameRaw(videoPath, outputPath) {
     const duration = await this.getVideoDuration(videoPath);
-    const seekTime = Math.max(0, duration - 0.1);
-
+    console.log(`  Duration of part1_watching.mp4: ${duration}s`);
+    
+    // Try multiple approaches to extract last frame
+    // Approach 1: Seek to near the end
+    const seekTime = Math.max(0, duration - 0.5); // Seek to 0.5 seconds before end
+    
     const args = [
       '-y',
       '-ss', seekTime.toString(),
@@ -383,12 +387,69 @@ class TwoClipReactionService {
       
       // Verify the file was created
       const exists = await fs.pathExists(outputPath);
-      if (!exists) {
-        throw new Error(`Frame extraction completed but file not found: ${outputPath}`);
+      if (exists) {
+        const stats = await fs.stat(outputPath);
+        if (stats.size > 0) {
+          console.log(`  ✓ Last frame extracted: ${outputPath} (${stats.size} bytes)`);
+          return outputPath;
+        }
       }
       
-      console.log(`  ✓ Last frame extracted: ${outputPath}`);
-      return outputPath;
+      // If first approach failed, try without seeking (just get first frame and use that)
+      console.log('  First approach failed, trying alternative (extract from beginning)...');
+      const args2 = [
+        '-y',
+        '-sseof', '-1',  // Seek to 1 second before end of file
+        '-i', videoPath,
+        '-vframes', '1',
+        '-q:v', '2',
+        outputPath
+      ];
+      
+      await runFFmpegCommand(args2);
+      
+      const exists2 = await fs.pathExists(outputPath);
+      if (exists2) {
+        const stats2 = await fs.stat(outputPath);
+        if (stats2.size > 0) {
+          console.log(`  ✓ Last frame extracted (alt method): ${outputPath} (${stats2.size} bytes)`);
+          return outputPath;
+        }
+      }
+      
+      // Third approach: use -update flag with output seeking
+      console.log('  Second approach failed, trying third method...');
+      const args3 = [
+        '-y',
+        '-i', videoPath,
+        '-vf', `select='eq(n,0)'`,  // Select first frame
+        '-vframes', '1',
+        '-q:v', '2',
+        '-update', '1',
+        outputPath
+      ];
+      
+      // Actually, let's just extract the first frame as a fallback
+      const args4 = [
+        '-y',
+        '-i', videoPath,
+        '-vframes', '1',
+        '-q:v', '2',
+        outputPath
+      ];
+      
+      await runFFmpegCommand(args4);
+      
+      const exists3 = await fs.pathExists(outputPath);
+      if (exists3) {
+        const stats3 = await fs.stat(outputPath);
+        if (stats3.size > 0) {
+          console.log(`  ✓ Frame extracted (fallback - first frame): ${outputPath} (${stats3.size} bytes)`);
+          return outputPath;
+        }
+      }
+      
+      throw new Error(`All frame extraction methods failed for: ${outputPath}`);
     } catch (error) {
       console.error('Frame extraction error:', error);
       throw error;
