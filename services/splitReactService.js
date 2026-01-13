@@ -352,16 +352,20 @@ class TwoClipReactionService {
       // Face Cam: React clip full screen, freeze frame as PiP
       console.log(`  Creating Face Cam layout (React full screen, freeze as PiP)...`);
       
+      // Escape the frame path for FFmpeg movie filter (replace spaces and special chars)
+      const escapedFramePath = framePath.replace(/\\/g, '/').replace(/'/g, "'\\''");
+      
       const filterComplex = [
         // Scale react clip to full screen
         `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1[bg]`,
-        // Loop freeze frame and scale to PiP size
-        `movie=${framePath}:loop=0,setpts=N/FRAME_RATE/TB,scale=${pipWidth}:-2,setsar=1[pip]`,
+        // Loop freeze frame and scale to PiP size - use input instead of movie filter
+        `[1:v]scale=${pipWidth}:-2,setsar=1[pip]`,
         // Overlay PiP on background
         `[bg][pip]overlay=${coords.x}:${coords.y}:shortest=1[outv]`
       ].join(';');
 
-      const cmd = `ffmpeg -y -i "${reactClipPath}" -filter_complex "${filterComplex}" -map "[outv]" -map 0:a? -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -t ${duration} "${outputPath}"`;
+      // Use two inputs instead of movie filter to avoid path escaping issues
+      const cmd = `ffmpeg -y -i "${reactClipPath}" -loop 1 -t ${duration} -i "${framePath}" -filter_complex "${filterComplex}" -map "[outv]" -map 0:a? -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -t ${duration} "${outputPath}"`;
 
       await execPromise(cmd);
     } else {
