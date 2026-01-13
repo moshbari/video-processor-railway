@@ -471,6 +471,7 @@ class TwoClipReactionService {
 
   /**
    * Create freeze frame video with reaction clip overlay
+   * Uses two-step approach for reliable audio-video sync
    */
   async createFreezeWithReaction(framePath, reactClipPath, outputPath, options) {
     const { layoutMode, pipPosition, pipScale, targetWidth, targetHeight, duration } = options;
@@ -482,72 +483,80 @@ class TwoClipReactionService {
     // Get PiP coordinates
     const coords = this.getPipCoordinates(pipPosition, targetWidth, targetHeight, pipWidth, pipHeight);
 
-    // Three-pass method for reliable audio-video sync
-    // Pass 1: Create background video from freeze frame
-    const bgVideoPath = outputPath.replace('.mp4', '_bg.mp4');
-    
-    // In Face Cam mode, the reaction is full screen and original (freeze) is PiP
-    // In Watch & React mode, the freeze frame is full screen and reaction is PiP
+    const workDir = path.dirname(outputPath);
     
     if (layoutMode === 'faceCam') {
       // Face Cam: React clip full screen, freeze frame as PiP
       console.log(`  Creating Face Cam layout (React full screen, freeze as PiP)...`);
       
+      // Step 1: Create a video from the freeze frame image (same duration as react clip)
+      const freezeVideoPath = path.join(workDir, 'freeze_video.mp4');
+      const freezeArgs = [
+        '-y',
+        '-loop', '1',
+        '-i', framePath,
+        '-c:v', 'libx264',
+        '-t', duration.toString(),
+        '-pix_fmt', 'yuv420p',
+        '-r', '30',
+        freezeVideoPath
+      ];
+      await runFFmpegCommand(freezeArgs);
+      console.log(`  ✓ Freeze video created`);
+      
+      // Step 2: Overlay freeze frame PiP on scaled react clip, copy audio directly
       const filterComplex = [
         // Scale react clip to full screen
         `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1[bg]`,
-        // Loop freeze frame and scale to PiP size
+        // Scale freeze frame video to PiP size
         `[1:v]scale=${pipWidth}:-2,setsar=1[pip]`,
         // Overlay PiP on background
-        `[bg][pip]overlay=${coords.x}:${coords.y}:shortest=1[outv]`
+        `[bg][pip]overlay=${coords.x}:${coords.y}[outv]`
       ].join(';');
 
-      // Use spawn with array args to handle spaces in filenames properly
-      const args = [
+      const overlayArgs = [
         '-y',
         '-i', reactClipPath,
-        '-loop', '1',
-        '-t', duration.toString(),
-        '-i', framePath,
+        '-i', freezeVideoPath,
         '-filter_complex', filterComplex,
         '-map', '[outv]',
-        '-map', '0:a?',
+        '-map', '0:a',
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
-        '-c:a', 'aac',
-        '-b:a', '128k',
-        '-t', duration.toString(),
+        '-c:a', 'copy',  // Copy audio directly without re-encoding
         outputPath
       ];
-
-      await runFFmpegCommand(args);
+      
+      await runFFmpegCommand(overlayArgs);
+      
+      // Cleanup temp freeze video
+      await fs.remove(freezeVideoPath).catch(() => {});
+      
     } else {
       // Watch & React: Freeze frame full screen, react clip as PiP
       console.log(`  Creating Watch & React layout (Freeze full screen, React as PiP)...`);
       
-      // Step 1: Create background video from freeze frame using spawn
+      // Step 1: Create background video from freeze frame
+      const bgVideoPath = outputPath.replace('.mp4', '_bg.mp4');
       const bgArgs = [
         '-y',
         '-loop', '1',
         '-i', framePath,
-        '-f', 'lavfi',
-        '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
         '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
         '-t', duration.toString(),
         '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac',
-        '-shortest',
+        '-r', '30',
+        '-s', `${targetWidth}x${targetHeight}`,
         bgVideoPath
       ];
       await runFFmpegCommand(bgArgs);
+      console.log(`  ✓ Background video created`);
 
-      // Step 2: Overlay react clip on background
+      // Step 2: Overlay react clip on background, copy audio directly
       const filterComplex = [
         `[1:v]scale=${pipWidth}:-2,setsar=1[pip]`,
-        `[0:v][pip]overlay=${coords.x}:${coords.y}:shortest=1[outv]`
+        `[0:v][pip]overlay=${coords.x}:${coords.y}[outv]`
       ].join(';');
 
       const overlayArgs = [
@@ -556,12 +565,11 @@ class TwoClipReactionService {
         '-i', reactClipPath,
         '-filter_complex', filterComplex,
         '-map', '[outv]',
-        '-map', '1:a?',
+        '-map', '1:a',
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
-        '-c:a', 'aac',
-        '-b:a', '128k',
+        '-c:a', 'copy',  // Copy audio directly without re-encoding
         outputPath
       ];
       await runFFmpegCommand(overlayArgs);
