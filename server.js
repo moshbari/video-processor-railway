@@ -18,7 +18,6 @@ const splitRoutes = require('./routes/split');
 const combineRoutes = require('./routes/combine');
 const adminRoutes = require('./routes/admin');
 const uploadRoutes = require('./routes/upload');
-const overlayRoutes = require('./routes/overlay');
 const singleReactionRoutes = require('./routes/singleReaction');
 const splitReactRoutes = require('./routes/splitReact');  // ⚡ SPLIT REACT (NEW!)
 
@@ -62,7 +61,6 @@ app.get('/health', (req, res) => {
       combine: 'active',
       cleanup: 'active',
       upload: 'active',
-      overlay: 'active',
       'single-reaction': 'active',
       'split-react': 'active'  // ⚡ SPLIT REACT (NEW!)
     }
@@ -78,7 +76,6 @@ app.use('/api/split', splitRoutes);
 app.use('/api/combine', combineRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/upload', uploadRoutes);
-app.use('/api/overlay', overlayRoutes);
 app.use('/api/single-reaction', singleReactionRoutes);
 app.use('/api/split-react', splitReactRoutes);  // ⚡ SPLIT REACT (NEW!)
 
@@ -124,7 +121,6 @@ app.listen(PORT, () => {
   console.log('  POST /api/combine');
   console.log('  POST /api/combine/from-split/:splitJobId');
   console.log('  POST /api/upload');
-  console.log('  POST /api/overlay');
   console.log('  POST /api/single-reaction/*');
   console.log('  POST /api/split-react/*        ← ⚡ SPLIT REACT (NEW!)');
   console.log('  GET  /api/combine/:jobId/download');
