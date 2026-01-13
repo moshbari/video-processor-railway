@@ -236,16 +236,37 @@ router.post('/from-url', upload.fields([
       }
     );
 
-    // Upload to R2 for persistent storage
-    console.log('Uploading to R2...');
+    // Upload ALL files to R2 for persistent storage
+    console.log('Uploading all files to R2...');
+    
+    // 1. Upload main/original video
+    const mainVideoR2Key = `split-react/${result.jobId}/original.mp4`;
+    await r2Service.uploadFile(mainVideoPath, mainVideoR2Key);
+    console.log(`✓ Uploaded original: ${mainVideoR2Key}`);
+    
+    // 2. Upload watch clip
+    const watchClipR2Key = `split-react/${result.jobId}/watch_clip.mp4`;
+    await r2Service.uploadFile(watchClipPath, watchClipR2Key);
+    console.log(`✓ Uploaded watch clip: ${watchClipR2Key}`);
+    
+    // 3. Upload react clip
+    const reactClipR2Key = `split-react/${result.jobId}/react_clip.mp4`;
+    await r2Service.uploadFile(reactClipPath, reactClipR2Key);
+    console.log(`✓ Uploaded react clip: ${reactClipR2Key}`);
+    
+    // 4. Upload final rendered video
     const r2Key = `split-react/${result.jobId}/final.mp4`;
     const r2Result = await r2Service.uploadFile(result.outputPath, r2Key);
-    console.log(`✓ Uploaded to R2: ${r2Key}`);
+    console.log(`✓ Uploaded final: ${r2Key}`);
 
-    // Generate download URL
-    const downloadUrl = r2Result.url || `https://pub-f59b46a864a6463ea4d6747002fd515d.r2.dev/${r2Key}`;
+    // Generate download URLs
+    const baseUrl = 'https://pub-f59b46a864a6463ea4d6747002fd515d.r2.dev';
+    const downloadUrl = r2Result.url || `${baseUrl}/${r2Key}`;
+    const originalVideoUrl = `${baseUrl}/${mainVideoR2Key}`;
+    const watchClipUrl = `${baseUrl}/${watchClipR2Key}`;
+    const reactClipUrl = `${baseUrl}/${reactClipR2Key}`;
 
-    // Save project metadata for Recent Projects
+    // Save project metadata for Recent Projects (with all file URLs)
     console.log('Saving project metadata...');
     const projectTitle = title || downloadResult.title || 'Split React Project';
     const savedProject = await projectMetadataService.addProject({
@@ -264,13 +285,27 @@ router.post('/from-url', upload.fields([
       totalDuration: result.totalDuration,
       fileSize: result.fileSize,
       fileSizeMB: result.fileSizeMB,
-      downloadUrl,
-      r2Key,
+      // All R2 keys for file retrieval
+      r2Keys: {
+        original: mainVideoR2Key,
+        watchClip: watchClipR2Key,
+        reactClip: reactClipR2Key,
+        final: r2Key
+      },
+      // All download URLs
+      urls: {
+        original: originalVideoUrl,
+        watchClip: watchClipUrl,
+        reactClip: reactClipUrl,
+        final: downloadUrl
+      },
+      downloadUrl,  // Keep for backwards compatibility
+      r2Key,        // Keep for backwards compatibility
       createdAt: new Date().toISOString()
     });
     console.log(`✓ Project saved: ${savedProject?.id || 'unknown'}`);
 
-    // Cleanup temp files
+    // Cleanup temp files (they're now in R2)
     await fs.remove(mainVideoPath).catch(() => {});
     await fs.remove(watchClipPath).catch(() => {});
     await fs.remove(reactClipPath).catch(() => {});
@@ -282,7 +317,14 @@ router.post('/from-url', upload.fields([
         projectId: savedProject?.id,
         projectTitle,
         downloadUrl,
-        r2Key
+        r2Key,
+        // Include all URLs in response
+        urls: {
+          original: originalVideoUrl,
+          watchClip: watchClipUrl,
+          reactClip: reactClipUrl,
+          final: downloadUrl
+        }
       }
     });
 
@@ -389,16 +431,37 @@ router.post('/from-upload', upload.fields([
       }
     );
 
-    // Upload to R2 for persistent storage
-    console.log('Uploading to R2...');
+    // Upload ALL files to R2 for persistent storage
+    console.log('Uploading all files to R2...');
+    
+    // 1. Upload main/original video
+    const mainVideoR2Key = `split-react/${result.jobId}/original.mp4`;
+    await r2Service.uploadFile(mainVideoPath, mainVideoR2Key);
+    console.log(`✓ Uploaded original: ${mainVideoR2Key}`);
+    
+    // 2. Upload watch clip
+    const watchClipR2Key = `split-react/${result.jobId}/watch_clip.mp4`;
+    await r2Service.uploadFile(watchClipPath, watchClipR2Key);
+    console.log(`✓ Uploaded watch clip: ${watchClipR2Key}`);
+    
+    // 3. Upload react clip
+    const reactClipR2Key = `split-react/${result.jobId}/react_clip.mp4`;
+    await r2Service.uploadFile(reactClipPath, reactClipR2Key);
+    console.log(`✓ Uploaded react clip: ${reactClipR2Key}`);
+    
+    // 4. Upload final rendered video
     const r2Key = `split-react/${result.jobId}/final.mp4`;
     const r2Result = await r2Service.uploadFile(result.outputPath, r2Key);
-    console.log(`✓ Uploaded to R2: ${r2Key}`);
+    console.log(`✓ Uploaded final: ${r2Key}`);
 
-    // Generate download URL
-    const downloadUrl = r2Result.url || `https://pub-f59b46a864a6463ea4d6747002fd515d.r2.dev/${r2Key}`;
+    // Generate download URLs
+    const baseUrl = 'https://pub-f59b46a864a6463ea4d6747002fd515d.r2.dev';
+    const downloadUrl = r2Result.url || `${baseUrl}/${r2Key}`;
+    const originalVideoUrl = `${baseUrl}/${mainVideoR2Key}`;
+    const watchClipUrl = `${baseUrl}/${watchClipR2Key}`;
+    const reactClipUrl = `${baseUrl}/${reactClipR2Key}`;
 
-    // Save project metadata for Recent Projects
+    // Save project metadata for Recent Projects (with all file URLs)
     console.log('Saving project metadata...');
     const projectTitle = title || mainVideoName.replace(/\.[^.]+$/, '') || 'Split React Project';
     const savedProject = await projectMetadataService.addProject({
@@ -416,13 +479,27 @@ router.post('/from-upload', upload.fields([
       totalDuration: result.totalDuration,
       fileSize: result.fileSize,
       fileSizeMB: result.fileSizeMB,
-      downloadUrl,
-      r2Key,
+      // All R2 keys for file retrieval
+      r2Keys: {
+        original: mainVideoR2Key,
+        watchClip: watchClipR2Key,
+        reactClip: reactClipR2Key,
+        final: r2Key
+      },
+      // All download URLs
+      urls: {
+        original: originalVideoUrl,
+        watchClip: watchClipUrl,
+        reactClip: reactClipUrl,
+        final: downloadUrl
+      },
+      downloadUrl,  // Keep for backwards compatibility
+      r2Key,        // Keep for backwards compatibility
       createdAt: new Date().toISOString()
     });
     console.log(`✓ Project saved: ${savedProject?.id || 'unknown'}`);
 
-    // Cleanup temp files
+    // Cleanup temp files (they're now in R2)
     await fs.remove(mainVideoPath).catch(() => {});
     await fs.remove(watchClipPath).catch(() => {});
     await fs.remove(reactClipPath).catch(() => {});
@@ -434,7 +511,14 @@ router.post('/from-upload', upload.fields([
         projectId: savedProject?.id,
         projectTitle,
         downloadUrl,
-        r2Key
+        r2Key,
+        // Include all URLs in response
+        urls: {
+          original: originalVideoUrl,
+          watchClip: watchClipUrl,
+          reactClip: reactClipUrl,
+          final: downloadUrl
+        }
       }
     });
 
@@ -545,16 +629,37 @@ router.post('/from-fetched', upload.fields([
       }
     );
 
-    // Upload to R2 for persistent storage
-    console.log('Uploading to R2...');
+    // Upload ALL files to R2 for persistent storage
+    console.log('Uploading all files to R2...');
+    
+    // 1. Upload main/original video
+    const mainVideoR2Key = `split-react/${result.jobId}/original.mp4`;
+    await r2Service.uploadFile(fetchedData.filePath, mainVideoR2Key);
+    console.log(`✓ Uploaded original: ${mainVideoR2Key}`);
+    
+    // 2. Upload watch clip
+    const watchClipR2Key = `split-react/${result.jobId}/watch_clip.mp4`;
+    await r2Service.uploadFile(watchClipPath, watchClipR2Key);
+    console.log(`✓ Uploaded watch clip: ${watchClipR2Key}`);
+    
+    // 3. Upload react clip
+    const reactClipR2Key = `split-react/${result.jobId}/react_clip.mp4`;
+    await r2Service.uploadFile(reactClipPath, reactClipR2Key);
+    console.log(`✓ Uploaded react clip: ${reactClipR2Key}`);
+    
+    // 4. Upload final rendered video
     const r2Key = `split-react/${result.jobId}/final.mp4`;
     const r2Result = await r2Service.uploadFile(result.outputPath, r2Key);
-    console.log(`✓ Uploaded to R2: ${r2Key}`);
+    console.log(`✓ Uploaded final: ${r2Key}`);
 
-    // Generate download URL
-    const downloadUrl = r2Result.url || `https://pub-f59b46a864a6463ea4d6747002fd515d.r2.dev/${r2Key}`;
+    // Generate download URLs
+    const baseUrl = 'https://pub-f59b46a864a6463ea4d6747002fd515d.r2.dev';
+    const downloadUrl = r2Result.url || `${baseUrl}/${r2Key}`;
+    const originalVideoUrl = `${baseUrl}/${mainVideoR2Key}`;
+    const watchClipUrl = `${baseUrl}/${watchClipR2Key}`;
+    const reactClipUrl = `${baseUrl}/${reactClipR2Key}`;
 
-    // Save project metadata for Recent Projects
+    // Save project metadata for Recent Projects (with all file URLs)
     console.log('Saving project metadata...');
     const projectTitle = title || fetchedData.title || 'Split React Project';
     const savedProject = await projectMetadataService.addProject({
@@ -573,17 +678,31 @@ router.post('/from-fetched', upload.fields([
       totalDuration: result.totalDuration,
       fileSize: result.fileSize,
       fileSizeMB: result.fileSizeMB,
-      downloadUrl,
-      r2Key,
+      // All R2 keys for file retrieval
+      r2Keys: {
+        original: mainVideoR2Key,
+        watchClip: watchClipR2Key,
+        reactClip: reactClipR2Key,
+        final: r2Key
+      },
+      // All download URLs
+      urls: {
+        original: originalVideoUrl,
+        watchClip: watchClipUrl,
+        reactClip: reactClipUrl,
+        final: downloadUrl
+      },
+      downloadUrl,  // Keep for backwards compatibility
+      r2Key,        // Keep for backwards compatibility
       createdAt: new Date().toISOString()
     });
     console.log(`✓ Project saved: ${savedProject?.id || 'unknown'}`);
 
-    // Cleanup fetched video from memory store (already used)
+    // Cleanup fetched video from memory store (already uploaded to R2)
     fetchedVideos.delete(fetchId);
     await fs.remove(fetchedData.filePath).catch(() => {});
     
-    // Cleanup uploaded clips
+    // Cleanup uploaded clips (already uploaded to R2)
     await fs.remove(watchClipPath).catch(() => {});
     await fs.remove(reactClipPath).catch(() => {});
 
@@ -594,7 +713,14 @@ router.post('/from-fetched', upload.fields([
         projectId: savedProject?.id,
         projectTitle,
         downloadUrl,
-        r2Key
+        r2Key,
+        // Include all URLs in response
+        urls: {
+          original: originalVideoUrl,
+          watchClip: watchClipUrl,
+          reactClip: reactClipUrl,
+          final: downloadUrl
+        }
       }
     });
 
