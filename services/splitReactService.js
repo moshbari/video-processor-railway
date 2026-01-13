@@ -478,7 +478,7 @@ class TwoClipReactionService {
 
   /**
    * Create freeze frame video with reaction clip overlay
-   * Uses simple approach: scale react clip and overlay freeze frame
+   * Uses 3-pass approach for perfect audio-video sync
    */
   async createFreezeWithReaction(framePath, reactClipPath, outputPath, options) {
     const { layoutMode, pipPosition, pipScale, targetWidth, targetHeight, duration } = options;
@@ -498,84 +498,127 @@ class TwoClipReactionService {
     if (layoutMode === 'faceCam') {
       // Face Cam: React clip full screen, freeze frame as PiP
       console.log(`  Creating Face Cam layout (React full screen, freeze as PiP)...`);
+      console.log(`  Using 3-pass method for perfect audio sync...`);
       
-      // Simple single-pass approach: 
-      // Scale react clip to full screen, overlay static image as PiP
-      // This keeps audio perfectly synced since we don't touch the audio stream
-      
-      const filterComplex = [
-        // Scale react clip to full screen
-        `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1[bg]`,
-        // Scale freeze frame image to PiP size
-        `[1:v]scale=${pipWidth}:-2[pip]`,
-        // Overlay PiP on background
-        `[bg][pip]overlay=${coords.x}:${coords.y}[outv]`
-      ].join(';');
-
-      const args = [
+      // PASS 1: Scale react clip to target dimensions, preserve audio exactly
+      const pass1Path = path.join(workDir, 'part2_pass1.mp4');
+      console.log(`  Pass 1: Scaling react clip...`);
+      const pass1Args = [
         '-y',
-        '-i', reactClipPath,        // Input 0: React clip (has audio)
-        '-i', framePath,            // Input 1: Freeze frame image
-        '-filter_complex', filterComplex,
-        '-map', '[outv]',
-        '-map', '0:a',              // Use audio from react clip
+        '-i', reactClipPath,
+        '-vf', `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1`,
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
-        '-c:a', 'aac',
-        '-b:a', '192k',
-        '-ar', '48000',             // Standard audio sample rate
+        '-c:a', 'copy',  // Copy audio exactly as-is
+        pass1Path
+      ];
+      await runFFmpegCommand(pass1Args);
+      
+      // PASS 2: Create freeze frame video (PiP size, same duration as react clip)
+      const pass2Path = path.join(workDir, 'part2_pass2.mp4');
+      console.log(`  Pass 2: Creating freeze frame video...`);
+      
+      // Get exact duration from pass 1 to match perfectly
+      const exactDuration = await this.getVideoDuration(pass1Path);
+      
+      const pass2Args = [
+        '-y',
+        '-loop', '1',
+        '-i', framePath,
+        '-t', exactDuration.toString(),
+        '-vf', `scale=${pipWidth}:-2`,
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-pix_fmt', 'yuv420p',
+        '-r', '30',
+        '-an',  // No audio
+        pass2Path
+      ];
+      await runFFmpegCommand(pass2Args);
+      
+      // PASS 3: Overlay pass2 on pass1, copy audio from pass1
+      console.log(`  Pass 3: Overlaying and preserving audio...`);
+      const pass3Args = [
+        '-y',
+        '-i', pass1Path,   // Background with audio
+        '-i', pass2Path,   // PiP overlay (no audio)
+        '-filter_complex', `[1:v]setsar=1[pip];[0:v][pip]overlay=${coords.x}:${coords.y}[outv]`,
+        '-map', '[outv]',
+        '-map', '0:a',     // Audio from pass1 (the scaled react clip)
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-c:a', 'copy',    // Copy audio exactly
         outputPath
       ];
+      await runFFmpegCommand(pass3Args);
       
-      await runFFmpegCommand(args);
+      // Cleanup intermediate files
+      await fs.remove(pass1Path).catch(() => {});
+      await fs.remove(pass2Path).catch(() => {});
       
     } else {
       // Watch & React: Freeze frame full screen, react clip as PiP
       console.log(`  Creating Watch & React layout (Freeze full screen, React as PiP)...`);
+      console.log(`  Using 3-pass method for perfect audio sync...`);
       
-      // Step 1: Create background video from freeze frame (no audio)
-      const bgVideoPath = path.join(workDir, 'freeze_bg.mp4');
-      const bgArgs = [
+      // PASS 1: Create freeze frame background video (no audio)
+      const pass1Path = path.join(workDir, 'part2_pass1.mp4');
+      console.log(`  Pass 1: Creating freeze frame background...`);
+      const pass1Args = [
         '-y',
         '-loop', '1',
         '-i', framePath,
-        '-c:v', 'libx264',
         '-t', duration.toString(),
-        '-pix_fmt', 'yuv420p',
-        '-r', '30',
-        '-s', `${targetWidth}x${targetHeight}`,
-        bgVideoPath
-      ];
-      await runFFmpegCommand(bgArgs);
-      console.log(`  ✓ Background video created`);
-
-      // Step 2: Overlay react clip as PiP, use react clip's audio
-      const filterComplex = [
-        `[1:v]scale=${pipWidth}:-2,setsar=1[pip]`,
-        `[0:v][pip]overlay=${coords.x}:${coords.y}[outv]`
-      ].join(';');
-
-      const overlayArgs = [
-        '-y',
-        '-i', bgVideoPath,          // Input 0: Background (no audio)
-        '-i', reactClipPath,        // Input 1: React clip (has audio)
-        '-filter_complex', filterComplex,
-        '-map', '[outv]',
-        '-map', '1:a',              // Use audio from react clip
+        '-vf', `scale=${targetWidth}:${targetHeight}`,
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
-        '-c:a', 'aac',
-        '-b:a', '192k',
-        '-ar', '48000',
+        '-pix_fmt', 'yuv420p',
+        '-r', '30',
+        '-an',
+        pass1Path
+      ];
+      await runFFmpegCommand(pass1Args);
+      
+      // PASS 2: Scale react clip to PiP size, preserve audio
+      const pass2Path = path.join(workDir, 'part2_pass2.mp4');
+      console.log(`  Pass 2: Scaling react clip to PiP size...`);
+      const pass2Args = [
+        '-y',
+        '-i', reactClipPath,
+        '-vf', `scale=${pipWidth}:-2,setsar=1`,
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-c:a', 'copy',
+        pass2Path
+      ];
+      await runFFmpegCommand(pass2Args);
+      
+      // PASS 3: Overlay pass2 on pass1, use audio from pass2
+      console.log(`  Pass 3: Overlaying and preserving audio...`);
+      const pass3Args = [
+        '-y',
+        '-i', pass1Path,   // Background (no audio)
+        '-i', pass2Path,   // PiP with audio
+        '-filter_complex', `[1:v][0:v]scale2ref[pip][bg];[bg][pip]overlay=${coords.x}:${coords.y}[outv]`,
+        '-map', '[outv]',
+        '-map', '1:a',     // Audio from pass2 (the react clip)
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-c:a', 'copy',
         '-shortest',
         outputPath
       ];
-      await runFFmpegCommand(overlayArgs);
-
-      // Cleanup background video
-      await fs.remove(bgVideoPath).catch(() => {});
+      await runFFmpegCommand(pass3Args);
+      
+      // Cleanup intermediate files
+      await fs.remove(pass1Path).catch(() => {});
+      await fs.remove(pass2Path).catch(() => {});
     }
 
     console.log(`  ✓ Part 2 created: ${outputPath}`);
