@@ -221,16 +221,25 @@ class TwoClipReactionService {
       console.log(`  Watch: ${watchDims.width}x${watchDims.height}`);
       console.log(`  React: ${reactDims.width}x${reactDims.height}`);
 
-      // Step 4: Calculate target dimensions and PiP size
-      // Use 1920x1080 as target or original dimensions, whichever is smaller
-      const targetWidth = Math.min(originalDims.width, 1920);
-      const targetHeight = Math.min(originalDims.height, 1080);
+      // Step 4: Calculate target dimensions
+      // Use 1080x1920 portrait (9:16) output for social media reaction videos
+      // This is the standard format for TikTok, Reels, Shorts, etc.
+      const targetWidth = 1080;
+      const targetHeight = 1920;
+      
+      console.log(`  Target Output: ${targetWidth}x${targetHeight} (portrait 9:16)`);
       
       // Calculate PiP dimensions (maintaining aspect ratio)
       const pipTargetWidth = Math.round(targetWidth * (pipScale / 100));
       
-      // Step 5: Create Part 1 - Original video with Watch Clip as PiP
-      console.log('\nStep 4: Creating Part 1 - Original with Watch Clip PiP overlay...');
+      // Step 5: Extract last frame from ORIGINAL video (not Part 1!)
+      // This ensures the freeze frame shows only the original content, not the PiP overlay
+      console.log('\nStep 4: Extracting last frame from ORIGINAL video for freeze background...');
+      const lastFramePath = path.join(workDir, 'last_frame.jpg');
+      await this.extractLastFrameRaw(originalVideoPath, lastFramePath);
+      
+      // Step 6: Create Part 1 - Original video with Watch Clip as PiP
+      console.log('\nStep 5: Creating Part 1 - Original with Watch Clip PiP overlay...');
       const part1Path = path.join(workDir, 'part1_watching.mp4');
       await this.createPipOverlay(
         originalVideoPath,
@@ -244,11 +253,6 @@ class TwoClipReactionService {
           targetHeight
         }
       );
-
-      // Step 6: Extract last frame of Part 1 for freeze frame background
-      console.log('\nStep 5: Extracting last frame for freeze background...');
-      const lastFramePath = path.join(workDir, 'last_frame.jpg');
-      await this.extractLastFrameRaw(part1Path, lastFramePath);
 
       // Step 7: Create Part 2 - Freeze frame with React Clip
       console.log('\nStep 6: Creating Part 2 - Freeze frame with React Clip...');
@@ -307,13 +311,21 @@ class TwoClipReactionService {
 
   /**
    * Create PiP overlay video (Original + Watch clip)
+   * Audio always comes from the ORIGINAL video, not the watch clip
    */
   async createPipOverlay(mainVideoPath, overlayVideoPath, outputPath, options) {
     const { layoutMode, pipPosition, pipScale, targetWidth, targetHeight } = options;
 
     // Determine which video is background and which is PiP based on layout mode
+    // In watchReact: Original is background (full screen), Watch is PiP
+    // In faceCam: Watch is background (full screen), Original is PiP
     const bgVideo = layoutMode === 'watchReact' ? mainVideoPath : overlayVideoPath;
     const pipVideo = layoutMode === 'watchReact' ? overlayVideoPath : mainVideoPath;
+    
+    // Audio mapping: Always use ORIGINAL video's audio (mainVideoPath)
+    // In watchReact mode: Original is input 0, so use 0:a
+    // In faceCam mode: Original is input 1, so use 1:a
+    const audioMap = layoutMode === 'watchReact' ? '0:a?' : '1:a?';
 
     // Calculate PiP dimensions
     const pipWidth = Math.round(targetWidth * (pipScale / 100));
@@ -324,6 +336,7 @@ class TwoClipReactionService {
 
     console.log(`  Background: ${layoutMode === 'watchReact' ? 'Original' : 'Watch Clip'}`);
     console.log(`  PiP: ${layoutMode === 'watchReact' ? 'Watch Clip' : 'Original'}`);
+    console.log(`  Audio Source: Original video (${audioMap})`);
     console.log(`  PiP Size: ${pipWidth}x${pipHeight} at (${coords.x}, ${coords.y})`);
 
     // FFmpeg command with complex filter
@@ -342,7 +355,7 @@ class TwoClipReactionService {
       '-i', pipVideo,
       '-filter_complex', filterComplex,
       '-map', '[outv]',
-      '-map', '0:a?',
+      '-map', audioMap,
       '-c:v', 'libx264',
       '-preset', 'fast',
       '-crf', '23',
@@ -367,7 +380,7 @@ class TwoClipReactionService {
    */
   async extractLastFrameRaw(videoPath, outputPath) {
     const duration = await this.getVideoDuration(videoPath);
-    console.log(`  Duration of part1_watching.mp4: ${duration}s`);
+    console.log(`  Video duration: ${duration}s`);
     
     // Try multiple approaches to extract last frame
     // Approach 1: Seek to near the end
