@@ -48,7 +48,6 @@ class CombineService {
         const videoDuration = videoStream ? parseValidDuration(videoStream.duration) || formatDuration : 0;
         const audioDuration = audioStream ? parseValidDuration(audioStream.duration) || formatDuration : 0;
         
-        // Use the maximum of all durations
         const duration = Math.max(formatDuration, videoDuration, audioDuration);
         
         resolve({
@@ -83,13 +82,10 @@ class CombineService {
 
   /**
    * Extract the last frame from a video as an image
-   * Uses exec with raw ffmpeg command for reliability
    */
   async extractLastFrame(videoPath, outputPath) {
     console.log(`Extracting last frame from: ${videoPath}`);
-    console.log(`Output path: ${outputPath}`);
     
-    // Verify input exists
     if (!await fs.pathExists(videoPath)) {
       throw new Error(`Input video does not exist: ${videoPath}`);
     }
@@ -101,7 +97,6 @@ class CombineService {
       throw new Error(`Invalid video duration: ${duration}`);
     }
     
-    // Calculate seek time - handle very short videos
     let seekTime;
     if (duration < 1) {
       seekTime = Math.max(0, duration * 0.5);
@@ -111,9 +106,7 @@ class CombineService {
     console.log(`Seeking to: ${seekTime}s`);
     
     return new Promise((resolve, reject) => {
-      // Use raw ffmpeg command via exec for reliability
       const cmd = `ffmpeg -y -ss ${seekTime} -i "${videoPath}" -frames:v 1 -q:v 2 "${outputPath}"`;
-      console.log(`Extract frame command: ${cmd}`);
       
       exec(cmd, async (error, stdout, stderr) => {
         if (error) {
@@ -122,7 +115,6 @@ class CombineService {
           return;
         }
         
-        // Verify the file was created
         if (await fs.pathExists(outputPath)) {
           const stats = await fs.stat(outputPath);
           if (stats.size > 0) {
@@ -132,7 +124,6 @@ class CombineService {
             reject(new Error(`Frame extracted but file is empty: ${outputPath}`));
           }
         } else {
-          // Try alternative method - extract from start if end fails
           console.log('Frame extraction from end failed, trying from start...');
           const altCmd = `ffmpeg -y -i "${videoPath}" -frames:v 1 -q:v 2 "${outputPath}"`;
           
@@ -145,7 +136,6 @@ class CombineService {
             if (await fs.pathExists(outputPath)) {
               const stats = await fs.stat(outputPath);
               if (stats.size > 0) {
-                console.log(`Frame extracted (from start): ${outputPath} (${stats.size} bytes)`);
                 resolve(outputPath);
               } else {
                 reject(new Error('Frame extraction produced empty file'));
@@ -161,15 +151,12 @@ class CombineService {
 
   /**
    * Create a video from a still image (for background)
-   * This is PASS 2 of the three-pass method
    */
   async createVideoFromImage(imagePath, outputPath, duration, targetWidth, targetHeight) {
     console.log(`Creating background video: ${duration}s at ${targetWidth}x${targetHeight}`);
     
     return new Promise((resolve, reject) => {
-      // Use raw ffmpeg command via exec for reliability
       const cmd = `ffmpeg -y -loop 1 -i "${imagePath}" -vf "scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1" -c:v libx264 -preset fast -crf 23 -t ${duration} -pix_fmt yuv420p -r 30 "${outputPath}"`;
-      console.log(`Background video command: ${cmd}`);
       
       exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, async (error, stdout, stderr) => {
         if (error) {
@@ -191,19 +178,15 @@ class CombineService {
 
   /**
    * Overlay PiP on background video
-   * This is PASS 3 of the three-pass method
    */
   async overlayPipOnBackground(backgroundPath, reactionPath, outputPath, pipWidth, pipHeight, pipX, pipY, hasAudio) {
     console.log(`Overlay PiP: ${pipWidth}x${pipHeight} at (${pipX}, ${pipY})`);
     
     return new Promise((resolve, reject) => {
       const filterComplex = `[1:v]scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,setsar=1[pip];[0:v][pip]overlay=${pipX}:${pipY}[outv]`;
-      
-      // Build audio mapping
       const audioArgs = hasAudio ? '-map 1:a -c:a aac -ar 44100 -ac 2 -b:a 128k' : '';
       
       const cmd = `ffmpeg -y -i "${backgroundPath}" -i "${reactionPath}" -filter_complex "${filterComplex}" -map "[outv]" ${audioArgs} -c:v libx264 -preset fast -crf 23 -movflags +faststart "${outputPath}"`;
-      console.log(`Overlay command: ${cmd}`);
       
       exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, async (error, stdout, stderr) => {
         if (error) {
@@ -228,25 +211,12 @@ class CombineService {
    */
   getPipCoordinates(position, targetWidth, targetHeight, pipWidth, pipHeight, padding = 20) {
     const positions = {
-      'top-right': { 
-        x: targetWidth - pipWidth - padding, 
-        y: padding 
-      },
-      'bottom-right': { 
-        x: targetWidth - pipWidth - padding, 
-        y: targetHeight - pipHeight - padding 
-      },
-      'bottom-left': { 
-        x: padding, 
-        y: targetHeight - pipHeight - padding 
-      },
-      'top-left': { 
-        x: padding, 
-        y: padding 
-      }
+      'top-right': { x: targetWidth - pipWidth - padding, y: padding },
+      'bottom-right': { x: targetWidth - pipWidth - padding, y: targetHeight - pipHeight - padding },
+      'bottom-left': { x: padding, y: targetHeight - pipHeight - padding },
+      'top-left': { x: padding, y: padding }
     };
     
-    // Handle random position
     let resolvedPosition = position;
     if (position === 'random') {
       const positionKeys = Object.keys(positions);
@@ -254,20 +224,16 @@ class CombineService {
       console.log(`Random position selected: ${resolvedPosition}`);
     }
     
-    // Default to top-right if invalid position
     if (!positions[resolvedPosition]) {
       console.warn(`Invalid position "${resolvedPosition}", defaulting to top-right`);
       resolvedPosition = 'top-right';
     }
     
-    return {
-      ...positions[resolvedPosition],
-      position: resolvedPosition
-    };
+    return { ...positions[resolvedPosition], position: resolvedPosition };
   }
 
   /**
-   * Create PiP segment using THREE-PASS method for reliable audio/video sync
+   * Create PiP segment using THREE-PASS method
    */
   async createPipSegment(originalClipPath, reactionPath, outputPath, targetWidth = 1080, targetHeight = 1920, pipPosition = 'top-right') {
     const workDir = path.dirname(outputPath);
@@ -277,11 +243,7 @@ class CombineService {
     
     try {
       console.log('\n=== THREE-PASS PiP Creation ===');
-      console.log(`Original: ${originalClipPath}`);
-      console.log(`Reaction: ${reactionPath}`);
-      console.log(`Requested position: ${pipPosition}`);
       
-      // Verify files exist
       if (!await fs.pathExists(originalClipPath)) {
         throw new Error(`Original clip not found: ${originalClipPath}`);
       }
@@ -289,82 +251,50 @@ class CombineService {
         throw new Error(`Reaction file not found: ${reactionPath}`);
       }
       
-      // Get reaction metadata FIRST to know the duration
       const reactionMeta = await this.getVideoMetadata(reactionPath);
-      console.log(`Reaction metadata:`);
-      console.log(`  - Video duration: ${reactionMeta.videoDuration}s`);
-      console.log(`  - Audio duration: ${reactionMeta.audioDuration}s`);
-      console.log(`  - Max duration (used): ${reactionMeta.duration}s`);
-      console.log(`  - Dimensions: ${reactionMeta.width}x${reactionMeta.height}`);
-      console.log(`  - Has audio: ${reactionMeta.hasAudio}`);
+      console.log(`Reaction duration: ${reactionMeta.duration}s`);
       
       if (!reactionMeta.hasVideo || reactionMeta.width <= 0 || reactionMeta.height <= 0) {
         throw new Error('Reaction has no valid video');
       }
       
-      // Use the MAX duration (ensures audio doesn't get cut)
       const totalDuration = reactionMeta.duration;
       if (totalDuration <= 0 || isNaN(totalDuration)) {
         throw new Error(`Invalid duration: ${totalDuration}`);
       }
       
-      // Calculate PiP dimensions (35% width, maintain aspect ratio)
       const pipWidth = Math.round(targetWidth * 0.35);
       const pipHeight = Math.round(pipWidth * (reactionMeta.height / reactionMeta.width));
       
-      // Get coordinates based on position
       const coords = this.getPipCoordinates(pipPosition, targetWidth, targetHeight, pipWidth, pipHeight);
-      const pipX = coords.x;
-      const pipY = coords.y;
       
-      console.log(`PiP: ${pipWidth}x${pipHeight} at ${coords.position} (${pipX}, ${pipY})`);
+      console.log(`PiP: ${pipWidth}x${pipHeight} at ${coords.position} (${coords.x}, ${coords.y})`);
       
-      // PASS 1: Extract last frame
-      console.log('\n--- Pass 1: Extract frame ---');
+      // PASS 1
+      console.log('--- Pass 1: Extract frame ---');
       await this.extractLastFrame(originalClipPath, lastFramePath);
       
-      if (!await fs.pathExists(lastFramePath)) {
-        throw new Error('Failed to extract last frame - file not created');
-      }
-      const frameStats = await fs.stat(lastFramePath);
-      console.log(`Pass 1 complete: Frame extracted (${frameStats.size} bytes)`);
-      
-      // PASS 2: Create background video from frame (EXACT duration to match audio)
-      console.log('\n--- Pass 2: Create background video ---');
+      // PASS 2
+      console.log('--- Pass 2: Create background video ---');
       await this.createVideoFromImage(lastFramePath, backgroundVideoPath, totalDuration, targetWidth, targetHeight);
       
-      if (!await fs.pathExists(backgroundVideoPath)) {
-        throw new Error('Failed to create background video - file not created');
-      }
-      console.log('Pass 2 complete: Background video created');
+      // PASS 3
+      console.log('--- Pass 3: Overlay PiP ---');
+      await this.overlayPipOnBackground(backgroundVideoPath, reactionPath, outputPath, pipWidth, pipHeight, coords.x, coords.y, reactionMeta.hasAudio);
       
-      // PASS 3: Overlay PiP on background
-      console.log('\n--- Pass 3: Overlay PiP ---');
-      await this.overlayPipOnBackground(
-        backgroundVideoPath, 
-        reactionPath, 
-        outputPath, 
-        pipWidth, 
-        pipHeight, 
-        pipX, 
-        pipY, 
-        reactionMeta.hasAudio
-      );
-      
-      // Cleanup temp files
+      // Cleanup
       await fs.remove(lastFramePath).catch(() => {});
       await fs.remove(backgroundVideoPath).catch(() => {});
       
       if (await fs.pathExists(outputPath)) {
         const stats = await fs.stat(outputPath);
-        console.log(`\n=== PiP Complete: ${(stats.size/1024/1024).toFixed(2)} MB ===\n`);
+        console.log(`=== PiP Complete: ${(stats.size/1024/1024).toFixed(2)} MB ===\n`);
         return outputPath;
       } else {
         throw new Error('PiP output file not created');
       }
       
     } catch (error) {
-      // Cleanup on error
       await fs.remove(lastFramePath).catch(() => {});
       await fs.remove(backgroundVideoPath).catch(() => {});
       console.error('createPipSegment error:', error);
@@ -373,9 +303,9 @@ class CombineService {
   }
 
   /**
-   * Normalize a clip to consistent format with progress tracking
+   * Normalize a clip to consistent format
    */
-  async normalizeClip(inputPath, outputPath, targetWidth = 1080, targetHeight = 1920, progressCallback = null) {
+  async normalizeClip(inputPath, outputPath, targetWidth = 1080, targetHeight = 1920) {
     return new Promise((resolve, reject) => {
       ffmpeg(inputPath)
         .outputOptions([
@@ -391,15 +321,9 @@ class CombineService {
           '-movflags', '+faststart',
           '-y'
         ])
-        .on('start', (cmd) => {
-          console.log('Normalizing with command:', cmd);
-        })
         .on('progress', (progress) => {
           if (progress.percent) {
             console.log(`  Normalizing: ${Math.round(progress.percent)}%`);
-            if (progressCallback) {
-              progressCallback(progress.percent);
-            }
           }
         })
         .on('end', () => {
@@ -416,12 +340,15 @@ class CombineService {
 
   /**
    * Combine original clips with reaction clips
+   * NOW ACCEPTS jobId from outside (for background rendering)
    */
   async combineClipsWithReactions(originalClips, reactionClips, outputFileName = null, options = {}) {
     const mode = options.mode || 'sequential';
     const pipPosition = options.pipPosition || 'top-right';
     const renderProgress = options.renderProgress || null;
-    const jobId = uuidv4();
+    
+    // Use provided jobId or generate new one
+    const jobId = options.jobId || uuidv4();
     const workDir = path.join(this.tempDir, jobId);
     
     await fs.ensureDir(workDir);
@@ -441,7 +368,6 @@ class CombineService {
     this.updateProgress(renderProgress, jobId, 'rendering', 0);
     
     try {
-      // Build array of reactions matching original clips
       const reactions = [];
       for (let i = 0; i < originalClips.length; i++) {
         reactions.push(reactionClips[i] || null);
@@ -451,10 +377,9 @@ class CombineService {
       const targetWidth = 1080;
       const targetHeight = 1920;
       
-      // Calculate total steps for progress
       const totalClips = originalClips.length;
       const totalReactions = reactions.filter(r => r).length;
-      const totalSteps = totalClips + totalReactions + 1; // +1 for final concat
+      const totalSteps = totalClips + totalReactions + 1;
       let completedSteps = 0;
       
       for (let i = 0; i < originalClips.length; i++) {
@@ -465,41 +390,28 @@ class CombineService {
         console.log(`Original: ${path.basename(originalPath)}`);
         console.log(`Reaction: ${reactionPath ? path.basename(reactionPath) : 'NONE'}`);
         
-        // Normalize the original clip
         const normalizedOriginalPath = path.join(workDir, `normalized_original_${i}.mp4`);
         console.log('Normalizing original clip...');
         await this.normalizeClip(originalPath, normalizedOriginalPath, targetWidth, targetHeight);
         processedClips.push(normalizedOriginalPath);
         
-        // Update progress after normalizing original
         completedSteps++;
-        const progressPercent = (completedSteps / totalSteps) * 90; // 90% for processing, 10% for concat
+        const progressPercent = (completedSteps / totalSteps) * 90;
         this.updateProgress(renderProgress, jobId, 'rendering', progressPercent);
         
-        // Process reaction based on mode
         if (reactionPath) {
           if (mode === 'pip') {
-            // PiP mode: frozen frame + reaction overlay (THREE-PASS method)
             const pipOutputPath = path.join(workDir, `pip_${i}.mp4`);
             console.log(`Creating PiP segment (position: ${pipPosition})...`);
-            await this.createPipSegment(
-              normalizedOriginalPath, 
-              reactionPath, 
-              pipOutputPath, 
-              targetWidth, 
-              targetHeight,
-              pipPosition
-            );
+            await this.createPipSegment(normalizedOriginalPath, reactionPath, pipOutputPath, targetWidth, targetHeight, pipPosition);
             processedClips.push(pipOutputPath);
           } else {
-            // Sequential mode: full-screen reaction
             const normalizedReactionPath = path.join(workDir, `normalized_reaction_${i}.mp4`);
             console.log('Normalizing reaction clip...');
             await this.normalizeClip(reactionPath, normalizedReactionPath, targetWidth, targetHeight);
             processedClips.push(normalizedReactionPath);
           }
           
-          // Update progress after processing reaction
           completedSteps++;
           const progressPercent = (completedSteps / totalSteps) * 90;
           this.updateProgress(renderProgress, jobId, 'rendering', progressPercent);
@@ -507,20 +419,12 @@ class CombineService {
       }
       
       console.log('\n--- Creating final video ---');
-      console.log('Clips to concatenate:');
-      processedClips.forEach((p, i) => {
-        console.log(`  ${i + 1}. ${path.basename(p)}`);
-      });
-
-      // Update progress - starting concatenation
       this.updateProgress(renderProgress, jobId, 'rendering', 92);
 
-      // Create concat file
       const concatPath = path.join(workDir, 'concat.txt');
       const concatContent = processedClips.map(p => `file '${p}'`).join('\n');
       await fs.writeFile(concatPath, concatContent);
 
-      // Concatenate
       const outputPath = path.join(workDir, 'final_combined.mp4');
       await this.concatenateClips(concatPath, outputPath);
 
@@ -531,7 +435,6 @@ class CombineService {
       const stats = await fs.stat(outputPath);
       console.log(`\n✓ FINAL VIDEO: ${(stats.size/1024/1024).toFixed(2)} MB`);
 
-      // Mark as complete
       this.updateProgress(renderProgress, jobId, 'complete', 100);
 
       return {
@@ -548,10 +451,7 @@ class CombineService {
 
     } catch (error) {
       console.error('Combine error:', error);
-      
-      // Mark as error
       this.updateProgress(renderProgress, jobId, 'error', 0, error.message);
-      
       await fs.remove(workDir).catch(() => {});
       throw error;
     }
