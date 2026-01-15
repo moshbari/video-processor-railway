@@ -206,10 +206,17 @@ async function renderInBackground(jobId, originalClipPaths, reactionClipPaths, m
       { mode, pipPosition, renderProgress, jobId }
     );
 
+    // Update progress to 95% - uploading to R2
+    renderProgress[jobId] = {
+      status: 'rendering',
+      progress: 95
+    };
+    console.log(`[Progress] Job ${jobId}: uploading to R2 - 95%`);
+
     // Upload to R2
     const { r2Link, fileName } = await uploadToR2(result, mode, firstReactionText);
 
-    // Store the result for when frontend polls
+    // Store the result FIRST (before marking complete!)
     renderResults[jobId] = {
       success: true,
       jobId,
@@ -225,7 +232,7 @@ async function renderInBackground(jobId, originalClipPaths, reactionClipPaths, m
       fileName
     };
 
-    // Update progress to complete
+    // NOW mark as complete (after results are stored!)
     renderProgress[jobId] = {
       status: 'complete',
       progress: 100
