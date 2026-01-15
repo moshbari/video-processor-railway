@@ -6,6 +6,14 @@ const fs = require('fs-extra');
 const combineService = require('../services/combineService');
 const r2Service = require('../services/r2Service');
 
+// ============================================
+// PROGRESS TRACKING - Store progress for each job
+// ============================================
+const renderProgress = {};
+
+// Export so combineService can update it
+module.exports.renderProgress = renderProgress;
+
 // Configure multer for file uploads
 const storage = multer.diskStorage({
   destination: async (req, file, cb) => {
@@ -152,6 +160,26 @@ function validatePipPosition(position) {
   return position;
 }
 
+// ============================================
+// NEW ENDPOINT: GET RENDER PROGRESS
+// ============================================
+/**
+ * GET /api/combine/progress/:jobId
+ * Returns current render progress for a job
+ */
+router.get('/progress/:jobId', (req, res) => {
+  const { jobId } = req.params;
+  
+  if (!renderProgress[jobId]) {
+    return res.json({
+      status: 'not_found',
+      progress: 0
+    });
+  }
+  
+  res.json(renderProgress[jobId]);
+});
+
 /**
  * POST /api/combine/from-split/:splitJobId
  * 
@@ -246,12 +274,12 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
     const reactionCount = reactionClipPaths.filter(p => p !== null).length;
     console.log(`Mapped ${reactionCount} reactions to clips`);
 
-    // Combine clips with reactions
+    // Combine clips with reactions (pass renderProgress for tracking)
     const result = await combineService.combineClipsWithReactions(
       originalClipPaths,
       reactionClipPaths,
       null,
-      { mode, pipPosition }
+      { mode, pipPosition, renderProgress }
     );
 
     // Upload to R2
@@ -330,7 +358,7 @@ router.post('/', upload.fields([
       originalClipPaths,
       reactionClipPaths,
       null,
-      { mode, pipPosition }
+      { mode, pipPosition, renderProgress }
     );
 
     // Upload to R2
