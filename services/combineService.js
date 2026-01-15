@@ -11,6 +11,20 @@ class CombineService {
   }
 
   /**
+   * Update render progress
+   */
+  updateProgress(renderProgress, jobId, status, progress, error = null) {
+    if (renderProgress && jobId) {
+      renderProgress[jobId] = {
+        status,
+        progress: Math.round(progress),
+        error
+      };
+      console.log(`[Progress] Job ${jobId}: ${status} - ${Math.round(progress)}%`);
+    }
+  }
+
+  /**
    * Get video metadata using ffprobe
    */
   async getVideoMetadata(videoPath) {
@@ -359,9 +373,9 @@ class CombineService {
   }
 
   /**
-   * Normalize a clip to consistent format
+   * Normalize a clip to consistent format with progress tracking
    */
-  async normalizeClip(inputPath, outputPath, targetWidth = 1080, targetHeight = 1920) {
+  async normalizeClip(inputPath, outputPath, targetWidth = 1080, targetHeight = 1920, progressCallback = null) {
     return new Promise((resolve, reject) => {
       ffmpeg(inputPath)
         .outputOptions([
@@ -383,6 +397,9 @@ class CombineService {
         .on('progress', (progress) => {
           if (progress.percent) {
             console.log(`  Normalizing: ${Math.round(progress.percent)}%`);
+            if (progressCallback) {
+              progressCallback(progress.percent);
+            }
           }
         })
         .on('end', () => {
@@ -403,6 +420,7 @@ class CombineService {
   async combineClipsWithReactions(originalClips, reactionClips, outputFileName = null, options = {}) {
     const mode = options.mode || 'sequential';
     const pipPosition = options.pipPosition || 'top-right';
+    const renderProgress = options.renderProgress || null;
     const jobId = uuidv4();
     const workDir = path.join(this.tempDir, jobId);
     
@@ -419,6 +437,9 @@ class CombineService {
     console.log(`Original clips: ${originalClips.length}`);
     console.log(`Reaction clips: ${reactionClips.length}`);
     
+    // Initialize progress
+    this.updateProgress(renderProgress, jobId, 'rendering', 0);
+    
     try {
       // Build array of reactions matching original clips
       const reactions = [];
@@ -429,6 +450,12 @@ class CombineService {
       const processedClips = [];
       const targetWidth = 1080;
       const targetHeight = 1920;
+      
+      // Calculate total steps for progress
+      const totalClips = originalClips.length;
+      const totalReactions = reactions.filter(r => r).length;
+      const totalSteps = totalClips + totalReactions + 1; // +1 for final concat
+      let completedSteps = 0;
       
       for (let i = 0; i < originalClips.length; i++) {
         const originalPath = originalClips[i];
@@ -443,6 +470,11 @@ class CombineService {
         console.log('Normalizing original clip...');
         await this.normalizeClip(originalPath, normalizedOriginalPath, targetWidth, targetHeight);
         processedClips.push(normalizedOriginalPath);
+        
+        // Update progress after normalizing original
+        completedSteps++;
+        const progressPercent = (completedSteps / totalSteps) * 90; // 90% for processing, 10% for concat
+        this.updateProgress(renderProgress, jobId, 'rendering', progressPercent);
         
         // Process reaction based on mode
         if (reactionPath) {
@@ -466,6 +498,11 @@ class CombineService {
             await this.normalizeClip(reactionPath, normalizedReactionPath, targetWidth, targetHeight);
             processedClips.push(normalizedReactionPath);
           }
+          
+          // Update progress after processing reaction
+          completedSteps++;
+          const progressPercent = (completedSteps / totalSteps) * 90;
+          this.updateProgress(renderProgress, jobId, 'rendering', progressPercent);
         }
       }
       
@@ -474,6 +511,9 @@ class CombineService {
       processedClips.forEach((p, i) => {
         console.log(`  ${i + 1}. ${path.basename(p)}`);
       });
+
+      // Update progress - starting concatenation
+      this.updateProgress(renderProgress, jobId, 'rendering', 92);
 
       // Create concat file
       const concatPath = path.join(workDir, 'concat.txt');
@@ -491,6 +531,9 @@ class CombineService {
       const stats = await fs.stat(outputPath);
       console.log(`\n✓ FINAL VIDEO: ${(stats.size/1024/1024).toFixed(2)} MB`);
 
+      // Mark as complete
+      this.updateProgress(renderProgress, jobId, 'complete', 100);
+
       return {
         jobId,
         mode,
@@ -505,6 +548,10 @@ class CombineService {
 
     } catch (error) {
       console.error('Combine error:', error);
+      
+      // Mark as error
+      this.updateProgress(renderProgress, jobId, 'error', 0, error.message);
+      
       await fs.remove(workDir).catch(() => {});
       throw error;
     }
