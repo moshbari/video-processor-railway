@@ -5,14 +5,17 @@ const path = require('path');
 const fs = require('fs-extra');
 const combineService = require('../services/combineService');
 const r2Service = require('../services/r2Service');
+const { v4: uuidv4 } = require('uuid');
 
 // ============================================
 // PROGRESS TRACKING - Store progress for each job
 // ============================================
 const renderProgress = {};
+const renderResults = {}; // Store completed results
 
 // Export so combineService can update it
 module.exports.renderProgress = renderProgress;
+module.exports.renderResults = renderResults;
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
@@ -44,7 +47,6 @@ const upload = multer({
 
 /**
  * Generate filename in format: MODE-XXX-MonYY-HHMMSSAM.mp4
- * Example: PIP-Wha-Dec25-083045PM.mp4
  */
 function generateFileName(mode, firstReactionText) {
   let prefix = 'Vid';
@@ -119,7 +121,6 @@ async function ensureSplitClipsAvailable(splitJobId) {
   const tempDir = process.env.TEMP_DIR || '/app/temp';
   const splitDir = path.join(tempDir, splitJobId, 'clips');
   
-  // Check if clips exist locally
   if (await fs.pathExists(splitDir)) {
     const files = await fs.readdir(splitDir);
     const clips = files.filter(f => f.startsWith('clip_') && f.endsWith('.mp4'));
@@ -129,7 +130,6 @@ async function ensureSplitClipsAvailable(splitJobId) {
     }
   }
   
-  // Clips not found locally - try to restore from R2
   console.log('Local clips not found, attempting to restore from R2...');
   
   if (!r2Service.isConfigured()) {
@@ -152,7 +152,7 @@ async function ensureSplitClipsAvailable(splitJobId) {
  */
 function validatePipPosition(position) {
   const validPositions = ['top-right', 'bottom-right', 'bottom-left', 'top-left', 'random'];
-  if (!position) return 'top-right'; // default
+  if (!position) return 'top-right';
   if (!validPositions.includes(position)) {
     console.warn(`Invalid pipPosition "${position}", defaulting to top-right`);
     return 'top-right';
@@ -161,7 +161,7 @@ function validatePipPosition(position) {
 }
 
 // ============================================
-// NEW ENDPOINT: GET RENDER PROGRESS
+// GET RENDER PROGRESS
 // ============================================
 /**
  * GET /api/combine/progress/:jobId
@@ -170,27 +170,98 @@ function validatePipPosition(position) {
 router.get('/progress/:jobId', (req, res) => {
   const { jobId } = req.params;
   
-  if (!renderProgress[jobId]) {
+  // Check if job is complete and has results
+  if (renderResults[jobId]) {
     return res.json({
-      status: 'not_found',
-      progress: 0
+      status: 'complete',
+      progress: 100,
+      ...renderResults[jobId]
     });
   }
   
-  res.json(renderProgress[jobId]);
+  // Check if job is in progress
+  if (renderProgress[jobId]) {
+    return res.json(renderProgress[jobId]);
+  }
+  
+  // Job not found
+  return res.json({
+    status: 'not_found',
+    progress: 0
+  });
 });
+
+/**
+ * Background render function - runs AFTER response is sent
+ */
+async function renderInBackground(jobId, originalClipPaths, reactionClipPaths, mode, pipPosition, firstReactionText) {
+  try {
+    console.log(`\n[Background] Starting render for job ${jobId}`);
+    
+    // Combine clips with reactions
+    const result = await combineService.combineClipsWithReactions(
+      originalClipPaths,
+      reactionClipPaths,
+      null,
+      { mode, pipPosition, renderProgress, jobId }
+    );
+
+    // Upload to R2
+    const { r2Link, fileName } = await uploadToR2(result, mode, firstReactionText);
+
+    // Store the result for when frontend polls
+    renderResults[jobId] = {
+      success: true,
+      jobId,
+      mode,
+      pipPosition: mode === 'pip' ? pipPosition : null,
+      outputPath: result.outputPath,
+      segmentCount: result.segmentCount,
+      originalCount: result.originalCount,
+      reactionCount: result.reactionCount,
+      fileSize: result.fileSize,
+      downloadUrl: result.downloadUrl,
+      r2Link,
+      fileName
+    };
+
+    // Update progress to complete
+    renderProgress[jobId] = {
+      status: 'complete',
+      progress: 100
+    };
+
+    console.log(`\n[Background] ✓ Render complete for job ${jobId}`);
+    if (r2Link) {
+      console.log(`[Background] R2 Link: ${r2Link}`);
+    }
+    
+  } catch (error) {
+    console.error(`[Background] Render error for job ${jobId}:`, error);
+    
+    // Store error
+    renderProgress[jobId] = {
+      status: 'error',
+      progress: 0,
+      error: error.message
+    };
+    
+    renderResults[jobId] = {
+      success: false,
+      error: error.message
+    };
+  }
+}
 
 /**
  * POST /api/combine/from-split/:splitJobId
  * 
- * Body parameters:
- * - reactionClips[]: Array of reaction video files
- * - mode: 'sequential' or 'pip' (default: 'sequential')
- * - pipPosition: 'top-right', 'bottom-right', 'bottom-left', 'top-left', 'random' (default: 'top-right')
- * - firstReactionText: Text for filename generation
- * - reactionIndices: JSON array of indices mapping reactions to clips
+ * RESPONDS IMMEDIATELY with jobId, renders in background
  */
 router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async (req, res) => {
+  // Generate jobId FIRST
+  const jobId = uuidv4();
+  
   try {
     const { splitJobId } = req.params;
     const mode = req.body.mode || 'sequential';
@@ -198,15 +269,14 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
     const firstReactionText = req.body.firstReactionText || '';
     
     console.log('\n' + '='.repeat(60));
-    console.log('COMBINE FROM SPLIT');
+    console.log('COMBINE FROM SPLIT (BACKGROUND MODE)');
     console.log('='.repeat(60));
+    console.log(`Job ID: ${jobId}`);
     console.log(`Split Job ID: ${splitJobId}`);
     console.log(`Mode: ${mode}`);
     if (mode === 'pip') {
       console.log(`PiP Position: ${pipPosition}`);
     }
-    console.log(`First reaction text: ${firstReactionText}`);
-    console.log(`R2 Storage: ${r2Service.isConfigured() ? 'ENABLED' : 'DISABLED'}`);
     
     if (!['sequential', 'pip'].includes(mode)) {
       return res.status(400).json({
@@ -215,10 +285,9 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
       });
     }
     
-    // Get original clips from split job directory (restore from R2 if needed)
+    // Get original clips (this part we do before responding)
     const splitDir = await ensureSplitClipsAvailable(splitJobId);
     
-    // Read and sort original clips
     const files = await fs.readdir(splitDir);
     const originalClipFiles = files
       .filter(f => f.startsWith('clip_') && f.endsWith('.mp4'))
@@ -238,11 +307,10 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
     const originalClipPaths = originalClipFiles.map(f => path.join(splitDir, f));
     console.log(`Found ${originalClipPaths.length} original clips`);
     
-    // Process reaction clips - map them to the correct original clips
+    // Process reaction clips
     const reactionClipPaths = new Array(originalClipPaths.length).fill(null);
     
     if (req.files && req.files.length > 0) {
-      // Check if reactionIndices was provided
       let indices = null;
       if (req.body.reactionIndices) {
         try {
@@ -253,7 +321,6 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
       }
       
       if (indices && Array.isArray(indices)) {
-        // Map reactions using provided indices
         req.files.forEach((file, i) => {
           const clipIndex = indices[i];
           if (typeof clipIndex === 'number' && clipIndex >= 0 && clipIndex < originalClipPaths.length) {
@@ -262,7 +329,6 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
           }
         });
       } else {
-        // Sequential mapping (reaction 0 -> clip 0, reaction 1 -> clip 1, etc.)
         req.files.forEach((file, i) => {
           if (i < originalClipPaths.length) {
             reactionClipPaths[i] = file.path;
@@ -274,38 +340,53 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
     const reactionCount = reactionClipPaths.filter(p => p !== null).length;
     console.log(`Mapped ${reactionCount} reactions to clips`);
 
-    // Combine clips with reactions (pass renderProgress for tracking)
-    const result = await combineService.combineClipsWithReactions(
-      originalClipPaths,
-      reactionClipPaths,
-      null,
-      { mode, pipPosition, renderProgress }
-    );
+    // Initialize progress BEFORE responding
+    renderProgress[jobId] = {
+      status: 'rendering',
+      progress: 0
+    };
 
-    // Upload to R2
-    const { r2Link, fileName } = await uploadToR2(result, mode, firstReactionText);
-
+    // ============================================
+    // RESPOND IMMEDIATELY - Don't wait for render!
+    // ============================================
+    console.log(`\n[Response] Sending jobId immediately: ${jobId}`);
+    
     res.json({
       success: true,
       data: {
-        ...result,
-        pipPosition: mode === 'pip' ? pipPosition : null,
-        r2Link,
-        fileName
+        jobId,
+        status: 'rendering',
+        message: 'Render started. Poll /api/combine/progress/{jobId} for updates.'
       }
+    });
+
+    // ============================================
+    // START BACKGROUND RENDER (after response sent)
+    // ============================================
+    setImmediate(() => {
+      renderInBackground(jobId, originalClipPaths, reactionClipPaths, mode, pipPosition, firstReactionText);
     });
 
   } catch (error) {
     console.error('Combine from split error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        error: error.message
+      });
+    } else {
+      renderProgress[jobId] = {
+        status: 'error',
+        progress: 0,
+        error: error.message
+      };
+    }
   }
 });
 
 /**
- * POST /api/combine - Combine with direct file uploads
+ * POST /api/combine - Combine with direct file uploads (sync mode)
  */
 router.post('/', upload.fields([
   { name: 'originalClips', maxCount: 20 },
@@ -352,8 +433,6 @@ router.post('/', upload.fields([
       });
     }
 
-    console.log(`Combining ${originalClipPaths.length} clips with ${reactionClipPaths.length} reactions (mode: ${mode}, pipPosition: ${pipPosition})`);
-
     const result = await combineService.combineClipsWithReactions(
       originalClipPaths,
       reactionClipPaths,
@@ -361,7 +440,6 @@ router.post('/', upload.fields([
       { mode, pipPosition, renderProgress }
     );
 
-    // Upload to R2
     const { r2Link, fileName } = await uploadToR2(result, mode, firstReactionText);
 
     res.json({
@@ -389,10 +467,28 @@ router.post('/', upload.fields([
 router.get('/:jobId/download', async (req, res) => {
   try {
     const { jobId } = req.params;
+    
+    // First check if we have the result stored
+    if (renderResults[jobId] && renderResults[jobId].outputPath) {
+      const outputPath = renderResults[jobId].outputPath;
+      
+      if (await fs.pathExists(outputPath)) {
+        const stats = await fs.stat(outputPath);
+        
+        res.setHeader('Content-Length', stats.size);
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Content-Disposition', `attachment; filename="reaction_video_${jobId}.mp4"`);
+
+        const readStream = fs.createReadStream(outputPath);
+        readStream.pipe(res);
+        return;
+      }
+    }
+    
+    // Fallback to old method
     const outputPath = combineService.getOutputPath(jobId);
 
     if (!await fs.pathExists(outputPath)) {
-      // Return a nice HTML error page
       return res.status(404).send(`
         <!DOCTYPE html>
         <html>
@@ -404,8 +500,7 @@ router.get('/:jobId/download', async (req, res) => {
             h1 { color: #e74c3c; margin-bottom: 10px; }
             p { color: #666; line-height: 1.6; }
             .icon { font-size: 64px; margin-bottom: 20px; }
-            a { display: inline-block; margin-top: 20px; padding: 12px 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; text-decoration: none; border-radius: 8px; font-weight: 600; transition: transform 0.2s; }
-            a:hover { transform: translateY(-2px); }
+            a { display: inline-block; margin-top: 20px; padding: 12px 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; text-decoration: none; border-radius: 8px; font-weight: 600; }
           </style>
         </head>
         <body>
@@ -413,7 +508,6 @@ router.get('/:jobId/download', async (req, res) => {
             <div class="icon">📁</div>
             <h1>File Not Found</h1>
             <p>This video has been automatically deleted after 24 hours, or the job ID is invalid.</p>
-            <p>Please go back to the video editor and create a new render.</p>
             <a href="https://rantsquad.99dfy.com/video-editor">← Back to Video Editor</a>
           </div>
         </body>
@@ -446,6 +540,9 @@ router.delete('/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
     await combineService.cleanup(jobId);
+    
+    delete renderProgress[jobId];
+    delete renderResults[jobId];
     
     res.json({
       success: true,
