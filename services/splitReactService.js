@@ -107,6 +107,8 @@ class TwoClipReactionService {
       '-crf', '23',
       '-c:a', 'aac',
       '-b:a', '128k',
+      // AUDIO NORMALIZATION ADDED - Makes trimmed video same volume
+      '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
       outputPath
     ];
     
@@ -368,6 +370,8 @@ class TwoClipReactionService {
       '-crf', '23',
       '-c:a', 'aac',
       '-b:a', '128k',
+      // AUDIO NORMALIZATION ADDED - Makes audio same volume
+      '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
       '-shortest',
       outputPath
     ];
@@ -519,6 +523,8 @@ class TwoClipReactionService {
         '-ar', '44100',
         '-ac', '2',
         '-b:a', '128k',
+        // AUDIO NORMALIZATION ADDED - Normalize react clip audio
+        '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
         '-async', '1',  // Force audio sync
         normalizedBgPath
       ];
@@ -635,6 +641,8 @@ class TwoClipReactionService {
         '-ar', '44100',
         '-ac', '2',
         '-b:a', '128k',
+        // AUDIO NORMALIZATION ADDED - Normalize react clip audio
+        '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
         '-async', '1',  // Force audio sync
         normalizedPipPath
       ];
@@ -704,6 +712,8 @@ class TwoClipReactionService {
       '-crf', '23',
       '-c:a', 'aac',
       '-b:a', '128k',
+      // AUDIO NORMALIZATION ADDED - Makes final concatenated audio same volume
+      '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
       outputPath
     ];
 
