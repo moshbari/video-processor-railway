@@ -390,10 +390,8 @@ class CombineService {
         console.log(`Original: ${path.basename(originalPath)}`);
         console.log(`Reaction: ${reactionPath ? path.basename(reactionPath) : 'NONE'}`);
         
-        const normalizedOriginalPath = path.join(workDir, `normalized_original_${i}.mp4`);
-        console.log('Normalizing original clip...');
-        await this.normalizeClip(originalPath, normalizedOriginalPath, targetWidth, targetHeight);
-        processedClips.push(normalizedOriginalPath);
+        // Use original clip directly without normalization
+        processedClips.push(originalPath);
         
         completedSteps++;
         const progressPercent = (completedSteps / totalSteps) * 90;
@@ -403,13 +401,11 @@ class CombineService {
           if (mode === 'pip') {
             const pipOutputPath = path.join(workDir, `pip_${i}.mp4`);
             console.log(`Creating PiP segment (position: ${pipPosition})...`);
-            await this.createPipSegment(normalizedOriginalPath, reactionPath, pipOutputPath, targetWidth, targetHeight, pipPosition);
+            await this.createPipSegment(originalPath, reactionPath, pipOutputPath, targetWidth, targetHeight, pipPosition);
             processedClips.push(pipOutputPath);
           } else {
-            const normalizedReactionPath = path.join(workDir, `normalized_reaction_${i}.mp4`);
-            console.log('Normalizing reaction clip...');
-            await this.normalizeClip(reactionPath, normalizedReactionPath, targetWidth, targetHeight);
-            processedClips.push(normalizedReactionPath);
+            // Use reaction clip directly without normalization
+            processedClips.push(reactionPath);
           }
           
           completedSteps++;
