@@ -287,6 +287,261 @@ function getVideoDuration(filePath) {
   });
 }
 
+/**
+ * Update progress for background rendering
+ */
+function updateProgress(renderProgress, jobId, status, progress) {
+  if (renderProgress && jobId) {
+    renderProgress[jobId] = { status, progress };
+    console.log(`[Progress] Job ${jobId}: ${status} - ${progress}%`);
+  }
+}
+
+/**
+ * Normalize a video clip to target dimensions
+ */
+async function normalizeClip(inputPath, outputPath, targetWidth, targetHeight) {
+  return new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .outputOptions([
+        '-vf', `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1`,
+        '-r', '30',
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-ar', '44100',
+        '-ac', '2',
+        '-b:a', '128k',
+        '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',  // Audio normalization
+        '-async', '1'
+      ])
+      .output(outputPath)
+      .on('end', resolve)
+      .on('error', reject)
+      .run();
+  });
+}
+
+/**
+ * Create PiP segment with frozen frame and reaction overlay
+ */
+async function createPipSegment(originalPath, reactionPath, outputPath, targetWidth, targetHeight, pipPosition) {
+  const workDir = path.dirname(outputPath);
+  
+  // Extract last frame from original
+  const lastFramePath = path.join(workDir, `freeze_${Date.now()}.jpg`);
+  await new Promise((resolve, reject) => {
+    ffmpeg(originalPath)
+      .outputOptions(['-vf', 'select=eq(n\\,0)', '-frames:v', '1'])
+      .output(lastFramePath)
+      .on('end', resolve)
+      .on('error', reject)
+      .run();
+  });
+
+  // Get reaction duration
+  const reactionDuration = await getVideoDuration(reactionPath);
+
+  // Create freeze frame video
+  const freezePath = path.join(workDir, `freeze_video_${Date.now()}.mp4`);
+  await new Promise((resolve, reject) => {
+    ffmpeg()
+      .input(lastFramePath)
+      .inputOptions(['-loop', '1'])
+      .outputOptions([
+        '-t', reactionDuration.toString(),
+        '-vf', `scale=${targetWidth}:${targetHeight},setsar=1`,
+        '-r', '30',
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-pix_fmt', 'yuv420p',
+        '-an'
+      ])
+      .output(freezePath)
+      .on('end', resolve)
+      .on('error', reject)
+      .run();
+  });
+
+  // Normalize reaction clip
+  const normalizedReactionPath = path.join(workDir, `reaction_normalized_${Date.now()}.mp4`);
+  await normalizeClip(reactionPath, normalizedReactionPath, targetWidth, targetHeight);
+
+  // Overlay reaction on freeze frame
+  const pipWidth = Math.floor(targetWidth * 0.25);
+  const pipCoords = await getPipCoordinates(targetWidth, targetHeight, pipPosition);
+
+  await new Promise((resolve, reject) => {
+    const filterComplex = `[1:v]scale=${pipWidth}:-2,setsar=1[pip];[0:v][pip]overlay=${pipCoords.x}:${pipCoords.y}:shortest=1[outv]`;
+    
+    ffmpeg()
+      .input(freezePath)
+      .input(normalizedReactionPath)
+      .complexFilter(filterComplex)
+      .outputOptions([
+        '-map', '[outv]',
+        '-map', '1:a',
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-c:a', 'copy',
+        '-shortest'
+      ])
+      .output(outputPath)
+      .on('end', resolve)
+      .on('error', reject)
+      .run();
+  });
+
+  // Cleanup temp files
+  await fs.unlink(lastFramePath).catch(() => {});
+  await fs.unlink(freezePath).catch(() => {});
+  await fs.unlink(normalizedReactionPath).catch(() => {});
+}
+
+/**
+ * Concatenate multiple video files
+ */
+async function concatenateVideos(videoPaths, outputPath) {
+  const workDir = path.dirname(outputPath);
+  const concatListPath = path.join(workDir, `concat_${Date.now()}.txt`);
+  
+  const concatContent = videoPaths.map(p => `file '${p}'`).join('\n');
+  await fs.writeFile(concatListPath, concatContent);
+
+  await new Promise((resolve, reject) => {
+    ffmpeg()
+      .input(concatListPath)
+      .inputOptions(['-f', 'concat', '-safe', '0'])
+      .outputOptions([
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11'  // Audio normalization
+      ])
+      .output(outputPath)
+      .on('end', resolve)
+      .on('error', reject)
+      .run();
+  });
+
+  await fs.unlink(concatListPath).catch(() => {});
+}
+
+/**
+ * Combine clips with reactions - main function used by routes
+ */
+async function combineClipsWithReactions(originalClips, reactionClips, outputFileName = null, options = {}) {
+  const { v4: uuidv4 } = require('uuid');
+  const mode = options.mode || 'sequential';
+  const pipPosition = options.pipPosition || 'top-right';
+  const renderProgress = options.renderProgress || null;
+  const jobId = options.jobId || uuidv4();
+  
+  const workDir = path.join(TEMP_DIR, jobId);
+  await fs.mkdir(workDir, { recursive: true });
+
+  console.log(`\n========================================`);
+  console.log(`COMBINE CLIPS WITH REACTIONS`);
+  console.log(`Job ID: ${jobId}`);
+  console.log(`Mode: ${mode}`);
+  console.log(`========================================\n`);
+
+  updateProgress(renderProgress, jobId, 'rendering', 0);
+
+  try {
+    const targetWidth = 1080;
+    const targetHeight = 1920;
+    const processedClips = [];
+    
+    const totalClips = originalClips.length;
+    const totalReactions = reactionClips.filter(r => r).length;
+    const totalSteps = totalClips + totalReactions + 1;
+    let completedSteps = 0;
+
+    for (let i = 0; i < originalClips.length; i++) {
+      const originalPath = originalClips[i];
+      const reactionPath = reactionClips[i];
+
+      // Normalize original clip
+      const normalizedOriginalPath = path.join(workDir, `normalized_original_${i}.mp4`);
+      await normalizeClip(originalPath, normalizedOriginalPath, targetWidth, targetHeight);
+      processedClips.push(normalizedOriginalPath);
+      
+      completedSteps++;
+      updateProgress(renderProgress, jobId, 'rendering', Math.floor((completedSteps / totalSteps) * 90));
+
+      // Process reaction if exists
+      if (reactionPath && fsSync.existsSync(reactionPath)) {
+        if (mode === 'pip') {
+          // Create PiP segment
+          const pipSegmentPath = path.join(workDir, `pip_segment_${i}.mp4`);
+          await createPipSegment(originalPath, reactionPath, pipSegmentPath, targetWidth, targetHeight, pipPosition);
+          processedClips.push(pipSegmentPath);
+        } else {
+          // Normalize reaction for sequential mode
+          const normalizedReactionPath = path.join(workDir, `normalized_reaction_${i}.mp4`);
+          await normalizeClip(reactionPath, normalizedReactionPath, targetWidth, targetHeight);
+          processedClips.push(normalizedReactionPath);
+        }
+        
+        completedSteps++;
+        updateProgress(renderProgress, jobId, 'rendering', Math.floor((completedSteps / totalSteps) * 90));
+      }
+    }
+
+    // Concatenate all clips
+    const finalOutputPath = path.join(workDir, outputFileName || 'combined_output.mp4');
+    await concatenateVideos(processedClips, finalOutputPath);
+    
+    updateProgress(renderProgress, jobId, 'rendering', 95);
+
+    const stats = await fs.stat(finalOutputPath);
+
+    return {
+      success: true,
+      jobId,
+      outputPath: finalOutputPath,
+      segmentCount: processedClips.length,
+      originalCount: totalClips,
+      reactionCount: totalReactions,
+      fileSize: stats.size,
+      fileSizeMB: (stats.size / 1024 / 1024).toFixed(2),
+      downloadUrl: `/api/combine/${jobId}/download`,
+      mode,
+      pipPosition: mode === 'pip' ? pipPosition : null
+    };
+
+  } catch (error) {
+    console.error('Combine clips error:', error);
+    updateProgress(renderProgress, jobId, 'error', 0);
+    throw error;
+  }
+}
+
+/**
+ * Get output path for a job
+ */
+function getOutputPath(jobId) {
+  return path.join(TEMP_DIR, jobId, 'combined_output.mp4');
+}
+
+/**
+ * Cleanup job files
+ */
+async function cleanup(jobId) {
+  const workDir = path.join(TEMP_DIR, jobId);
+  await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  console.log(`Cleaned up job: ${jobId}`);
+}
+
 module.exports = {
-  combineReactions
+  combineReactions,
+  combineClipsWithReactions,
+  getOutputPath,
+  cleanup
 };
