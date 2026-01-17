@@ -273,12 +273,11 @@ class TwoClipReactionService {
       bgScaled
     ]);
 
-    // Step 2: Scale PiP WITH audio and proper aspect ratio
+    // Step 2: Scale PiP WITH audio - maintain original aspect ratio
     const pipScaled = output.replace('.mp4', '_pip.mp4');
-    const pipHeight = Math.round(pipWidth * (height / width)); // Calculate proportional height
     await runFFmpeg([
       '-y', '-i', pipVideo,
-      '-vf', `scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,pad=${pipWidth}:${pipHeight}:(ow-iw)/2:(oh-ih)/2`,
+      '-vf', `scale=${pipWidth}:-2`, // -2 maintains aspect ratio
       '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
       '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
       pipScaled
@@ -310,12 +309,10 @@ class TwoClipReactionService {
   async createFreezeReact(reactVideo, freezeFrame, output, duration, width, height, pipWidth, coords, reactIsBg) {
     console.log(`Creating freeze + react (react is ${reactIsBg ? 'background' : 'PiP'})`);
 
-    const pipHeight = Math.round(pipWidth * (height / width)); // Calculate proportional height
-
     // Step 1: Create freeze frame video (no audio)
     const freezeVideo = output.replace('.mp4', '_freeze.mp4');
     const freezeScale = reactIsBg 
-      ? `scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,pad=${pipWidth}:${pipHeight}:(ow-iw)/2:(oh-ih)/2`
+      ? `scale=${pipWidth}:-2`  // PiP: maintain aspect ratio
       : `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`;
     
     await runFFmpeg([
@@ -334,7 +331,7 @@ class TwoClipReactionService {
     const reactScaled = output.replace('.mp4', '_react.mp4');
     const reactScale = reactIsBg 
       ? `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`
-      : `scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,pad=${pipWidth}:${pipHeight}:(ow-iw)/2:(oh-ih)/2`;
+      : `scale=${pipWidth}:-2`;  // PiP: maintain aspect ratio
     
     await runFFmpeg([
       '-y', '-i', reactVideo,
