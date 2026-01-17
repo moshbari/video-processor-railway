@@ -2,7 +2,7 @@ const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs').promises;
 const fsSync = require('fs');
-const { uploadToR2, getR2Url } = require('./r2');
+const r2Service = require('./r2Service');
 
 const TEMP_DIR = '/app/temp';
 
@@ -108,8 +108,8 @@ async function createSequentialVideo(jobId, clips, reactionDir) {
         try {
           const fileName = `SEQ_${jobId}_${new Date().toISOString()}.mp4`;
           const r2Key = `${jobId}/${fileName}`;
-          await uploadToR2(outputPath, r2Key);
-          const downloadUrl = getR2Url(r2Key);
+          const result = await r2Service.uploadFile(outputPath, r2Key);
+          const downloadUrl = result.downloadUrl || result.url;
           resolve({ downloadUrl, fileName });
         } catch (error) {
           reject(error);
@@ -242,8 +242,8 @@ async function createPipVideo(jobId, clips, reactionDir, pipPosition) {
         try {
           const fileName = `PIP_${jobId}_${new Date().toISOString()}.mp4`;
           const r2Key = `${jobId}/${fileName}`;
-          await uploadToR2(overlayOutputPath, r2Key);
-          const downloadUrl = getR2Url(r2Key);
+          const result = await r2Service.uploadFile(overlayOutputPath, r2Key);
+          const downloadUrl = result.downloadUrl || result.url;
           resolve({ downloadUrl, fileName });
         } catch (error) {
           reject(error);
