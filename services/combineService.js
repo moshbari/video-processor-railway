@@ -110,7 +110,12 @@ async function createSequentialVideo(jobId, clips, reactionDir) {
           const r2Key = `${jobId}/${fileName}`;
           const result = await r2Service.uploadFile(outputPath, r2Key);
           const downloadUrl = result.downloadUrl || result.url;
-          resolve({ downloadUrl, fileName });
+          resolve({ 
+            downloadUrl, 
+            fileName,
+            r2Link: downloadUrl,
+            mode: 'sequential'
+          });
         } catch (error) {
           reject(error);
         }
@@ -244,7 +249,12 @@ async function createPipVideo(jobId, clips, reactionDir, pipPosition) {
           const r2Key = `${jobId}/${fileName}`;
           const result = await r2Service.uploadFile(overlayOutputPath, r2Key);
           const downloadUrl = result.downloadUrl || result.url;
-          resolve({ downloadUrl, fileName });
+          resolve({ 
+            downloadUrl, 
+            fileName,
+            r2Link: downloadUrl,
+            mode: 'pip'
+          });
         } catch (error) {
           reject(error);
         }
