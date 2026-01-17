@@ -116,27 +116,29 @@ class TwoClipReactionService {
       
       if (layoutMode === 'faceCam') {
         // Face Cam: Watch is background, Original is PiP
+        // Audio should come from Original (PiP)
         await this.createSimplePiP(
-          finalWatchPath,  // Background
-          originalVideoPath,  // PiP
+          finalWatchPath,  // Background (Watch)
+          originalVideoPath,  // PiP (Original)
           part1Path,
           targetWidth,
           targetHeight,
           pipWidth,
           coords,
-          true  // Audio from PiP (original)
+          false  // Audio from PiP (Original)
         );
       } else {
         // Watch & React: Original is background, Watch is PiP
+        // Audio should come from Original (background)
         await this.createSimplePiP(
-          originalVideoPath,  // Background
-          finalWatchPath,  // PiP
+          originalVideoPath,  // Background (Original)
+          finalWatchPath,  // PiP (Watch)
           part1Path,
           targetWidth,
           targetHeight,
           pipWidth,
           coords,
-          true  // Audio from background (original)
+          true  // Audio from background (Original)
         );
       }
 
