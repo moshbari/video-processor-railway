@@ -90,13 +90,45 @@ class CombineService {
       throw new Error(`Input video does not exist: ${videoPath}`);
     }
     
-    const duration = await this.getVideoDuration(videoPath);
-    console.log(`Video duration: ${duration}s`);
-    
-    if (duration <= 0 || isNaN(duration)) {
-      throw new Error(`Invalid video duration: ${duration}`);
+    let duration = 0;
+    try {
+      duration = await this.getVideoDuration(videoPath);
+      console.log(`Video duration: ${duration}s`);
+    } catch (err) {
+      console.warn(`Could not get duration, trying alternative method: ${err.message}`);
     }
     
+    // If duration is invalid or zero, try to extract first frame as fallback
+    if (duration <= 0 || isNaN(duration)) {
+      console.log(`Invalid duration (${duration}s), extracting first frame as fallback`);
+      
+      return new Promise((resolve, reject) => {
+        // Extract first frame (no seeking)
+        const cmd = `ffmpeg -y -i "${videoPath}" -frames:v 1 -q:v 2 "${outputPath}"`;
+        
+        exec(cmd, async (error, stdout, stderr) => {
+          if (error) {
+            console.error('Frame extraction error:', stderr);
+            reject(new Error(`Frame extraction failed: ${error.message}`));
+            return;
+          }
+          
+          if (await fs.pathExists(outputPath)) {
+            const stats = await fs.stat(outputPath);
+            if (stats.size > 0) {
+              console.log(`Frame extracted (first frame fallback): ${outputPath} (${stats.size} bytes)`);
+              resolve(outputPath);
+            } else {
+              reject(new Error(`Frame extracted but file is empty`));
+            }
+          } else {
+            reject(new Error('Frame extraction completed but file not found'));
+          }
+        });
+      });
+    }
+    
+    // Normal case: extract last frame
     let seekTime;
     if (duration < 1) {
       seekTime = Math.max(0, duration * 0.5);
@@ -183,10 +215,11 @@ class CombineService {
     console.log(`Overlay PiP: ${pipWidth}x${pipHeight} at (${pipX}, ${pipY})`);
     
     return new Promise((resolve, reject) => {
-      const filterComplex = `[1:v]scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,setsar=1[pip];[0:v][pip]overlay=${pipX}:${pipY}[outv]`;
+      // Set consistent frame rate for both inputs
+      const filterComplex = `[1:v]scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,setsar=1,fps=30[pip];[0:v]fps=30[bg];[bg][pip]overlay=${pipX}:${pipY}[outv]`;
       const audioArgs = hasAudio ? '-map 1:a -c:a aac -ar 44100 -ac 2 -b:a 128k' : '';
       
-      const cmd = `ffmpeg -y -i "${backgroundPath}" -i "${reactionPath}" -filter_complex "${filterComplex}" -map "[outv]" ${audioArgs} -c:v libx264 -preset fast -crf 23 -movflags +faststart "${outputPath}"`;
+      const cmd = `ffmpeg -y -i "${backgroundPath}" -i "${reactionPath}" -filter_complex "${filterComplex}" -map "[outv]" ${audioArgs} -c:v libx264 -preset fast -crf 23 -r 30 -movflags +faststart "${outputPath}"`;
       
       exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, async (error, stdout, stderr) => {
         if (error) {
@@ -303,35 +336,33 @@ class CombineService {
   }
 
   /**
-   * Normalize a clip to consistent format
+   * Lightweight normalization - only standardize framerate and codec
    */
-  async normalizeClip(inputPath, outputPath, targetWidth = 1080, targetHeight = 1920) {
+  async standardizeClip(inputPath, outputPath) {
     return new Promise((resolve, reject) => {
       ffmpeg(inputPath)
         .outputOptions([
-          '-vf', `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
-          '-r', '30',
+          '-r', '30',  // Standardize to 30fps
           '-c:v', 'libx264',
-          '-preset', 'fast',
+          '-preset', 'ultrafast',  // Fast encoding
           '-crf', '23',
           '-c:a', 'aac',
           '-ar', '44100',
           '-ac', '2',
           '-b:a', '128k',
-          '-movflags', '+faststart',
           '-y'
         ])
         .on('progress', (progress) => {
           if (progress.percent) {
-            console.log(`  Normalizing: ${Math.round(progress.percent)}%`);
+            console.log(`  Standardizing: ${Math.round(progress.percent)}%`);
           }
         })
         .on('end', () => {
-          console.log('Clip normalized successfully');
+          console.log('Clip standardized');
           resolve(outputPath);
         })
         .on('error', (err) => {
-          console.error('Normalization error:', err);
+          console.error('Standardization error:', err);
           reject(err);
         })
         .save(outputPath);
@@ -390,7 +421,7 @@ class CombineService {
         console.log(`Original: ${path.basename(originalPath)}`);
         console.log(`Reaction: ${reactionPath ? path.basename(reactionPath) : 'NONE'}`);
         
-        // Use original clip directly without normalization
+        // Use original clip directly
         processedClips.push(originalPath);
         
         completedSteps++;
@@ -404,8 +435,11 @@ class CombineService {
             await this.createPipSegment(originalPath, reactionPath, pipOutputPath, targetWidth, targetHeight, pipPosition);
             processedClips.push(pipOutputPath);
           } else {
-            // Use reaction clip directly without normalization
-            processedClips.push(reactionPath);
+            // Sequential mode: standardize reaction clip frame rate
+            const standardizedReactionPath = path.join(workDir, `standardized_reaction_${i}.mp4`);
+            console.log('Standardizing reaction clip frame rate...');
+            await this.standardizeClip(reactionPath, standardizedReactionPath);
+            processedClips.push(standardizedReactionPath);
           }
           
           completedSteps++;
@@ -459,12 +493,14 @@ class CombineService {
         .input(concatFilePath)
         .inputOptions(['-f', 'concat', '-safe', '0'])
         .outputOptions([
+          '-vf', 'fps=30',  // Force consistent frame rate
           '-c:v', 'libx264',
           '-preset', 'fast',
           '-crf', '23',
           '-c:a', 'aac',
           '-b:a', '128k',
           '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',  // AUDIO NORMALIZATION
+          '-r', '30',  // Output frame rate
           '-movflags', '+faststart',
           '-y'
         ])
