@@ -462,7 +462,16 @@ class CombineService {
       ffmpeg()
         .input(concatFilePath)
         .inputOptions(['-f', 'concat', '-safe', '0'])
-        .outputOptions(['-c', 'copy', '-movflags', '+faststart', '-y'])
+        .outputOptions([
+          '-c:v', 'libx264',
+          '-preset', 'fast',
+          '-crf', '23',
+          '-c:a', 'aac',
+          '-b:a', '128k',
+          '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',  // AUDIO NORMALIZATION
+          '-movflags', '+faststart',
+          '-y'
+        ])
         .on('start', cmd => console.log('Concat:', cmd))
         .on('progress', p => {
           if (p.percent) console.log(`  Concat: ${Math.round(p.percent)}%`);
