@@ -301,6 +301,18 @@ function updateProgress(renderProgress, jobId, status, progress) {
  * Normalize a video clip to target dimensions
  */
 async function normalizeClip(inputPath, outputPath, targetWidth, targetHeight) {
+  console.log(`[Normalize] Input: ${inputPath}`);
+  console.log(`[Normalize] Output: ${outputPath}`);
+  
+  // Check if input file exists
+  if (!fsSync.existsSync(inputPath)) {
+    throw new Error(`Input file does not exist: ${inputPath}`);
+  }
+  
+  // Get file stats
+  const stats = fsSync.statSync(inputPath);
+  console.log(`[Normalize] Input file size: ${stats.size} bytes`);
+  
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
       .outputOptions([
@@ -318,8 +330,17 @@ async function normalizeClip(inputPath, outputPath, targetWidth, targetHeight) {
         '-async', '1'
       ])
       .output(outputPath)
-      .on('end', resolve)
-      .on('error', reject)
+      .on('start', (commandLine) => {
+        console.log(`[Normalize] FFmpeg command: ${commandLine}`);
+      })
+      .on('end', () => {
+        console.log(`[Normalize] Success: ${outputPath}`);
+        resolve();
+      })
+      .on('error', (error) => {
+        console.error(`[Normalize] Error: ${error.message}`);
+        reject(error);
+      })
       .run();
   });
 }
