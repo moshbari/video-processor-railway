@@ -273,11 +273,12 @@ class TwoClipReactionService {
       bgScaled
     ]);
 
-    // Step 2: Scale PiP WITH audio
+    // Step 2: Scale PiP WITH audio and proper aspect ratio
     const pipScaled = output.replace('.mp4', '_pip.mp4');
+    const pipHeight = Math.round(pipWidth * (height / width)); // Calculate proportional height
     await runFFmpeg([
       '-y', '-i', pipVideo,
-      '-vf', `scale=${pipWidth}:-1`,
+      '-vf', `scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,pad=${pipWidth}:${pipHeight}:(ow-iw)/2:(oh-ih)/2`,
       '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
       '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
       pipScaled
@@ -309,14 +310,20 @@ class TwoClipReactionService {
   async createFreezeReact(reactVideo, freezeFrame, output, duration, width, height, pipWidth, coords, reactIsBg) {
     console.log(`Creating freeze + react (react is ${reactIsBg ? 'background' : 'PiP'})`);
 
+    const pipHeight = Math.round(pipWidth * (height / width)); // Calculate proportional height
+
     // Step 1: Create freeze frame video (no audio)
     const freezeVideo = output.replace('.mp4', '_freeze.mp4');
+    const freezeScale = reactIsBg 
+      ? `scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,pad=${pipWidth}:${pipHeight}:(ow-iw)/2:(oh-ih)/2`
+      : `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`;
+    
     await runFFmpeg([
       '-y',
       '-loop', '1',
       '-i', freezeFrame,
       '-t', duration.toString(),
-      '-vf', reactIsBg ? `scale=${pipWidth}:-1` : `scale=${width}:${height}`,
+      '-vf', freezeScale,
       '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
       '-r', '30',
       '-an',  // No audio
@@ -325,9 +332,13 @@ class TwoClipReactionService {
 
     // Step 2: Scale reaction video WITH audio
     const reactScaled = output.replace('.mp4', '_react.mp4');
+    const reactScale = reactIsBg 
+      ? `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`
+      : `scale=${pipWidth}:${pipHeight}:force_original_aspect_ratio=decrease,pad=${pipWidth}:${pipHeight}:(ow-iw)/2:(oh-ih)/2`;
+    
     await runFFmpeg([
       '-y', '-i', reactVideo,
-      '-vf', reactIsBg ? `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2` : `scale=${pipWidth}:-1`,
+      '-vf', reactScale,
       '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
       '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
       reactScaled
