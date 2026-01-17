@@ -707,7 +707,13 @@ class TwoClipReactionService {
       '-f', 'concat',
       '-safe', '0',
       '-i', concatListPath,
-      '-c', 'copy',  // Just copy streams (no re-encoding needed)
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-crf', '23',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      // AUDIO NORMALIZATION - Makes final concatenated audio same volume
+      '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
       outputPath
     ];
 
