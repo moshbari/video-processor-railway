@@ -107,7 +107,7 @@ class TwoClipReactionService {
       '-crf', '23',
       '-c:a', 'aac',
       '-b:a', '128k',
-      // AUDIO NORMALIZATION ADDED - Makes trimmed video same volume
+      // AUDIO NORMALIZATION - Makes trimmed video same volume
       '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
       outputPath
     ];
@@ -324,10 +324,10 @@ class TwoClipReactionService {
     const bgVideo = layoutMode === 'watchReact' ? mainVideoPath : overlayVideoPath;
     const pipVideo = layoutMode === 'watchReact' ? overlayVideoPath : mainVideoPath;
     
-    // Audio mapping: Always use ORIGINAL video's audio (mainVideoPath)
+    // Audio input: Always use ORIGINAL video's audio (mainVideoPath)
     // In watchReact mode: Original is input 0, so use 0:a
     // In faceCam mode: Original is input 1, so use 1:a
-    const audioMap = layoutMode === 'watchReact' ? '0:a?' : '1:a?';
+    const audioInput = layoutMode === 'watchReact' ? '0:a' : '1:a';
 
     // Calculate PiP dimensions
     // For portrait output (1080x1920), pipScale represents % of WIDTH
@@ -343,7 +343,7 @@ class TwoClipReactionService {
 
     console.log(`  Background: ${layoutMode === 'watchReact' ? 'Original' : 'Watch Clip'}`);
     console.log(`  PiP: ${layoutMode === 'watchReact' ? 'Watch Clip' : 'Original'}`);
-    console.log(`  Audio Source: Original video (${audioMap})`);
+    console.log(`  Audio Source: Original video (${audioInput})`);
     console.log(`  PiP Width: ${pipWidth}px (${pipScale}% of ${targetWidth})`);
     console.log(`  PiP Position: (${coords.x}, ${coords.y})`);
 
@@ -355,7 +355,9 @@ class TwoClipReactionService {
       // Scale PiP video - width is set, height auto-calculated to maintain aspect ratio
       `[1:v]scale=${pipWidth}:-2,setsar=1[pip]`,
       // Overlay PiP on background
-      `[bg][pip]overlay=${coords.x}:${coords.y}:shortest=1[outv]`
+      `[bg][pip]overlay=${coords.x}:${coords.y}:shortest=1[outv]`,
+      // AUDIO: Normalize the audio from the original video
+      `[${audioInput}]loudnorm=I=-16:TP=-1.5:LRA=11[outa]`
     ].join(';');
 
     const args = [
@@ -364,14 +366,12 @@ class TwoClipReactionService {
       '-i', pipVideo,
       '-filter_complex', filterComplex,
       '-map', '[outv]',
-      '-map', audioMap,
+      '-map', '[outa]',  // Map the normalized audio
       '-c:v', 'libx264',
       '-preset', 'fast',
       '-crf', '23',
       '-c:a', 'aac',
       '-b:a', '128k',
-      // AUDIO NORMALIZATION ADDED - Makes audio same volume
-      '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
       '-shortest',
       outputPath
     ];
@@ -523,7 +523,7 @@ class TwoClipReactionService {
         '-ar', '44100',
         '-ac', '2',
         '-b:a', '128k',
-        // AUDIO NORMALIZATION ADDED - Normalize react clip audio
+        // AUDIO NORMALIZATION - Normalize react clip audio
         '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
         '-async', '1',  // Force audio sync
         normalizedBgPath
@@ -641,7 +641,7 @@ class TwoClipReactionService {
         '-ar', '44100',
         '-ac', '2',
         '-b:a', '128k',
-        // AUDIO NORMALIZATION ADDED - Normalize react clip audio
+        // AUDIO NORMALIZATION - Normalize react clip audio
         '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
         '-async', '1',  // Force audio sync
         normalizedPipPath
@@ -707,13 +707,7 @@ class TwoClipReactionService {
       '-f', 'concat',
       '-safe', '0',
       '-i', concatListPath,
-      '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '23',
-      '-c:a', 'aac',
-      '-b:a', '128k',
-      // AUDIO NORMALIZATION ADDED - Makes final concatenated audio same volume
-      '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
+      '-c', 'copy',  // Just copy streams (no re-encoding needed)
       outputPath
     ];
 
