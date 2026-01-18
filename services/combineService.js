@@ -156,16 +156,14 @@ async function overlayPip(bgPath, pipPath, outputPath, coords, targetWidth, targ
 }
 
 async function createPipSegment(originalPath, reactionPath, outputPath, targetWidth, targetHeight, pipPosition) {
-  console.log('\n=== PiP Creation (Original=Background, Reaction=Overlay+Audio) ===');
+  console.log('\n=== PiP Creation (Frozen Frame + Reaction Overlay) ===');
   const workDir = path.dirname(outputPath);
 
-  const originalDuration = await getVideoDuration(originalPath);
   const reactionDuration = await getVideoDuration(reactionPath);
-  console.log(`Original duration: ${originalDuration}s`);
   console.log(`Reaction duration: ${reactionDuration}s`);
 
-  if (!originalDuration || originalDuration <= 0) {
-    console.log('WARNING: Invalid original duration, copying reaction as fallback...');
+  if (!reactionDuration || reactionDuration <= 0) {
+    console.log('WARNING: Invalid reaction duration, copying reaction as fallback...');
     await fs.copy(reactionPath, outputPath);
     return outputPath;
   }
@@ -178,35 +176,61 @@ async function createPipSegment(originalPath, reactionPath, outputPath, targetWi
   const pipWidth = Math.floor(targetWidth * 0.25);
   const pipHeight = Math.floor(targetHeight * 0.25);
 
-  // PiP overlay: Original as background, Reaction as small overlay
-  // IMPORTANT: Use REACTION audio (1:a) so viewers hear you reacting!
-  // Limit to original duration with -t
+  // Step 1: Extract last frame from original video
+  const lastFramePath = path.join(workDir, `last_frame_${Date.now()}.jpg`);
+  console.log('  Extracting last frame from original...');
+  
+  await new Promise((resolve, reject) => {
+    const cmd = `ffmpeg -y -sseof -0.5 -i "${originalPath}" -vframes 1 -q:v 2 "${lastFramePath}"`;
+    exec(cmd, (error, stdout, stderr) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+  console.log('  ✓ Last frame extracted');
+
+  // Step 2: Create frozen background video from last frame (duration = reaction duration)
+  // with REACTION audio
+  const frozenBgPath = path.join(workDir, `frozen_bg_${Date.now()}.mp4`);
+  console.log(`  Creating frozen background (${reactionDuration}s)...`);
+  
+  await new Promise((resolve, reject) => {
+    const cmd = `ffmpeg -y -loop 1 -i "${lastFramePath}" -i "${reactionPath}" -t ${reactionDuration} -vf "scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,fps=30" -map 0:v -map 1:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -shortest "${frozenBgPath}"`;
+    exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+  console.log('  ✓ Frozen background created');
+
+  // Step 3: Overlay reaction video (scaled to PiP size) on frozen background
+  console.log('  Overlaying reaction PiP on frozen background...');
+  
   const filterComplex = [
-    // Scale original to target size
-    `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,fps=30[bg]`,
-    // Scale reaction to PiP size
     `[1:v]scale=${pipWidth}:${pipHeight}[pip]`,
-    // Overlay reaction on original
-    `[bg][pip]overlay=${coords.x}:${coords.y}[outv]`
+    `[0:v][pip]overlay=${coords.x}:${coords.y}[outv]`
   ].join(';');
 
-  // Use 1:a (reaction audio) instead of 0:a (original audio)
-  // This way viewers hear YOUR reactions!
-  const cmd = `ffmpeg -y -i "${originalPath}" -i "${reactionPath}" -filter_complex "${filterComplex}" -map "[outv]" -map 1:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -t ${originalDuration} "${outputPath}"`;
+  // Use audio from frozen background (which has reaction audio)
+  const cmd = `ffmpeg -y -i "${frozenBgPath}" -i "${reactionPath}" -filter_complex "${filterComplex}" -map "[outv]" -map 0:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
 
-  console.log(`Running PiP overlay with REACTION audio...`);
-  
-  return new Promise((resolve, reject) => {
+  await new Promise((resolve, reject) => {
     exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
       if (error) {
         console.error('PiP overlay error:', stderr ? stderr.substring(stderr.length - 500) : error.message);
         reject(error);
       } else {
-        console.log('  ✓ PiP overlay complete (with reaction audio)');
-        resolve(outputPath);
+        resolve();
       }
     });
   });
+
+  // Cleanup temp files
+  await fs.remove(lastFramePath).catch(() => {});
+  await fs.remove(frozenBgPath).catch(() => {});
+
+  console.log('  ✓ PiP segment complete (frozen frame + reaction overlay)');
+  return outputPath;
 }
 
 // ============================================
@@ -346,13 +370,19 @@ async function combineClipsWithReactions(originalClipPaths, reactionClipPaths, w
 
       if (reactionPath) {
         if (mode === 'pip') {
-          // PiP mode: Original is background, Reaction is small overlay
-          // The PiP segment already contains the original, so we ONLY add the PiP
+          // PiP MODE: "Watch Then React" format
+          // 1. Original plays first (full screen, original audio)
+          // 2. THEN frozen last frame + reaction PiP (reaction audio)
+          
+          // Add original clip first
+          processedClips.push(originalPath);
+          
+          // Then create and add the PiP segment (frozen frame + reaction overlay)
           const pipOutputPath = path.join(workDir, `pip_${i}.mp4`);
           await createPipSegment(originalPath, reactionPath, pipOutputPath, targetWidth, targetHeight, pipPosition);
           processedClips.push(pipOutputPath);
         } else {
-          // SEQUENTIAL MODE: Original plays first, then reaction
+          // SEQUENTIAL MODE: Original plays first, then reaction full screen
           // Add original clip first
           processedClips.push(originalPath);
           // Then add standardized reaction clip
