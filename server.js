@@ -1,7 +1,7 @@
 /**
  * ⚡ RANT SQUAD VIDEO PROCESSOR API ⚡
  * 
- * Complete server.js with all routes including Split React
+ * Complete server.js with all routes including Audio-Only RANT
  */
 
 const express = require('express');
@@ -18,8 +18,10 @@ const splitRoutes = require('./routes/split');
 const combineRoutes = require('./routes/combine');
 const adminRoutes = require('./routes/admin');
 const uploadRoutes = require('./routes/upload');
+const overlayRoutes = require('./routes/overlay');
 const singleReactionRoutes = require('./routes/singleReaction');
-const splitReactRoutes = require('./routes/splitReact');  // ⚡ SPLIT REACT (NEW!)
+const splitReactRoutes = require('./routes/splitReact');
+const audioReactionRoutes = require('./routes/audioReaction');  // 🎙️ AUDIO-ONLY RANT (NEW!)
 
 // Import services
 const cleanupService = require('./services/cleanupService');
@@ -61,8 +63,10 @@ app.get('/health', (req, res) => {
       combine: 'active',
       cleanup: 'active',
       upload: 'active',
-      'single-reaction': 'active',
-      'split-react': 'active'  // ⚡ SPLIT REACT (NEW!)
+      overlay: 'active',
+      singleReaction: 'active',
+      splitReact: 'active',
+      audioReaction: 'active'  // 🎙️ NEW!
     }
   });
 });
@@ -76,8 +80,10 @@ app.use('/api/split', splitRoutes);
 app.use('/api/combine', combineRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/upload', uploadRoutes);
+app.use('/api/overlay', overlayRoutes);
 app.use('/api/single-reaction', singleReactionRoutes);
-app.use('/api/split-react', splitReactRoutes);  // ⚡ SPLIT REACT (NEW!)
+app.use('/api/split-react', splitReactRoutes);
+app.use('/api/audio-reaction', audioReactionRoutes);  // 🎙️ AUDIO-ONLY RANT (NEW!)
 
 // Error handling for multer
 app.use((err, req, res, next) => {
@@ -93,41 +99,42 @@ app.use((err, req, res, next) => {
       error: 'Too many files. Maximum is 20 files.'
     });
   }
-  if (err.message && err.message.includes('Invalid file type')) {
+  if (err.message) {
     return res.status(400).json({
       success: false,
       error: err.message
     });
   }
-  console.error('Error:', err);
-  res.status(500).json({ 
-    success: false, 
-    error: err.message 
+  next(err);
+});
+
+// General error handling
+app.use((err, req, res, next) => {
+  console.error('Server error:', err);
+  res.status(500).json({
+    success: false,
+    error: 'Internal server error'
   });
 });
 
 // Start server
 app.listen(PORT, () => {
-  console.log('');
-  console.log('⚡ RANT SQUAD VIDEO PROCESSOR API ⚡');
-  console.log(`Listening on port ${PORT}`);
-  console.log('');
-  console.log('Available endpoints:');
-  console.log('  POST /api/download');
-  console.log('  POST /api/transcribe');
-  console.log('  POST /api/render');
-  console.log('  POST /api/admin/cleanup');
-  console.log('  POST /api/split');
-  console.log('  POST /api/combine');
-  console.log('  POST /api/combine/from-split/:splitJobId');
-  console.log('  POST /api/upload');
-  console.log('  POST /api/single-reaction/*');
-  console.log('  POST /api/split-react/*        ← ⚡ SPLIT REACT (NEW!)');
-  console.log('  GET  /api/combine/:jobId/download');
-  console.log('  GET  /api/split/:jobId/download');
-  console.log('  GET  /api/jobs/:jobId/download');
-  console.log('  GET  /api/admin/status');
-  console.log('  GET  /health');
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`⚡ RANT SQUAD VIDEO PROCESSOR API`);
+  console.log(`${'='.repeat(60)}`);
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`\n📡 Available endpoints:`);
+  console.log(`   POST /api/download          - Download video from URL`);
+  console.log(`   POST /api/transcribe        - Transcribe video audio`);
+  console.log(`   POST /api/render            - Render reaction video`);
+  console.log(`   POST /api/split             - Split video at timestamps`);
+  console.log(`   POST /api/combine           - Combine clips with reactions`);
+  console.log(`   POST /api/upload            - Upload video directly`);
+  console.log(`   POST /api/overlay           - Add overlay to video`);
+  console.log(`   POST /api/single-reaction   - Single reaction video`);
+  console.log(`   POST /api/split-react       - Split React feature`);
+  console.log(`   POST /api/audio-reaction    - 🎙️ Audio-Only RANT (NEW!)`);
+  console.log(`   GET  /api/admin/status      - Storage status`);
+  console.log(`   GET  /health                - Health check`);
+  console.log(`${'='.repeat(60)}\n`);
 });
-
-module.exports = app;
