@@ -80,32 +80,37 @@ function getPipCoordinates(targetWidth, targetHeight, pipPosition) {
 
 // ============================================
 // KEY FIX: Standardize reaction clips to 30fps
-// This prevents the fast-forward issue!
+// Handles Variable Frame Rate (VFR) videos from phones!
 // ============================================
 async function standardizeClipTo30fps(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
-    console.log(`  Standardizing to 30fps: ${path.basename(inputPath)}`);
+    console.log(`  Standardizing VFR video to 30fps CFR: ${path.basename(inputPath)}`);
+    
+    // The KEY is using video filter fps=30 with setpts to reset timestamps
+    // This properly handles Variable Frame Rate (VFR) videos from phones
+    // -vf "fps=30,setpts=N/30/TB" = force 30fps and recalculate all timestamps
+    // -af "aresample=async=1000" = resample audio to stay in sync
     
     ffmpeg(inputPath)
       .outputOptions([
-        '-r', '30',              // Output at 30fps
-        '-vsync', 'cfr',         // CONSTANT frame rate - KEY FIX!
-        '-c:v', 'libx264',       // Re-encode video
-        '-preset', 'fast',       // Balance speed/quality
-        '-crf', '23',            // Quality setting
-        '-c:a', 'aac',           // Re-encode audio
-        '-ar', '44100',          // Standard audio sample rate
-        '-b:a', '128k',          // Audio bitrate
-        '-y'                     // Overwrite output
+        '-vf', 'fps=30,setpts=N/30/TB',    // FORCE 30fps + reset timestamps - KEY FIX!
+        '-af', 'aresample=async=1000',      // Keep audio in sync with video
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-c:a', 'aac',
+        '-ar', '44100',
+        '-b:a', '128k',
+        '-y'
       ])
-      .on('start', cmd => console.log(`  Standardize started...`))
+      .on('start', cmd => console.log(`  Standardize cmd: ${cmd.substring(cmd.length - 100)}`))
       .on('progress', p => {
         if (p.percent && p.percent % 25 < 5) {
           console.log(`    Standardizing: ${Math.round(p.percent)}%`);
         }
       })
       .on('end', () => {
-        console.log(`  ✓ Standardized: ${path.basename(outputPath)}`);
+        console.log(`  ✓ Standardized VFR->CFR: ${path.basename(outputPath)}`);
         resolve(outputPath);
       })
       .on('error', (err) => {
