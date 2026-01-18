@@ -1,5 +1,5 @@
 /**
- * 🎙️ AUDIO REACTION SERVICE
+ * 🎙️ AUDIO REACTION SERVICE - FIXED
  * 
  * Creates "faceless" reaction videos where:
  * - Original video plays normally
@@ -8,6 +8,8 @@
  * - Video continues after audio ends
  * 
  * Audio normalization ensures consistent volume levels
+ * 
+ * FIXED: Now checks local files first, then falls back to R2
  */
 
 const ffmpeg = require('fluent-ffmpeg');
@@ -254,6 +256,75 @@ class AudioReactionService {
   }
 
   /**
+   * Load clips - checks LOCAL first, then falls back to R2
+   */
+  async loadClips(jobId, workDir) {
+    // OPTION 1: Check local clips directory (where split service saves them)
+    const localClipsDir = path.join(this.tempDir, jobId, 'clips');
+    const localManifestPath = path.join(localClipsDir, 'manifest.json');
+    
+    console.log(`[AudioReaction] Checking local clips at: ${localClipsDir}`);
+    
+    if (await fs.pathExists(localManifestPath)) {
+      console.log(`[AudioReaction] ✅ Found LOCAL manifest!`);
+      const manifest = await fs.readJson(localManifestPath);
+      
+      // Copy clips to work directory
+      const clipPaths = [];
+      for (let i = 0; i < manifest.clips.length; i++) {
+        const localClipPath = path.join(localClipsDir, `clip_${i + 1}.mp4`);
+        const workClipPath = path.join(workDir, `clip_${i + 1}.mp4`);
+        
+        if (await fs.pathExists(localClipPath)) {
+          await fs.copy(localClipPath, workClipPath);
+          clipPaths.push(workClipPath);
+          console.log(`[AudioReaction] ✅ Copied local clip ${i + 1}/${manifest.clips.length}`);
+        } else {
+          throw new Error(`Local clip ${i + 1} not found at ${localClipPath}`);
+        }
+      }
+      
+      return { manifest, clipPaths };
+    }
+    
+    // OPTION 2: Try R2 storage
+    console.log(`[AudioReaction] Local clips not found, trying R2...`);
+    
+    const manifestKey = `splits/${jobId}/manifest.json`;
+    let manifest;
+    
+    try {
+      console.log(`[AudioReaction] Downloading from R2: ${manifestKey}`);
+      const manifestData = await r2Service.downloadFile(manifestKey);
+      manifest = JSON.parse(manifestData.toString());
+      console.log(`[AudioReaction] ✅ R2 Manifest loaded: ${manifest.clips.length} clips`);
+    } catch (err) {
+      console.error(`[AudioReaction] ❌ R2 manifest download failed:`, err.message);
+      throw new Error('Split job not found. Clips may have been cleaned up. Please re-split the video.');
+    }
+    
+    // Download clips from R2
+    const clipPaths = [];
+    for (let i = 0; i < manifest.clips.length; i++) {
+      const clipKey = `${jobId}/clip_${i + 1}.mp4`;
+      const localPath = path.join(workDir, `clip_${i + 1}.mp4`);
+      
+      try {
+        console.log(`[AudioReaction] Downloading clip ${i + 1} from R2: ${clipKey}`);
+        const clipData = await r2Service.downloadFile(clipKey);
+        await fs.writeFile(localPath, clipData);
+        clipPaths.push(localPath);
+        console.log(`[AudioReaction] ✅ Downloaded clip ${i + 1}/${manifest.clips.length}`);
+      } catch (err) {
+        console.error(`[AudioReaction] ❌ Failed to download clip ${i + 1}:`, err);
+        throw new Error(`Failed to download clip ${i + 1}. Clips may have expired.`);
+      }
+    }
+    
+    return { manifest, clipPaths };
+  }
+
+  /**
    * MAIN FUNCTION: Combine clips with audio reactions
    * 
    * @param {string} jobId - The split job ID
@@ -261,7 +332,7 @@ class AudioReactionService {
    *                                 (clipIndex is which clip to add reaction AFTER)
    */
   async combineClipsWithAudioReactions(jobId, audioReactions) {
-    const workDir = path.join(this.tempDir, jobId);
+    const workDir = path.join(this.tempDir, jobId, 'audio_render');
     await fs.ensureDir(workDir);
     
     console.log(`\n${'='.repeat(60)}`);
@@ -273,49 +344,22 @@ class AudioReactionService {
     this.updateProgress(renderProgress, jobId, 'starting', 0, 'Initializing...');
     
     try {
-      // Step 1: Get manifest from R2
+      // Step 1: Load clips (local first, then R2)
       this.updateProgress(renderProgress, jobId, 'loading', 5, 'Loading split data...');
       
-      const manifestKey = `splits/${jobId}/manifest.json`;
-      let manifest;
+      const { manifest, clipPaths } = await this.loadClips(jobId, workDir);
+      console.log(`[AudioReaction] ✅ Loaded ${clipPaths.length} clips`);
       
-      try {
-        const manifestData = await r2Service.downloadFile(manifestKey);
-        manifest = JSON.parse(manifestData.toString());
-        console.log(`[AudioReaction] ✅ Manifest loaded: ${manifest.clips.length} clips`);
-      } catch (err) {
-        throw new Error('Split job not found. Please re-split the video first.');
-      }
+      this.updateProgress(renderProgress, jobId, 'loading', 30, `Loaded ${clipPaths.length} clips`);
       
-      // Step 2: Download all clips from R2
-      this.updateProgress(renderProgress, jobId, 'downloading', 10, 'Downloading clips...');
-      
-      const clipPaths = [];
-      for (let i = 0; i < manifest.clips.length; i++) {
-        const clipKey = `${jobId}/clip_${i + 1}.mp4`;
-        const localPath = path.join(workDir, `clip_${i + 1}.mp4`);
-        
-        try {
-          const clipData = await r2Service.downloadFile(clipKey);
-          await fs.writeFile(localPath, clipData);
-          clipPaths.push(localPath);
-          console.log(`[AudioReaction] ✅ Downloaded clip ${i + 1}/${manifest.clips.length}`);
-        } catch (err) {
-          console.error(`[AudioReaction] ❌ Failed to download clip ${i + 1}:`, err);
-          throw new Error(`Failed to download clip ${i + 1}. Clips may have expired.`);
-        }
-        
-        const progress = 10 + ((i + 1) / manifest.clips.length) * 20;
-        this.updateProgress(renderProgress, jobId, 'downloading', progress, `Downloaded clip ${i + 1}/${manifest.clips.length}`);
-      }
-      
-      // Step 3: Create map of which clips have audio reactions
+      // Step 2: Create map of which clips have audio reactions
       const reactionMap = {};
       for (const reaction of audioReactions) {
         reactionMap[reaction.clipIndex] = reaction.audioPath;
+        console.log(`[AudioReaction] Reaction mapped: clip ${reaction.clipIndex} → ${path.basename(reaction.audioPath)}`);
       }
       
-      // Step 4: Build all segments
+      // Step 3: Build all segments
       this.updateProgress(renderProgress, jobId, 'processing', 35, 'Processing clips and audio...');
       
       const allSegments = [];
@@ -339,7 +383,7 @@ class AudioReactionService {
           
           // Get audio duration
           const audioDuration = await this.getAudioDuration(audioPath);
-          console.log(`[AudioReaction] Audio duration: ${audioDuration}s`);
+          console.log(`[AudioReaction] Audio duration: ${audioDuration.toFixed(2)}s`);
           
           // Extract last frame of this clip
           const framePath = path.join(workDir, `frame_${clipIndex}.jpg`);
@@ -364,11 +408,16 @@ class AudioReactionService {
         this.updateProgress(renderProgress, jobId, 'processing', progress, `Processed clip ${clipIndex}/${totalClips}`);
       }
       
-      // Step 5: Concatenate all segments
+      // Step 4: Concatenate all segments
       this.updateProgress(renderProgress, jobId, 'rendering', 70, 'Creating final video...');
       
       // Generate output filename
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const now = new Date();
+      // Convert to GMT+4
+      const gmt4Offset = 4 * 60 * 60 * 1000;
+      const gmt4Date = new Date(now.getTime() + gmt4Offset);
+      const timestamp = gmt4Date.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      
       const firstReactionText = audioReactions[0]?.text || 'audio';
       const shortText = firstReactionText.substring(0, 3).replace(/[^a-zA-Z0-9]/g, '').toUpperCase() || 'AUD';
       const outputFilename = `AUDIO_${shortText}_${timestamp}.mp4`;
@@ -376,7 +425,7 @@ class AudioReactionService {
       
       await this.concatenateSegments(allSegments, outputPath, jobId);
       
-      // Step 6: Upload to R2
+      // Step 5: Upload to R2
       this.updateProgress(renderProgress, jobId, 'uploading', 95, 'Uploading to cloud...');
       
       const r2Key = `renders/${jobId}/${outputFilename}`;
@@ -385,15 +434,22 @@ class AudioReactionService {
       
       const downloadUrl = await r2Service.getSignedUrl(r2Key, 7 * 24 * 60 * 60); // 7 days
       
-      // Step 7: Cleanup local files
-      console.log(`[AudioReaction] Cleaning up temp files...`);
+      console.log(`[AudioReaction] ✅ Uploaded to R2: ${r2Key}`);
+      
+      // Step 6: Cleanup local files (keep clips for potential re-render)
+      console.log(`[AudioReaction] Cleaning up render temp files...`);
       await fs.remove(workDir);
       
       // Done!
       this.updateProgress(renderProgress, jobId, 'complete', 100, 'Done!');
       
+      // Store download URL in progress for frontend to access
+      renderProgress[jobId].downloadUrl = downloadUrl;
+      renderProgress[jobId].filename = outputFilename;
+      
       console.log(`\n${'='.repeat(60)}`);
       console.log(`[AudioReaction] 🎉 AUDIO-ONLY RANT COMPLETE!`);
+      console.log(`[AudioReaction] Filename: ${outputFilename}`);
       console.log(`[AudioReaction] Download URL ready`);
       console.log(`${'='.repeat(60)}\n`);
       
