@@ -156,7 +156,7 @@ async function overlayPip(bgPath, pipPath, outputPath, coords, targetWidth, targ
 }
 
 async function createPipSegment(originalPath, reactionPath, outputPath, targetWidth, targetHeight, pipPosition) {
-  console.log('\n=== PiP Creation (Original=Background, Reaction=Overlay) ===');
+  console.log('\n=== PiP Creation (Original=Background, Reaction=Overlay+Audio) ===');
   const workDir = path.dirname(outputPath);
 
   const originalDuration = await getVideoDuration(originalPath);
@@ -178,21 +178,23 @@ async function createPipSegment(originalPath, reactionPath, outputPath, targetWi
   const pipWidth = Math.floor(targetWidth * 0.25);
   const pipHeight = Math.floor(targetHeight * 0.25);
 
-  // Simple overlay: Original as background, Reaction as small PiP
-  // Use -shortest to end when original ends (in case reaction is longer)
-  // Use original's audio (stream 0:a)
+  // PiP overlay: Original as background, Reaction as small overlay
+  // IMPORTANT: Use REACTION audio (1:a) so viewers hear you reacting!
+  // Limit to original duration with -t
   const filterComplex = [
     // Scale original to target size
     `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,fps=30[bg]`,
     // Scale reaction to PiP size
     `[1:v]scale=${pipWidth}:${pipHeight}[pip]`,
     // Overlay reaction on original
-    `[bg][pip]overlay=${coords.x}:${coords.y}:shortest=1[outv]`
+    `[bg][pip]overlay=${coords.x}:${coords.y}[outv]`
   ].join(';');
 
-  const cmd = `ffmpeg -y -i "${originalPath}" -i "${reactionPath}" -filter_complex "${filterComplex}" -map "[outv]" -map 0:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -t ${originalDuration} "${outputPath}"`;
+  // Use 1:a (reaction audio) instead of 0:a (original audio)
+  // This way viewers hear YOUR reactions!
+  const cmd = `ffmpeg -y -i "${originalPath}" -i "${reactionPath}" -filter_complex "${filterComplex}" -map "[outv]" -map 1:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -t ${originalDuration} "${outputPath}"`;
 
-  console.log(`Running PiP overlay...`);
+  console.log(`Running PiP overlay with REACTION audio...`);
   
   return new Promise((resolve, reject) => {
     exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
@@ -200,7 +202,7 @@ async function createPipSegment(originalPath, reactionPath, outputPath, targetWi
         console.error('PiP overlay error:', stderr ? stderr.substring(stderr.length - 500) : error.message);
         reject(error);
       } else {
-        console.log('  ✓ PiP overlay complete');
+        console.log('  ✓ PiP overlay complete (with reaction audio)');
         resolve(outputPath);
       }
     });
