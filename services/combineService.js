@@ -156,7 +156,7 @@ async function overlayPip(bgPath, pipPath, outputPath, coords, targetWidth, targ
 }
 
 async function createPipSegment(originalPath, reactionPath, outputPath, targetWidth, targetHeight, pipPosition) {
-  console.log('\n=== THREE-PASS PiP Creation ===');
+  console.log('\n=== PiP Creation (Original=Background, Reaction=Overlay) ===');
   const workDir = path.dirname(outputPath);
 
   const originalDuration = await getVideoDuration(originalPath);
@@ -164,37 +164,47 @@ async function createPipSegment(originalPath, reactionPath, outputPath, targetWi
   console.log(`Original duration: ${originalDuration}s`);
   console.log(`Reaction duration: ${reactionDuration}s`);
 
-  if (!originalDuration || originalDuration <= 0 || !reactionDuration || reactionDuration <= 0) {
-    console.log('WARNING: Invalid duration detected, using fallback...');
+  if (!originalDuration || originalDuration <= 0) {
+    console.log('WARNING: Invalid original duration, copying reaction as fallback...');
     await fs.copy(reactionPath, outputPath);
     return outputPath;
   }
 
-  // Pass 1: Extract last frame from reaction
-  console.log('--- Pass 1: Extract frame ---');
-  const lastFramePath = path.join(workDir, `last_frame_${Date.now()}.jpg`);
-  await extractLastFrame(reactionPath, lastFramePath);
-
-  // Pass 2: Create background video
-  console.log('--- Pass 2: Create background video ---');
-  const bgPath = path.join(workDir, `bg_${Date.now()}.mp4`);
-  const bgDuration = originalDuration + 0.5;
-  await createBackgroundVideo(lastFramePath, bgPath, bgDuration, targetWidth, targetHeight, reactionPath);
-
-  // Pass 3: Overlay original on background
-  console.log('--- Pass 3: Overlay PiP ---');
+  // Get PiP coordinates
   const coords = getPipCoordinates(targetWidth, targetHeight, pipPosition);
-  await overlayPip(bgPath, originalPath, outputPath, coords, targetWidth, targetHeight);
+  console.log(`PiP position: ${pipPosition} (${coords.x}, ${coords.y})`);
 
-  // Cleanup temp files
-  await fs.remove(lastFramePath).catch(() => {});
-  await fs.remove(bgPath).catch(() => {});
+  // PiP size (25% of screen)
+  const pipWidth = Math.floor(targetWidth * 0.25);
+  const pipHeight = Math.floor(targetHeight * 0.25);
 
-  console.log('=== THREE-PASS Complete ===\n');
-  const stats = await fs.stat(outputPath);
-  console.log(`✓ Pass 3 complete - Final video: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+  // Simple overlay: Original as background, Reaction as small PiP
+  // Use -shortest to end when original ends (in case reaction is longer)
+  // Use original's audio (stream 0:a)
+  const filterComplex = [
+    // Scale original to target size
+    `[0:v]scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,fps=30[bg]`,
+    // Scale reaction to PiP size
+    `[1:v]scale=${pipWidth}:${pipHeight}[pip]`,
+    // Overlay reaction on original
+    `[bg][pip]overlay=${coords.x}:${coords.y}:shortest=1[outv]`
+  ].join(';');
 
-  return outputPath;
+  const cmd = `ffmpeg -y -i "${originalPath}" -i "${reactionPath}" -filter_complex "${filterComplex}" -map "[outv]" -map 0:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -t ${originalDuration} "${outputPath}"`;
+
+  console.log(`Running PiP overlay...`);
+  
+  return new Promise((resolve, reject) => {
+    exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) {
+        console.error('PiP overlay error:', stderr ? stderr.substring(stderr.length - 500) : error.message);
+        reject(error);
+      } else {
+        console.log('  ✓ PiP overlay complete');
+        resolve(outputPath);
+      }
+    });
+  });
 }
 
 // ============================================
