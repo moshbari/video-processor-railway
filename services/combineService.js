@@ -342,22 +342,25 @@ async function combineClipsWithReactions(originalClipPaths, reactionClipPaths, w
       console.log(`  Original: ${path.basename(originalPath)}`);
       console.log(`  Reaction: ${reactionPath ? path.basename(reactionPath) : 'NONE'}`);
 
-      // Add original clip (already 30fps from split)
-      processedClips.push(originalPath);
-
       if (reactionPath) {
         if (mode === 'pip') {
-          // PiP mode: create overlay segment using THREE-PASS method
+          // PiP mode: Original is background, Reaction is small overlay
+          // The PiP segment already contains the original, so we ONLY add the PiP
           const pipOutputPath = path.join(workDir, `pip_${i}.mp4`);
           await createPipSegment(originalPath, reactionPath, pipOutputPath, targetWidth, targetHeight, pipPosition);
           processedClips.push(pipOutputPath);
         } else {
-          // SEQUENTIAL MODE: Standardize reaction clip to 30fps BEFORE concatenation
-          // This is the KEY FIX for the fast-forward issue!
+          // SEQUENTIAL MODE: Original plays first, then reaction
+          // Add original clip first
+          processedClips.push(originalPath);
+          // Then add standardized reaction clip
           const standardizedPath = path.join(workDir, `std_reaction_${i}.mp4`);
           await standardizeClipTo30fps(reactionPath, standardizedPath);
           processedClips.push(standardizedPath);
         }
+      } else {
+        // No reaction for this clip, just add the original
+        processedClips.push(originalPath);
       }
 
       completedPairs++;
