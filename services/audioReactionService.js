@@ -1,5 +1,5 @@
 /**
- * 🎙️ AUDIO REACTION SERVICE - FIXED
+ * 🎙️ AUDIO REACTION SERVICE - FIXED V2
  * 
  * Creates "faceless" reaction videos where:
  * - Original video plays normally
@@ -9,10 +9,11 @@
  * 
  * Audio normalization ensures consistent volume levels
  * 
- * FIXED: Now checks local files first, then falls back to R2
+ * FIXED: Uses same clip loading logic as combine.js (r2Service.downloadSplitJob)
  */
 
 const ffmpeg = require('fluent-ffmpeg');
+const { exec, spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs-extra');
 const { v4: uuidv4 } = require('uuid');
@@ -21,10 +22,12 @@ const r2Service = require('./r2Service');
 // Store render progress for polling
 const renderProgress = {};
 
+const TEMP_DIR = process.env.TEMP_DIR || '/app/temp';
+
 class AudioReactionService {
   
   constructor() {
-    this.tempDir = process.env.TEMP_DIR || '/app/temp';
+    this.tempDir = TEMP_DIR;
   }
 
   /**
@@ -37,8 +40,8 @@ class AudioReactionService {
   /**
    * Update render progress
    */
-  updateProgress(progressStore, jobId, status, progress, message = '') {
-    progressStore[jobId] = { 
+  updateProgress(jobId, status, progress, message = '') {
+    renderProgress[jobId] = { 
       status, 
       progress: Math.round(progress), 
       message,
@@ -48,7 +51,7 @@ class AudioReactionService {
   }
 
   /**
-   * Get video duration using ffprobe
+   * Get video/audio duration using ffprobe
    */
   async getMediaDuration(filePath) {
     return new Promise((resolve, reject) => {
@@ -57,48 +60,127 @@ class AudioReactionService {
           console.error('Error getting duration:', err);
           reject(err);
         } else {
-          resolve(metadata.format.duration);
+          resolve(metadata.format.duration || 0);
         }
       });
     });
   }
 
   /**
-   * Get audio duration
+   * Get video dimensions
    */
-  async getAudioDuration(audioPath) {
-    return this.getMediaDuration(audioPath);
+  async getVideoDimensions(videoPath) {
+    return new Promise((resolve) => {
+      ffmpeg.ffprobe(videoPath, (err, metadata) => {
+        if (err) {
+          console.error('Probe error:', err.message);
+          resolve({ width: 1080, height: 1920 });
+          return;
+        }
+        const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+        if (videoStream) {
+          resolve({
+            width: videoStream.width || 1080,
+            height: videoStream.height || 1920
+          });
+        } else {
+          resolve({ width: 1080, height: 1920 });
+        }
+      });
+    });
+  }
+
+  /**
+   * EXACT SAME LOGIC AS combine.js - Ensure split clips are available
+   * Checks local first, then restores from R2 if needed
+   */
+  async ensureSplitClipsAvailable(splitJobId) {
+    const splitDir = path.join(this.tempDir, splitJobId, 'clips');
+    
+    console.log(`[AudioReaction] Checking local clips at: ${splitDir}`);
+    
+    // Check if clips exist locally
+    if (await fs.pathExists(splitDir)) {
+      const files = await fs.readdir(splitDir);
+      const clips = files.filter(f => f.startsWith('clip_') && f.endsWith('.mp4'));
+      if (clips.length > 0) {
+        console.log(`[AudioReaction] ✅ Found ${clips.length} local clips`);
+        return splitDir;
+      }
+    }
+    
+    console.log('[AudioReaction] Local clips not found, attempting to restore from R2...');
+    
+    // Check if R2 is configured
+    if (!r2Service.isConfigured()) {
+      throw new Error('Split job not found locally and R2 is not configured');
+    }
+    
+    // Create job directory and download from R2
+    const jobDir = path.join(this.tempDir, splitJobId);
+    await fs.ensureDir(jobDir);
+    
+    try {
+      await r2Service.downloadSplitJob(splitJobId, jobDir);
+      console.log(`[AudioReaction] ✅ Restored clips from R2`);
+      return path.join(jobDir, 'clips');
+    } catch (err) {
+      console.error(`[AudioReaction] ❌ R2 restore failed:`, err.message);
+      throw new Error(`Split job not found. Clips may have been cleaned up. Please re-split the video.`);
+    }
+  }
+
+  /**
+   * Extract clip number from filename
+   */
+  extractClipNumber(filename) {
+    const match = filename.match(/(\d+)/);
+    if (match) {
+      return parseInt(match[1], 10);
+    }
+    return null;
   }
 
   /**
    * Extract the last frame from a video clip as JPG image
    */
   async extractLastFrame(videoPath, outputPath) {
+    return new Promise((resolve, reject) => {
+      const cmd = `ffmpeg -y -sseof -0.5 -i "${videoPath}" -vframes 1 -q:v 2 "${outputPath}"`;
+      exec(cmd, (error, stdout, stderr) => {
+        if (error) {
+          console.error('[AudioReaction] Extract frame error:', stderr);
+          reject(error);
+        } else {
+          console.log('[AudioReaction] ✓ Last frame extracted');
+          resolve(outputPath);
+        }
+      });
+    });
+  }
+
+  /**
+   * Create a frozen frame video with audio
+   * The frozen frame that plays during audio reaction
+   */
+  async createFrozenFrameWithAudio(framePath, audioPath, outputPath, targetWidth, targetHeight) {
     return new Promise(async (resolve, reject) => {
       try {
-        // Get video duration first
-        const duration = await this.getMediaDuration(videoPath);
-        // Get frame slightly before end to avoid black frames
-        const frameTime = Math.max(0, duration - 0.1);
+        const audioDuration = await this.getMediaDuration(audioPath);
+        console.log(`[AudioReaction] Creating frozen frame video (${audioDuration.toFixed(2)}s) with normalized audio...`);
         
-        console.log(`[AudioReaction] Extracting last frame at ${frameTime}s from ${path.basename(videoPath)}`);
+        // Create frozen video from image + add audio with normalization
+        const cmd = `ffmpeg -y -loop 1 -i "${framePath}" -i "${audioPath}" -t ${audioDuration} -vf "scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,fps=30" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -ar 44100 -af "loudnorm=I=-16:TP=-1.5:LRA=11" -shortest -pix_fmt yuv420p "${outputPath}"`;
         
-        ffmpeg(videoPath)
-          .seekInput(frameTime)
-          .outputOptions([
-            '-vframes', '1',
-            '-q:v', '2'  // High quality JPG
-          ])
-          .output(outputPath)
-          .on('end', () => {
-            console.log(`[AudioReaction] ✅ Last frame extracted: ${path.basename(outputPath)}`);
+        exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
+          if (error) {
+            console.error('[AudioReaction] Frozen frame creation error:', stderr ? stderr.substring(stderr.length - 500) : error.message);
+            reject(error);
+          } else {
+            console.log(`[AudioReaction] ✓ Frozen frame with audio created (${audioDuration.toFixed(2)}s)`);
             resolve(outputPath);
-          })
-          .on('error', (err) => {
-            console.error(`[AudioReaction] ❌ Frame extraction failed:`, err);
-            reject(err);
-          })
-          .run();
+          }
+        });
       } catch (err) {
         reject(err);
       }
@@ -106,230 +188,101 @@ class AudioReactionService {
   }
 
   /**
-   * Create a video from a still image with specific duration
-   * The frozen frame video that plays during audio reaction
-   */
-  async createFrozenFrameVideo(imagePath, duration, outputPath, width = 1080, height = 1920) {
-    return new Promise((resolve, reject) => {
-      console.log(`[AudioReaction] Creating ${duration}s frozen frame video...`);
-      
-      ffmpeg()
-        .input(imagePath)
-        .inputOptions([
-          '-loop', '1',  // Loop the image
-          '-framerate', '30'  // 30fps
-        ])
-        .outputOptions([
-          '-t', String(duration),  // Duration matches audio length
-          '-vf', `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black`,
-          '-c:v', 'libx264',
-          '-preset', 'fast',
-          '-pix_fmt', 'yuv420p',
-          '-r', '30'
-        ])
-        .output(outputPath)
-        .on('end', () => {
-          console.log(`[AudioReaction] ✅ Frozen frame video created: ${duration}s`);
-          resolve(outputPath);
-        })
-        .on('error', (err) => {
-          console.error(`[AudioReaction] ❌ Frozen frame creation failed:`, err);
-          reject(err);
-        })
-        .run();
-    });
-  }
-
-  /**
-   * Add audio to frozen frame video with normalization
-   */
-  async addAudioToFrozenFrame(videoPath, audioPath, outputPath) {
-    return new Promise((resolve, reject) => {
-      console.log(`[AudioReaction] Adding normalized audio to frozen frame...`);
-      
-      ffmpeg()
-        .input(videoPath)
-        .input(audioPath)
-        .outputOptions([
-          '-c:v', 'copy',  // Copy video stream (already encoded)
-          '-c:a', 'aac',
-          '-b:a', '192k',
-          '-ar', '44100',
-          // Audio normalization - same as your video reactions
-          '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
-          '-shortest'  // End when shortest stream ends
-        ])
-        .output(outputPath)
-        .on('end', () => {
-          console.log(`[AudioReaction] ✅ Audio added and normalized`);
-          resolve(outputPath);
-        })
-        .on('error', (err) => {
-          console.error(`[AudioReaction] ❌ Audio addition failed:`, err);
-          reject(err);
-        })
-        .run();
-    });
-  }
-
-  /**
    * Normalize audio in original video clips for consistent levels
    */
-  async normalizeVideoClipAudio(inputPath, outputPath) {
+  async normalizeVideoClip(inputPath, outputPath) {
     return new Promise((resolve, reject) => {
-      console.log(`[AudioReaction] Normalizing clip audio: ${path.basename(inputPath)}`);
+      console.log(`[AudioReaction] Normalizing clip: ${path.basename(inputPath)}`);
       
-      ffmpeg(inputPath)
-        .outputOptions([
-          '-c:v', 'libx264',
-          '-preset', 'fast',
-          '-c:a', 'aac',
-          '-b:a', '192k',
-          '-ar', '44100',
-          '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
-          '-r', '30',
-          '-vsync', 'cfr'
-        ])
-        .output(outputPath)
-        .on('end', () => {
-          console.log(`[AudioReaction] ✅ Clip audio normalized`);
+      const cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset fast -crf 23 -r 30 -c:a aac -b:a 192k -ar 44100 -af "loudnorm=I=-16:TP=-1.5:LRA=11" -pix_fmt yuv420p "${outputPath}"`;
+      
+      exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
+        if (error) {
+          console.error('[AudioReaction] Normalization error:', stderr ? stderr.substring(stderr.length - 300) : error.message);
+          reject(error);
+        } else {
+          console.log(`[AudioReaction] ✓ Clip normalized`);
           resolve(outputPath);
-        })
-        .on('error', (err) => {
-          console.error(`[AudioReaction] ❌ Normalization failed:`, err);
-          reject(err);
-        })
-        .run();
+        }
+      });
     });
   }
 
   /**
-   * Concatenate all video segments (clips + frozen frames)
+   * Concatenate all video segments using concat filter
    */
   async concatenateSegments(segments, outputPath, jobId) {
     return new Promise((resolve, reject) => {
-      const workDir = path.dirname(outputPath);
-      const listFile = path.join(workDir, 'concat_list.txt');
-      
-      // Create concat list file
-      const listContent = segments.map(s => `file '${s}'`).join('\n');
-      fs.writeFileSync(listFile, listContent);
-      
       console.log(`[AudioReaction] Concatenating ${segments.length} segments...`);
-      console.log(`[AudioReaction] Segments: ${segments.map(s => path.basename(s)).join(' → ')}`);
+      segments.forEach((s, i) => console.log(`  [${i}] ${path.basename(s)}`));
       
-      const ffmpegCmd = ffmpeg()
-        .input(listFile)
-        .inputOptions(['-f', 'concat', '-safe', '0'])
-        .outputOptions([
-          '-c:v', 'libx264',
-          '-preset', 'fast',
-          '-c:a', 'aac',
-          '-b:a', '192k',
-          '-r', '30',
-          '-vsync', 'cfr',
-          // Final audio normalization pass
-          '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11'
-        ])
-        .output(outputPath);
+      const numClips = segments.length;
       
-      ffmpegCmd
-        .on('progress', (progress) => {
-          if (progress.percent) {
-            const percent = Math.min(95, 70 + (progress.percent * 0.25));
-            this.updateProgress(renderProgress, jobId, 'rendering', percent, 'Concatenating final video...');
-          }
-        })
-        .on('end', () => {
-          // Clean up concat list
-          fs.removeSync(listFile);
-          console.log(`[AudioReaction] ✅ Final video created!`);
-          resolve(outputPath);
-        })
-        .on('error', (err) => {
-          fs.removeSync(listFile);
-          console.error(`[AudioReaction] ❌ Concatenation failed:`, err);
-          reject(err);
-        })
-        .run();
-    });
-  }
-
-  /**
-   * Load clips - checks LOCAL first, then falls back to R2
-   */
-  async loadClips(jobId, workDir) {
-    // OPTION 1: Check local clips directory (where split service saves them)
-    const localClipsDir = path.join(this.tempDir, jobId, 'clips');
-    const localManifestPath = path.join(localClipsDir, 'manifest.json');
-    
-    console.log(`[AudioReaction] Checking local clips at: ${localClipsDir}`);
-    
-    if (await fs.pathExists(localManifestPath)) {
-      console.log(`[AudioReaction] ✅ Found LOCAL manifest!`);
-      const manifest = await fs.readJson(localManifestPath);
+      // Build input arguments
+      const inputArgs = segments.flatMap(p => ['-i', p]);
       
-      // Copy clips to work directory
-      const clipPaths = [];
-      for (let i = 0; i < manifest.clips.length; i++) {
-        const localClipPath = path.join(localClipsDir, `clip_${i + 1}.mp4`);
-        const workClipPath = path.join(workDir, `clip_${i + 1}.mp4`);
-        
-        if (await fs.pathExists(localClipPath)) {
-          await fs.copy(localClipPath, workClipPath);
-          clipPaths.push(workClipPath);
-          console.log(`[AudioReaction] ✅ Copied local clip ${i + 1}/${manifest.clips.length}`);
-        } else {
-          throw new Error(`Local clip ${i + 1} not found at ${localClipPath}`);
+      // Build filter_complex - scale all to same size
+      let filterParts = [];
+      let concatInputs = '';
+      
+      for (let i = 0; i < numClips; i++) {
+        filterParts.push(`[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p[v${i}]`);
+        filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a${i}]`);
+        concatInputs += `[v${i}][a${i}]`;
+      }
+      
+      // Concat and final audio normalization
+      filterParts.push(`${concatInputs}concat=n=${numClips}:v=1:a=1[outv][outa]`);
+      
+      const filterComplex = filterParts.join(';');
+      
+      const args = [
+        '-y',
+        ...inputArgs,
+        '-filter_complex', filterComplex,
+        '-map', '[outv]',
+        '-map', '[outa]',
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-movflags', '+faststart',
+        outputPath
+      ];
+      
+      const ffmpegProcess = spawn('ffmpeg', args);
+      
+      let stderrOutput = '';
+      
+      ffmpegProcess.stderr.on('data', (data) => {
+        const str = data.toString();
+        stderrOutput += str;
+        const timeMatch = str.match(/time=(\d{2}:\d{2}:\d{2}\.\d{2})/);
+        if (timeMatch) {
+          this.updateProgress(jobId, 'rendering', 80, `Concatenating: ${timeMatch[1]}`);
         }
-      }
+      });
       
-      return { manifest, clipPaths };
-    }
-    
-    // OPTION 2: Try R2 storage
-    console.log(`[AudioReaction] Local clips not found, trying R2...`);
-    
-    const manifestKey = `splits/${jobId}/manifest.json`;
-    let manifest;
-    
-    try {
-      console.log(`[AudioReaction] Downloading from R2: ${manifestKey}`);
-      const manifestData = await r2Service.downloadFile(manifestKey);
-      manifest = JSON.parse(manifestData.toString());
-      console.log(`[AudioReaction] ✅ R2 Manifest loaded: ${manifest.clips.length} clips`);
-    } catch (err) {
-      console.error(`[AudioReaction] ❌ R2 manifest download failed:`, err.message);
-      throw new Error('Split job not found. Clips may have been cleaned up. Please re-split the video.');
-    }
-    
-    // Download clips from R2
-    const clipPaths = [];
-    for (let i = 0; i < manifest.clips.length; i++) {
-      const clipKey = `${jobId}/clip_${i + 1}.mp4`;
-      const localPath = path.join(workDir, `clip_${i + 1}.mp4`);
+      ffmpegProcess.on('close', (code) => {
+        if (code === 0) {
+          console.log('[AudioReaction] ✓ Concatenation complete');
+          resolve(outputPath);
+        } else {
+          const lastLines = stderrOutput.split('\n').slice(-15).join('\n');
+          console.error(`[AudioReaction] FFmpeg concat failed:\n${lastLines}`);
+          reject(new Error(`FFmpeg concat failed with code ${code}`));
+        }
+      });
       
-      try {
-        console.log(`[AudioReaction] Downloading clip ${i + 1} from R2: ${clipKey}`);
-        const clipData = await r2Service.downloadFile(clipKey);
-        await fs.writeFile(localPath, clipData);
-        clipPaths.push(localPath);
-        console.log(`[AudioReaction] ✅ Downloaded clip ${i + 1}/${manifest.clips.length}`);
-      } catch (err) {
-        console.error(`[AudioReaction] ❌ Failed to download clip ${i + 1}:`, err);
-        throw new Error(`Failed to download clip ${i + 1}. Clips may have expired.`);
-      }
-    }
-    
-    return { manifest, clipPaths };
+      ffmpegProcess.on('error', (err) => {
+        reject(err);
+      });
+    });
   }
 
   /**
    * MAIN FUNCTION: Combine clips with audio reactions
-   * 
-   * @param {string} jobId - The split job ID
-   * @param {Array} audioReactions - Array of {clipIndex, audioPath} 
-   *                                 (clipIndex is which clip to add reaction AFTER)
    */
   async combineClipsWithAudioReactions(jobId, audioReactions) {
     const workDir = path.join(this.tempDir, jobId, 'audio_render');
@@ -341,16 +294,38 @@ class AudioReactionService {
     console.log(`[AudioReaction] Audio reactions: ${audioReactions.length}`);
     console.log(`${'='.repeat(60)}\n`);
     
-    this.updateProgress(renderProgress, jobId, 'starting', 0, 'Initializing...');
+    this.updateProgress(jobId, 'starting', 0, 'Initializing...');
     
     try {
-      // Step 1: Load clips (local first, then R2)
-      this.updateProgress(renderProgress, jobId, 'loading', 5, 'Loading split data...');
+      // Step 1: Load clips using SAME LOGIC as combine.js
+      this.updateProgress(jobId, 'loading', 5, 'Loading split clips...');
       
-      const { manifest, clipPaths } = await this.loadClips(jobId, workDir);
-      console.log(`[AudioReaction] ✅ Loaded ${clipPaths.length} clips`);
+      const splitDir = await this.ensureSplitClipsAvailable(jobId);
       
-      this.updateProgress(renderProgress, jobId, 'loading', 30, `Loaded ${clipPaths.length} clips`);
+      // Get clip files sorted by number
+      const files = await fs.readdir(splitDir);
+      const clipFiles = files
+        .filter(f => f.startsWith('clip_') && f.endsWith('.mp4'))
+        .sort((a, b) => {
+          const numA = this.extractClipNumber(a) || 0;
+          const numB = this.extractClipNumber(b) || 0;
+          return numA - numB;
+        });
+      
+      if (clipFiles.length === 0) {
+        throw new Error('No clips found in split job');
+      }
+      
+      const clipPaths = clipFiles.map(f => path.join(splitDir, f));
+      console.log(`[AudioReaction] ✅ Found ${clipPaths.length} clips`);
+      
+      this.updateProgress(jobId, 'loading', 20, `Found ${clipPaths.length} clips`);
+      
+      // Get dimensions from first clip
+      const dimensions = await this.getVideoDimensions(clipPaths[0]);
+      const targetWidth = dimensions.width;
+      const targetHeight = dimensions.height;
+      console.log(`[AudioReaction] Target dimensions: ${targetWidth}x${targetHeight}`);
       
       // Step 2: Create map of which clips have audio reactions
       const reactionMap = {};
@@ -360,20 +335,20 @@ class AudioReactionService {
       }
       
       // Step 3: Build all segments
-      this.updateProgress(renderProgress, jobId, 'processing', 35, 'Processing clips and audio...');
+      this.updateProgress(jobId, 'processing', 25, 'Processing clips...');
       
       const allSegments = [];
       const totalClips = clipPaths.length;
       
       for (let i = 0; i < totalClips; i++) {
         const clipPath = clipPaths[i];
-        const clipIndex = i + 1;
+        const clipIndex = i + 1;  // 1-based index
         
         console.log(`\n[AudioReaction] Processing clip ${clipIndex}/${totalClips}...`);
         
         // Normalize the original clip's audio
         const normalizedClipPath = path.join(workDir, `clip_${clipIndex}_normalized.mp4`);
-        await this.normalizeVideoClipAudio(clipPath, normalizedClipPath);
+        await this.normalizeVideoClip(clipPath, normalizedClipPath);
         allSegments.push(normalizedClipPath);
         
         // Check if this clip has an audio reaction
@@ -381,39 +356,29 @@ class AudioReactionService {
           const audioPath = reactionMap[clipIndex];
           console.log(`[AudioReaction] 🎙️ Adding audio reaction after clip ${clipIndex}`);
           
-          // Get audio duration
-          const audioDuration = await this.getAudioDuration(audioPath);
-          console.log(`[AudioReaction] Audio duration: ${audioDuration.toFixed(2)}s`);
-          
           // Extract last frame of this clip
           const framePath = path.join(workDir, `frame_${clipIndex}.jpg`);
           await this.extractLastFrame(normalizedClipPath, framePath);
           
-          // Create frozen frame video matching audio duration
-          const frozenPath = path.join(workDir, `frozen_${clipIndex}.mp4`);
-          await this.createFrozenFrameVideo(framePath, audioDuration, frozenPath);
-          
-          // Add audio to frozen frame (with normalization)
+          // Create frozen frame video with audio (duration auto-matched to audio)
           const frozenWithAudioPath = path.join(workDir, `frozen_audio_${clipIndex}.mp4`);
-          await this.addAudioToFrozenFrame(frozenPath, audioPath, frozenWithAudioPath);
+          await this.createFrozenFrameWithAudio(framePath, audioPath, frozenWithAudioPath, targetWidth, targetHeight);
           
           allSegments.push(frozenWithAudioPath);
           
-          // Clean up intermediate files
-          await fs.remove(framePath);
-          await fs.remove(frozenPath);
+          // Clean up frame image
+          await fs.remove(framePath).catch(() => {});
         }
         
-        const progress = 35 + ((i + 1) / totalClips) * 35;
-        this.updateProgress(renderProgress, jobId, 'processing', progress, `Processed clip ${clipIndex}/${totalClips}`);
+        const progress = 25 + ((i + 1) / totalClips) * 45;
+        this.updateProgress(jobId, 'processing', progress, `Processed clip ${clipIndex}/${totalClips}`);
       }
       
       // Step 4: Concatenate all segments
-      this.updateProgress(renderProgress, jobId, 'rendering', 70, 'Creating final video...');
+      this.updateProgress(jobId, 'rendering', 70, 'Creating final video...');
       
       // Generate output filename
       const now = new Date();
-      // Convert to GMT+4
       const gmt4Offset = 4 * 60 * 60 * 1000;
       const gmt4Date = new Date(now.getTime() + gmt4Offset);
       const timestamp = gmt4Date.toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -426,7 +391,7 @@ class AudioReactionService {
       await this.concatenateSegments(allSegments, outputPath, jobId);
       
       // Step 5: Upload to R2
-      this.updateProgress(renderProgress, jobId, 'uploading', 95, 'Uploading to cloud...');
+      this.updateProgress(jobId, 'uploading', 90, 'Uploading to cloud...');
       
       const r2Key = `renders/${jobId}/${outputFilename}`;
       const videoBuffer = await fs.readFile(outputPath);
@@ -436,12 +401,8 @@ class AudioReactionService {
       
       console.log(`[AudioReaction] ✅ Uploaded to R2: ${r2Key}`);
       
-      // Step 6: Cleanup local files (keep clips for potential re-render)
-      console.log(`[AudioReaction] Cleaning up render temp files...`);
-      await fs.remove(workDir);
-      
       // Done!
-      this.updateProgress(renderProgress, jobId, 'complete', 100, 'Done!');
+      this.updateProgress(jobId, 'complete', 100, 'Done!');
       
       // Store download URL in progress for frontend to access
       renderProgress[jobId].downloadUrl = downloadUrl;
@@ -450,7 +411,6 @@ class AudioReactionService {
       console.log(`\n${'='.repeat(60)}`);
       console.log(`[AudioReaction] 🎉 AUDIO-ONLY RANT COMPLETE!`);
       console.log(`[AudioReaction] Filename: ${outputFilename}`);
-      console.log(`[AudioReaction] Download URL ready`);
       console.log(`${'='.repeat(60)}\n`);
       
       return {
@@ -463,13 +423,7 @@ class AudioReactionService {
       
     } catch (error) {
       console.error(`[AudioReaction] ❌ Render failed:`, error);
-      this.updateProgress(renderProgress, jobId, 'error', 0, error.message);
-      
-      // Cleanup on error
-      try {
-        await fs.remove(workDir);
-      } catch (e) {}
-      
+      this.updateProgress(jobId, 'error', 0, error.message);
       throw error;
     }
   }
