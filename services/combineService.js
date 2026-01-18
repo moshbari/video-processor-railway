@@ -218,23 +218,21 @@ async function concatenateClips(concatFilePath, outputPath) {
   return new Promise((resolve, reject) => {
     console.log(`  Running concatenation with fps normalization...`);
     
-    // Use filter_complex to handle both video fps AND audio normalization
-    const filterComplex = '[0:v]fps=30[v];[0:a]loudnorm=I=-16:TP=-1.5:LRA=11[a]';
-    
+    // Simple approach: re-encode with fixed frame rate
+    // Don't use complexFilter with concat demuxer - it doesn't work!
     ffmpeg()
       .input(concatFilePath)
       .inputOptions(['-f', 'concat', '-safe', '0'])
-      .complexFilter(filterComplex, ['v', 'a'])
       .outputOptions([
-        '-map', '[v]',
-        '-map', '[a]',
-        '-r', '30',
-        '-vsync', 'cfr',
+        '-r', '30',              // Force 30fps output
+        '-vsync', 'cfr',         // Constant frame rate - KEY FIX!
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
         '-c:a', 'aac',
+        '-ar', '44100',
         '-b:a', '128k',
+        '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',  // Audio normalization
         '-movflags', '+faststart',
         '-y'
       ])
