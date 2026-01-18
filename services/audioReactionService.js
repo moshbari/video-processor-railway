@@ -394,10 +394,11 @@ class AudioReactionService {
       this.updateProgress(jobId, 'uploading', 90, 'Uploading to cloud...');
       
       const r2Key = `renders/${jobId}/${outputFilename}`;
-      const videoBuffer = await fs.readFile(outputPath);
-      await r2Service.uploadFile(r2Key, videoBuffer, 'video/mp4');
       
-      const downloadUrl = await r2Service.getSignedUrl(r2Key, 7 * 24 * 60 * 60); // 7 days
+      // IMPORTANT: r2Service.uploadFile expects (localFilePath, r2Key, contentType)
+      const uploadResult = await r2Service.uploadFile(outputPath, r2Key, 'video/mp4');
+      
+      const downloadUrl = uploadResult.downloadUrl || await r2Service.getSignedUrl(r2Key, 7 * 24 * 60 * 60);
       
       console.log(`[AudioReaction] ✅ Uploaded to R2: ${r2Key}`);
       
