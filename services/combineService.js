@@ -202,7 +202,7 @@ async function createPipSegment(originalPath, reactionPath, outputPath, targetWi
 // ============================================
 async function concatenateClips(clipPaths, outputPath) {
   return new Promise((resolve, reject) => {
-    console.log(`  Running concatenation with concat FILTER (not demuxer)...`);
+    console.log(`  Running concatenation with concat FILTER + audio normalization...`);
     console.log(`  Clips to concat: ${clipPaths.length}`);
     
     // Log the clips being concatenated
@@ -213,21 +213,24 @@ async function concatenateClips(clipPaths, outputPath) {
     // Build input arguments: -i clip1 -i clip2 -i clip3 ...
     const inputArgs = clipPaths.flatMap(p => ['-i', p]);
     
-    // Build filter_complex with scale normalization
+    // Build filter_complex with scale normalization AND audio normalization
     // Each input gets scaled to 1080x1920 and fps set to 30, then concatenated
-    // This ensures all clips have identical format before concat!
+    // Audio gets normalized with loudnorm for consistent volume
     let filterParts = [];
     let concatInputs = '';
     
     for (let i = 0; i < numClips; i++) {
-      // Scale each video to same size and fps, with audio passthrough
+      // Scale each video to same size and fps
       filterParts.push(`[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p[v${i}]`);
+      // Normalize audio format
       filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a${i}]`);
       concatInputs += `[v${i}][a${i}]`;
     }
     
-    // Add concat filter
-    filterParts.push(`${concatInputs}concat=n=${numClips}:v=1:a=1[outv][outa]`);
+    // Add concat filter, then apply loudnorm to the combined audio
+    filterParts.push(`${concatInputs}concat=n=${numClips}:v=1:a=1[outv][preAudio]`);
+    // Apply loudnorm to normalize volume across all clips
+    filterParts.push(`[preAudio]loudnorm=I=-16:TP=-1.5:LRA=11[outa]`);
     
     const filterComplex = filterParts.join(';');
     
@@ -247,7 +250,7 @@ async function concatenateClips(clipPaths, outputPath) {
       outputPath
     ];
     
-    console.log(`  Filter has ${filterParts.length} parts, normalizing all to 1080x1920@30fps`);
+    console.log(`  Filter has ${filterParts.length} parts, normalizing all to 1080x1920@30fps + loudnorm`);
     
     const ffmpegProcess = spawn('ffmpeg', args);
     
@@ -266,7 +269,7 @@ async function concatenateClips(clipPaths, outputPath) {
     
     ffmpegProcess.on('close', (code) => {
       if (code === 0) {
-        console.log('  ✓ Concatenation complete');
+        console.log('  ✓ Concatenation complete (with audio normalization)');
         resolve(outputPath);
       } else {
         // Log last part of stderr for debugging
