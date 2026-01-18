@@ -493,14 +493,14 @@ class CombineService {
         .input(concatFilePath)
         .inputOptions(['-f', 'concat', '-safe', '0'])
         .outputOptions([
-          '-vf', 'fps=30',  // Force consistent frame rate
+          '-r', '30',  // Force 30fps output
+          '-vsync', 'cfr',  // Constant frame rate - prevents speed issues
           '-c:v', 'libx264',
           '-preset', 'fast',
           '-crf', '23',
           '-c:a', 'aac',
           '-b:a', '128k',
           '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',  // AUDIO NORMALIZATION
-          '-r', '30',  // Output frame rate
           '-movflags', '+faststart',
           '-y'
         ])
