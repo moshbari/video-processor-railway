@@ -205,20 +205,31 @@ async function concatenateClips(clipPaths, outputPath) {
     console.log(`  Running concatenation with concat FILTER (not demuxer)...`);
     console.log(`  Clips to concat: ${clipPaths.length}`);
     
-    // Build FFmpeg command using concat FILTER
-    // This DECODES all videos first, then concatenates - handles different formats!
+    // Log the clips being concatenated
+    clipPaths.forEach((p, i) => console.log(`    [${i}] ${path.basename(p)}`));
+    
+    const numClips = clipPaths.length;
     
     // Build input arguments: -i clip1 -i clip2 -i clip3 ...
     const inputArgs = clipPaths.flatMap(p => ['-i', p]);
     
-    // Build filter_complex string
-    // [0:v][0:a][1:v][1:a][2:v][2:a]...concat=n=N:v=1:a=1[outv][outa]
-    const numClips = clipPaths.length;
-    let filterInputs = '';
+    // Build filter_complex with scale normalization
+    // Each input gets scaled to 1080x1920 and fps set to 30, then concatenated
+    // This ensures all clips have identical format before concat!
+    let filterParts = [];
+    let concatInputs = '';
+    
     for (let i = 0; i < numClips; i++) {
-      filterInputs += `[${i}:v][${i}:a]`;
+      // Scale each video to same size and fps, with audio passthrough
+      filterParts.push(`[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p[v${i}]`);
+      filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a${i}]`);
+      concatInputs += `[v${i}][a${i}]`;
     }
-    const filterComplex = `${filterInputs}concat=n=${numClips}:v=1:a=1[outv][outa]`;
+    
+    // Add concat filter
+    filterParts.push(`${concatInputs}concat=n=${numClips}:v=1:a=1[outv][outa]`);
+    
+    const filterComplex = filterParts.join(';');
     
     // Build full FFmpeg command
     const args = [
@@ -227,25 +238,25 @@ async function concatenateClips(clipPaths, outputPath) {
       '-filter_complex', filterComplex,
       '-map', '[outv]',
       '-map', '[outa]',
-      '-r', '30',
       '-c:v', 'libx264',
       '-preset', 'fast',
       '-crf', '23',
       '-c:a', 'aac',
-      '-ar', '44100',
       '-b:a', '128k',
-      '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
       '-movflags', '+faststart',
       outputPath
     ];
     
-    console.log(`  Filter: ${filterComplex.substring(0, 100)}...`);
+    console.log(`  Filter has ${filterParts.length} parts, normalizing all to 1080x1920@30fps`);
     
     const ffmpegProcess = spawn('ffmpeg', args);
     
+    let stderrOutput = '';
     let lastProgress = '';
+    
     ffmpegProcess.stderr.on('data', (data) => {
       const str = data.toString();
+      stderrOutput += str;
       const timeMatch = str.match(/time=(\d{2}:\d{2}:\d{2}\.\d{2})/);
       if (timeMatch && timeMatch[1] !== lastProgress) {
         lastProgress = timeMatch[1];
@@ -258,6 +269,9 @@ async function concatenateClips(clipPaths, outputPath) {
         console.log('  ✓ Concatenation complete');
         resolve(outputPath);
       } else {
+        // Log last part of stderr for debugging
+        const lastLines = stderrOutput.split('\n').slice(-20).join('\n');
+        console.error(`  FFmpeg concat stderr (last 20 lines):\n${lastLines}`);
         reject(new Error(`FFmpeg concat failed with code ${code}`));
       }
     });
