@@ -1,7 +1,8 @@
 /**
  * ⚡ RANT SQUAD VIDEO PROCESSOR API ⚡
  * 
- * Complete server.js with all routes including Audio-Only RANT
+ * Server.js for STAGING environment
+ * Includes Audio-Only RANT feature
  */
 
 const express = require('express');
@@ -9,19 +10,19 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs-extra');
 
-// Import routes
-const downloadRoutes = require('./routes/download');
-const transcribeRoutes = require('./routes/transcribe');
-const renderRoutes = require('./routes/render');
-const jobsRoutes = require('./routes/jobs');
-const splitRoutes = require('./routes/split');
-const combineRoutes = require('./routes/combine');
+// Import routes (ONLY files that exist in /routes folder)
 const adminRoutes = require('./routes/admin');
-const uploadRoutes = require('./routes/upload');
-const overlayRoutes = require('./routes/overlay');
+const audioReactionRoutes = require('./routes/audioReaction');  // 🎙️ AUDIO-ONLY RANT
+const combineRoutes = require('./routes/combine');
+const downloadRoutes = require('./routes/download');
+const jobsRoutes = require('./routes/jobs');
+const renderRoutes = require('./routes/render');
 const singleReactionRoutes = require('./routes/singleReaction');
+const splitRoutes = require('./routes/split');
 const splitReactRoutes = require('./routes/splitReact');
-const audioReactionRoutes = require('./routes/audioReaction');  // 🎙️ AUDIO-ONLY RANT (NEW!)
+const transcribeRoutes = require('./routes/transcribe');
+const uploadRoutes = require('./routes/upload');
+const voiceRoutes = require('./routes/voice');
 
 // Import services
 const cleanupService = require('./services/cleanupService');
@@ -56,34 +57,35 @@ app.get('/health', (req, res) => {
     status: 'healthy',
     timestamp: new Date().toISOString(),
     services: {
-      download: 'active',
-      transcribe: 'active',
-      render: 'active',
-      split: 'active',
+      admin: 'active',
+      audioReaction: 'active',  // 🎙️ NEW!
       combine: 'active',
-      cleanup: 'active',
-      upload: 'active',
-      overlay: 'active',
+      download: 'active',
+      jobs: 'active',
+      render: 'active',
       singleReaction: 'active',
+      split: 'active',
       splitReact: 'active',
-      audioReaction: 'active'  // 🎙️ NEW!
+      transcribe: 'active',
+      upload: 'active',
+      voice: 'active'
     }
   });
 });
 
 // Routes
-app.use('/api/download', downloadRoutes);
-app.use('/api/transcribe', transcribeRoutes);
-app.use('/api/render', renderRoutes);
-app.use('/api/jobs', jobsRoutes);
-app.use('/api/split', splitRoutes);
-app.use('/api/combine', combineRoutes);
 app.use('/api/admin', adminRoutes);
-app.use('/api/upload', uploadRoutes);
-app.use('/api/overlay', overlayRoutes);
+app.use('/api/audio-reaction', audioReactionRoutes);  // 🎙️ AUDIO-ONLY RANT
+app.use('/api/combine', combineRoutes);
+app.use('/api/download', downloadRoutes);
+app.use('/api/jobs', jobsRoutes);
+app.use('/api/render', renderRoutes);
 app.use('/api/single-reaction', singleReactionRoutes);
+app.use('/api/split', splitRoutes);
 app.use('/api/split-react', splitReactRoutes);
-app.use('/api/audio-reaction', audioReactionRoutes);  // 🎙️ AUDIO-ONLY RANT (NEW!)
+app.use('/api/transcribe', transcribeRoutes);
+app.use('/api/upload', uploadRoutes);
+app.use('/api/voice', voiceRoutes);
 
 // Error handling for multer
 app.use((err, req, res, next) => {
@@ -120,21 +122,22 @@ app.use((err, req, res, next) => {
 // Start server
 app.listen(PORT, () => {
   console.log(`\n${'='.repeat(60)}`);
-  console.log(`⚡ RANT SQUAD VIDEO PROCESSOR API`);
+  console.log(`⚡ RANT SQUAD VIDEO PROCESSOR API - STAGING`);
   console.log(`${'='.repeat(60)}`);
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`\n📡 Available endpoints:`);
-  console.log(`   POST /api/download          - Download video from URL`);
-  console.log(`   POST /api/transcribe        - Transcribe video audio`);
-  console.log(`   POST /api/render            - Render reaction video`);
-  console.log(`   POST /api/split             - Split video at timestamps`);
-  console.log(`   POST /api/combine           - Combine clips with reactions`);
-  console.log(`   POST /api/upload            - Upload video directly`);
-  console.log(`   POST /api/overlay           - Add overlay to video`);
-  console.log(`   POST /api/single-reaction   - Single reaction video`);
-  console.log(`   POST /api/split-react       - Split React feature`);
+  console.log(`   POST /api/admin             - Admin functions`);
   console.log(`   POST /api/audio-reaction    - 🎙️ Audio-Only RANT (NEW!)`);
-  console.log(`   GET  /api/admin/status      - Storage status`);
+  console.log(`   POST /api/combine           - Combine clips with reactions`);
+  console.log(`   POST /api/download          - Download video from URL`);
+  console.log(`   GET  /api/jobs              - Job status`);
+  console.log(`   POST /api/render            - Render reaction video`);
+  console.log(`   POST /api/single-reaction   - Single reaction video`);
+  console.log(`   POST /api/split             - Split video at timestamps`);
+  console.log(`   POST /api/split-react       - Split React feature`);
+  console.log(`   POST /api/transcribe        - Transcribe video audio`);
+  console.log(`   POST /api/upload            - Upload video directly`);
+  console.log(`   POST /api/voice             - Voice synthesis`);
   console.log(`   GET  /health                - Health check`);
   console.log(`${'='.repeat(60)}\n`);
 });
