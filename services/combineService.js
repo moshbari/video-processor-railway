@@ -1,5 +1,5 @@
 const ffmpeg = require('fluent-ffmpeg');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs-extra');
 const { v4: uuidv4 } = require('uuid');
@@ -79,81 +79,24 @@ function getPipCoordinates(targetWidth, targetHeight, pipPosition) {
 }
 
 // ============================================
-// KEY FIX: Standardize reaction clips to 30fps
-// Forces video timestamps to match audio duration!
-// This fixes VFR videos where metadata lies about fps
+// Standardize reaction clips for concatenation
+// Simple re-encode to ensure consistent format
 // ============================================
 async function standardizeClipTo30fps(inputPath, outputPath) {
-  return new Promise(async (resolve, reject) => {
-    console.log(`  Standardizing VFR video: ${path.basename(inputPath)}`);
-    
-    try {
-      // First, get the AUDIO duration (which is always correct)
-      const audioDuration = await getMediaDuration(inputPath, 'audio');
-      console.log(`  Audio duration: ${audioDuration}s`);
-      
-      // Get video duration for comparison
-      const videoDuration = await getMediaDuration(inputPath, 'video');
-      console.log(`  Video duration: ${videoDuration}s`);
-      
-      // Check if there's a mismatch (VFR symptom)
-      const durationMismatch = Math.abs(audioDuration - videoDuration) > 0.5;
-      if (durationMismatch) {
-        console.log(`  ⚠️ Duration mismatch detected! Video=${videoDuration}s, Audio=${audioDuration}s`);
-      }
-      
-      // THE FIX: Use 'atempo' equivalent for video by setting output to match audio
-      // -t [audioDuration] ensures video stops at audio end
-      // -vf "setpts=PTS*[ratio]" adjusts video speed to match audio
-      // But simpler: just use -shortest and let ffmpeg figure it out
-      
-      // Actually, the KEY is to use fps filter which DROPS/DUPLICATES frames
-      // to achieve exact 30fps, and -af aresample to keep audio in sync
-      const cmd = `ffmpeg -y -i "${inputPath}" -vf "fps=30" -af "aresample=async=1:first_pts=0" -c:v libx264 -preset fast -crf 23 -c:a aac -ar 44100 -b:a 128k -shortest "${outputPath}"`;
-      
-      console.log(`  Running VFR fix with fps filter + audio resample...`);
-      
-      exec(cmd, async (error, stdout, stderr) => {
-        if (error) {
-          console.error(`  ✗ Standardize failed:`, error.message);
-          // Log a snippet of stderr for debugging
-          if (stderr) {
-            const lines = stderr.split('\n').slice(-10).join('\n');
-            console.error(`  Last 10 lines of stderr:`, lines);
-          }
-          reject(error);
-        } else {
-          // Verify the output
-          const outAudio = await getMediaDuration(outputPath, 'audio');
-          const outVideo = await getMediaDuration(outputPath, 'video');
-          console.log(`  OUTPUT: video=${outVideo}s, audio=${outAudio}s`);
-          console.log(`  ✓ Standardized: ${path.basename(outputPath)}`);
-          resolve(outputPath);
-        }
-      });
-    } catch (err) {
-      console.error(`  ✗ Pre-analysis failed:`, err.message);
-      reject(err);
-    }
-  });
-}
-
-// Get duration of a specific stream (audio or video)
-async function getMediaDuration(filePath, streamType) {
   return new Promise((resolve, reject) => {
-    const streamSelect = streamType === 'audio' ? 'a:0' : 'v:0';
-    const cmd = `ffprobe -v error -select_streams ${streamSelect} -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`;
+    console.log(`  Standardizing: ${path.basename(inputPath)}`);
+    
+    // Simple re-encode with fixed parameters
+    // The concat FILTER will handle the rest, but this ensures clean input
+    const cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset fast -crf 23 -r 30 -c:a aac -ar 44100 -b:a 128k -pix_fmt yuv420p "${outputPath}"`;
     
     exec(cmd, (error, stdout, stderr) => {
-      if (error || !stdout.trim()) {
-        // Fallback to format duration
-        exec(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`, (err2, stdout2) => {
-          const duration = parseFloat(stdout2.trim()) || 0;
-          resolve(duration);
-        });
+      if (error) {
+        console.error(`  ✗ Standardize failed:`, error.message);
+        reject(error);
       } else {
-        const duration = parseFloat(stdout.trim()) || 0;
-        resolve(duration);
+        console.log(`  ✓ Standardized: ${path.basename(outputPath)}`);
+        resolve(outputPath);
       }
     });
   });
@@ -257,43 +200,72 @@ async function createPipSegment(originalPath, reactionPath, outputPath, targetWi
 // ============================================
 // CONCATENATION WITH PROPER FRAME RATE HANDLING
 // ============================================
-async function concatenateClips(concatFilePath, outputPath) {
+async function concatenateClips(clipPaths, outputPath) {
   return new Promise((resolve, reject) => {
-    console.log(`  Running concatenation with fps normalization...`);
+    console.log(`  Running concatenation with concat FILTER (not demuxer)...`);
+    console.log(`  Clips to concat: ${clipPaths.length}`);
     
-    // Simple approach: re-encode with fixed frame rate
-    // Don't use complexFilter with concat demuxer - it doesn't work!
-    ffmpeg()
-      .input(concatFilePath)
-      .inputOptions(['-f', 'concat', '-safe', '0'])
-      .outputOptions([
-        '-r', '30',              // Force 30fps output
-        '-vsync', 'cfr',         // Constant frame rate - KEY FIX!
-        '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
-        '-c:a', 'aac',
-        '-ar', '44100',
-        '-b:a', '128k',
-        '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',  // Audio normalization
-        '-movflags', '+faststart',
-        '-y'
-      ])
-      .on('start', cmd => console.log(`  Concat started...`))
-      .on('progress', p => {
-        if (p.timemark) {
-          console.log(`  Concat progress: ${p.timemark}`);
-        }
-      })
-      .on('end', () => {
+    // Build FFmpeg command using concat FILTER
+    // This DECODES all videos first, then concatenates - handles different formats!
+    
+    // Build input arguments: -i clip1 -i clip2 -i clip3 ...
+    const inputArgs = clipPaths.flatMap(p => ['-i', p]);
+    
+    // Build filter_complex string
+    // [0:v][0:a][1:v][1:a][2:v][2:a]...concat=n=N:v=1:a=1[outv][outa]
+    const numClips = clipPaths.length;
+    let filterInputs = '';
+    for (let i = 0; i < numClips; i++) {
+      filterInputs += `[${i}:v][${i}:a]`;
+    }
+    const filterComplex = `${filterInputs}concat=n=${numClips}:v=1:a=1[outv][outa]`;
+    
+    // Build full FFmpeg command
+    const args = [
+      '-y',
+      ...inputArgs,
+      '-filter_complex', filterComplex,
+      '-map', '[outv]',
+      '-map', '[outa]',
+      '-r', '30',
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-crf', '23',
+      '-c:a', 'aac',
+      '-ar', '44100',
+      '-b:a', '128k',
+      '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
+      '-movflags', '+faststart',
+      outputPath
+    ];
+    
+    console.log(`  Filter: ${filterComplex.substring(0, 100)}...`);
+    
+    const ffmpegProcess = spawn('ffmpeg', args);
+    
+    let lastProgress = '';
+    ffmpegProcess.stderr.on('data', (data) => {
+      const str = data.toString();
+      const timeMatch = str.match(/time=(\d{2}:\d{2}:\d{2}\.\d{2})/);
+      if (timeMatch && timeMatch[1] !== lastProgress) {
+        lastProgress = timeMatch[1];
+        console.log(`  Concat progress: ${timeMatch[1]}`);
+      }
+    });
+    
+    ffmpegProcess.on('close', (code) => {
+      if (code === 0) {
         console.log('  ✓ Concatenation complete');
         resolve(outputPath);
-      })
-      .on('error', (err) => {
-        console.error('Concat error:', err.message);
-        reject(err);
-      })
-      .save(outputPath);
+      } else {
+        reject(new Error(`FFmpeg concat failed with code ${code}`));
+      }
+    });
+    
+    ffmpegProcess.on('error', (err) => {
+      console.error('Concat spawn error:', err.message);
+      reject(err);
+    });
   });
 }
 
@@ -371,12 +343,9 @@ async function combineClipsWithReactions(originalClipPaths, reactionClipPaths, w
     console.log(`Total clips to concatenate: ${processedClips.length}`);
     updateProgress(renderProgress, jobId, 'concatenating', 85);
 
-    const concatFilePath = path.join(workDir, 'concat_list.txt');
-    const concatContent = processedClips.map(p => `file '${p}'`).join('\n');
-    await fs.writeFile(concatFilePath, concatContent);
-
+    // Pass the clip paths directly to concatenateClips (uses concat FILTER now)
     const outputPath = path.join(workDir, 'final_combined.mp4');
-    await concatenateClips(concatFilePath, outputPath);
+    await concatenateClips(processedClips, outputPath);
 
     // Get final file stats
     const stats = await fs.stat(outputPath);
