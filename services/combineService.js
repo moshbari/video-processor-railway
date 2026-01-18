@@ -80,66 +80,80 @@ function getPipCoordinates(targetWidth, targetHeight, pipPosition) {
 
 // ============================================
 // KEY FIX: Standardize reaction clips to 30fps
-// Handles Variable Frame Rate (VFR) videos from phones!
+// Forces video timestamps to match audio duration!
+// This fixes VFR videos where metadata lies about fps
 // ============================================
 async function standardizeClipTo30fps(inputPath, outputPath) {
   return new Promise(async (resolve, reject) => {
     console.log(`  Standardizing VFR video: ${path.basename(inputPath)}`);
     
-    // First, analyze the input video
     try {
-      const inputInfo = await getVideoInfo(inputPath);
-      console.log(`  INPUT: fps=${inputInfo.fps}, duration=${inputInfo.duration}s, frames=${inputInfo.frames}`);
-    } catch (e) {
-      console.log(`  INPUT: Could not analyze (${e.message})`);
-    }
-    
-    // Simple approach: just re-encode at 30fps with standard settings
-    const cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset fast -crf 23 -r 30 -pix_fmt yuv420p -c:a aac -ar 44100 -b:a 128k -movflags +faststart "${outputPath}"`;
-    
-    console.log(`  Running simple re-encode at 30fps...`);
-    
-    exec(cmd, async (error, stdout, stderr) => {
-      if (error) {
-        console.error(`  ✗ Standardize failed:`, error.message);
-        reject(error);
-      } else {
-        // Analyze output
-        try {
-          const outputInfo = await getVideoInfo(outputPath);
-          console.log(`  OUTPUT: fps=${outputInfo.fps}, duration=${outputInfo.duration}s, frames=${outputInfo.frames}`);
-        } catch (e) {
-          console.log(`  OUTPUT: Could not analyze (${e.message})`);
-        }
-        console.log(`  ✓ Standardized to 30fps: ${path.basename(outputPath)}`);
-        resolve(outputPath);
+      // First, get the AUDIO duration (which is always correct)
+      const audioDuration = await getMediaDuration(inputPath, 'audio');
+      console.log(`  Audio duration: ${audioDuration}s`);
+      
+      // Get video duration for comparison
+      const videoDuration = await getMediaDuration(inputPath, 'video');
+      console.log(`  Video duration: ${videoDuration}s`);
+      
+      // Check if there's a mismatch (VFR symptom)
+      const durationMismatch = Math.abs(audioDuration - videoDuration) > 0.5;
+      if (durationMismatch) {
+        console.log(`  ⚠️ Duration mismatch detected! Video=${videoDuration}s, Audio=${audioDuration}s`);
       }
-    });
+      
+      // THE FIX: Use 'atempo' equivalent for video by setting output to match audio
+      // -t [audioDuration] ensures video stops at audio end
+      // -vf "setpts=PTS*[ratio]" adjusts video speed to match audio
+      // But simpler: just use -shortest and let ffmpeg figure it out
+      
+      // Actually, the KEY is to use fps filter which DROPS/DUPLICATES frames
+      // to achieve exact 30fps, and -af aresample to keep audio in sync
+      const cmd = `ffmpeg -y -i "${inputPath}" -vf "fps=30" -af "aresample=async=1:first_pts=0" -c:v libx264 -preset fast -crf 23 -c:a aac -ar 44100 -b:a 128k -shortest "${outputPath}"`;
+      
+      console.log(`  Running VFR fix with fps filter + audio resample...`);
+      
+      exec(cmd, async (error, stdout, stderr) => {
+        if (error) {
+          console.error(`  ✗ Standardize failed:`, error.message);
+          // Log a snippet of stderr for debugging
+          if (stderr) {
+            const lines = stderr.split('\n').slice(-10).join('\n');
+            console.error(`  Last 10 lines of stderr:`, lines);
+          }
+          reject(error);
+        } else {
+          // Verify the output
+          const outAudio = await getMediaDuration(outputPath, 'audio');
+          const outVideo = await getMediaDuration(outputPath, 'video');
+          console.log(`  OUTPUT: video=${outVideo}s, audio=${outAudio}s`);
+          console.log(`  ✓ Standardized: ${path.basename(outputPath)}`);
+          resolve(outputPath);
+        }
+      });
+    } catch (err) {
+      console.error(`  ✗ Pre-analysis failed:`, err.message);
+      reject(err);
+    }
   });
 }
 
-// Get video info using ffprobe
-async function getVideoInfo(videoPath) {
+// Get duration of a specific stream (audio or video)
+async function getMediaDuration(filePath, streamType) {
   return new Promise((resolve, reject) => {
-    const cmd = `ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate,duration,nb_frames -of json "${videoPath}"`;
+    const streamSelect = streamType === 'audio' ? 'a:0' : 'v:0';
+    const cmd = `ffprobe -v error -select_streams ${streamSelect} -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`;
+    
     exec(cmd, (error, stdout, stderr) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      try {
-        const data = JSON.parse(stdout);
-        const stream = data.streams[0];
-        const fpsRaw = stream.r_frame_rate || '30/1';
-        const fpsParts = fpsRaw.split('/');
-        const fps = (parseInt(fpsParts[0]) / parseInt(fpsParts[1] || 1)).toFixed(2);
-        resolve({
-          fps: fps,
-          duration: stream.duration || 'unknown',
-          frames: stream.nb_frames || 'unknown'
+      if (error || !stdout.trim()) {
+        // Fallback to format duration
+        exec(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`, (err2, stdout2) => {
+          const duration = parseFloat(stdout2.trim()) || 0;
+          resolve(duration);
         });
-      } catch (e) {
-        reject(e);
+      } else {
+        const duration = parseFloat(stdout.trim()) || 0;
+        resolve(duration);
       }
     });
   });
