@@ -83,41 +83,65 @@ function getPipCoordinates(targetWidth, targetHeight, pipPosition) {
 // Handles Variable Frame Rate (VFR) videos from phones!
 // ============================================
 async function standardizeClipTo30fps(inputPath, outputPath) {
-  return new Promise((resolve, reject) => {
-    console.log(`  Standardizing VFR video to 30fps CFR: ${path.basename(inputPath)}`);
+  return new Promise(async (resolve, reject) => {
+    console.log(`  Standardizing VFR video: ${path.basename(inputPath)}`);
     
-    // The KEY is using video filter fps=30 with setpts to reset timestamps
-    // This properly handles Variable Frame Rate (VFR) videos from phones
-    // -vf "fps=30,setpts=N/30/TB" = force 30fps and recalculate all timestamps
-    // -af "aresample=async=1000" = resample audio to stay in sync
+    // First, analyze the input video
+    try {
+      const inputInfo = await getVideoInfo(inputPath);
+      console.log(`  INPUT: fps=${inputInfo.fps}, duration=${inputInfo.duration}s, frames=${inputInfo.frames}`);
+    } catch (e) {
+      console.log(`  INPUT: Could not analyze (${e.message})`);
+    }
     
-    ffmpeg(inputPath)
-      .outputOptions([
-        '-vf', 'fps=30,setpts=N/30/TB',    // FORCE 30fps + reset timestamps - KEY FIX!
-        '-af', 'aresample=async=1000',      // Keep audio in sync with video
-        '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
-        '-c:a', 'aac',
-        '-ar', '44100',
-        '-b:a', '128k',
-        '-y'
-      ])
-      .on('start', cmd => console.log(`  Standardize cmd: ${cmd.substring(cmd.length - 100)}`))
-      .on('progress', p => {
-        if (p.percent && p.percent % 25 < 5) {
-          console.log(`    Standardizing: ${Math.round(p.percent)}%`);
+    // Simple approach: just re-encode at 30fps with standard settings
+    const cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset fast -crf 23 -r 30 -pix_fmt yuv420p -c:a aac -ar 44100 -b:a 128k -movflags +faststart "${outputPath}"`;
+    
+    console.log(`  Running simple re-encode at 30fps...`);
+    
+    exec(cmd, async (error, stdout, stderr) => {
+      if (error) {
+        console.error(`  ✗ Standardize failed:`, error.message);
+        reject(error);
+      } else {
+        // Analyze output
+        try {
+          const outputInfo = await getVideoInfo(outputPath);
+          console.log(`  OUTPUT: fps=${outputInfo.fps}, duration=${outputInfo.duration}s, frames=${outputInfo.frames}`);
+        } catch (e) {
+          console.log(`  OUTPUT: Could not analyze (${e.message})`);
         }
-      })
-      .on('end', () => {
-        console.log(`  ✓ Standardized VFR->CFR: ${path.basename(outputPath)}`);
+        console.log(`  ✓ Standardized to 30fps: ${path.basename(outputPath)}`);
         resolve(outputPath);
-      })
-      .on('error', (err) => {
-        console.error(`  ✗ Standardize failed:`, err.message);
-        reject(err);
-      })
-      .save(outputPath);
+      }
+    });
+  });
+}
+
+// Get video info using ffprobe
+async function getVideoInfo(videoPath) {
+  return new Promise((resolve, reject) => {
+    const cmd = `ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate,duration,nb_frames -of json "${videoPath}"`;
+    exec(cmd, (error, stdout, stderr) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      try {
+        const data = JSON.parse(stdout);
+        const stream = data.streams[0];
+        const fpsRaw = stream.r_frame_rate || '30/1';
+        const fpsParts = fpsRaw.split('/');
+        const fps = (parseInt(fpsParts[0]) / parseInt(fpsParts[1] || 1)).toFixed(2);
+        resolve({
+          fps: fps,
+          duration: stream.duration || 'unknown',
+          frames: stream.nb_frames || 'unknown'
+        });
+      } catch (e) {
+        reject(e);
+      }
+    });
   });
 }
 
