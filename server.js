@@ -24,6 +24,7 @@ const transcribeRoutes = require('./routes/transcribe');
 const uploadRoutes = require('./routes/upload');
 const voiceRoutes = require('./routes/voice');
 const imageOverlayRoutes = require('./routes/imageOverlay');
+const webinarRoutes = require('./routes/webinar');
 
 // Import services
 const cleanupService = require('./services/cleanupService');
@@ -88,6 +89,7 @@ app.use('/api/transcribe', transcribeRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/voice', voiceRoutes);
 app.use('/api/image-overlay', imageOverlayRoutes);
+app.use('/api/webinar', webinarRoutes);
 
 // Error handling for multer
 app.use((err, req, res, next) => {
