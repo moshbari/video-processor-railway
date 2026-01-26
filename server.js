@@ -23,6 +23,7 @@ const splitReactRoutes = require('./routes/splitReact');
 const transcribeRoutes = require('./routes/transcribe');
 const uploadRoutes = require('./routes/upload');
 const voiceRoutes = require('./routes/voice');
+const imageOverlayRoutes = require('./routes/imageOverlay');
 
 // Import services
 const cleanupService = require('./services/cleanupService');
@@ -86,6 +87,7 @@ app.use('/api/split-react', splitReactRoutes);
 app.use('/api/transcribe', transcribeRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/voice', voiceRoutes);
+app.use('/api/image-overlay', imageOverlayRoutes);
 
 // Error handling for multer
 app.use((err, req, res, next) => {
