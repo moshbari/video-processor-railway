@@ -100,20 +100,17 @@ router.post('/', upload.fields([
     const r2Key = `image-overlay/${jobId}/${outputFilename}`;
     console.log(`[${jobId}] Uploading to R2: ${r2Key}`);
     
-    await r2Service.uploadFile(result.outputPath, r2Key);
-
-    // Get download URL
-    const downloadUrl = await r2Service.getSignedUrl(r2Key, 7 * 24 * 60 * 60); // 7 days
+    const uploadResult = await r2Service.uploadFile(result.outputPath, r2Key, 'video/mp4');
 
     // Clean up local files
     await imageOverlayService.cleanup(jobId);
 
-    console.log(`[${jobId}] Complete! Download URL generated`);
+    console.log(`[${jobId}] Complete! Download URL: ${uploadResult.downloadUrl}`);
 
     res.json({
       success: true,
       jobId,
-      downloadUrl,
+      downloadUrl: uploadResult.downloadUrl,
       filename: outputFilename,
       message: 'Overlay applied successfully. Download link valid for 7 days.'
     });
