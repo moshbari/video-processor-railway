@@ -29,7 +29,14 @@ const storage = multer.diskStorage({
     cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
-    const uniqueName = `${Date.now()}_${file.originalname}`;
+    // Sanitize filename: remove spaces and special characters
+    const sanitized = file.originalname
+      .replace(/[^a-zA-Z0-9._-]/g, '_')  // Replace special chars with underscore
+      .replace(/_+/g, '_')                // Remove multiple underscores
+      .replace(/^_|_$/g, '');             // Remove leading/trailing underscores
+    
+    const uniqueName = `${Date.now()}_${sanitized}`;
+    console.log(`[Upload] Sanitized filename: ${file.originalname} -> ${uniqueName}`);
     cb(null, uniqueName);
   }
 });
