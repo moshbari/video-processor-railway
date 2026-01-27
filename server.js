@@ -136,7 +136,7 @@ app.use((err, req, res, next) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`\n${'='.repeat(60)}`);
   console.log(`⚡ RANT SQUAD VIDEO PROCESSOR API - STAGING`);
   console.log(`${'='.repeat(60)}`);
@@ -157,3 +157,8 @@ app.listen(PORT, () => {
   console.log(`   GET  /health                - Health check`);
   console.log(`${'='.repeat(60)}\n`);
 });
+
+// Set longer timeouts for large file uploads (30 minutes)
+server.timeout = 30 * 60 * 1000;
+server.keepAliveTimeout = 30 * 60 * 1000;
+server.headersTimeout = 31 * 60 * 1000;
