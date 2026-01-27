@@ -1,9 +1,8 @@
 /**
  * ⚡ RANT SQUAD VIDEO PROCESSOR API ⚡
  * 
- * Complete server.js with all routes including Split React
+ * Complete server.js with all routes including Split React and Webinar
  */
-
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -19,7 +18,9 @@ const combineRoutes = require('./routes/combine');
 const adminRoutes = require('./routes/admin');
 const uploadRoutes = require('./routes/upload');
 const singleReactionRoutes = require('./routes/singleReaction');
-const splitReactRoutes = require('./routes/splitReact');  // ⚡ SPLIT REACT (NEW!)
+const splitReactRoutes = require('./routes/splitReact');
+const imageOverlayRoutes = require('./routes/imageOverlay');
+const webinarRoutes = require('./routes/webinar');
 
 // Import services
 const cleanupService = require('./services/cleanupService');
@@ -43,8 +44,19 @@ ensureDirs();
 // Start cleanup service (runs every hour, deletes files older than 24h)
 cleanupService.startAutoCleanup();
 
-// Middleware
-app.use(cors());
+// Middleware - CORS configured for all domains
+app.use(cors({
+  origin: [
+    'https://devrant.99dfy.com',
+    'https://rantsquad.99dfy.com',
+    'http://localhost:3000',
+    'http://localhost:5173',
+    'http://localhost:8080'
+  ],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Id']
+}));
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
@@ -62,7 +74,9 @@ app.get('/health', (req, res) => {
       cleanup: 'active',
       upload: 'active',
       'single-reaction': 'active',
-      'split-react': 'active'  // ⚡ SPLIT REACT (NEW!)
+      'split-react': 'active',
+      'image-overlay': 'active',
+      'webinar': 'active'
     }
   });
 });
@@ -77,14 +91,16 @@ app.use('/api/combine', combineRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/single-reaction', singleReactionRoutes);
-app.use('/api/split-react', splitReactRoutes);  // ⚡ SPLIT REACT (NEW!)
+app.use('/api/split-react', splitReactRoutes);
+app.use('/api/image-overlay', imageOverlayRoutes);
+app.use('/api/webinar', webinarRoutes);
 
 // Error handling for multer
 app.use((err, req, res, next) => {
   if (err.code === 'LIMIT_FILE_SIZE') {
     return res.status(413).json({
       success: false,
-      error: 'File too large. Maximum size is 500MB.'
+      error: 'File too large. Maximum size is 10GB.'
     });
   }
   if (err.code === 'LIMIT_FILE_COUNT') {
@@ -122,7 +138,11 @@ app.listen(PORT, () => {
   console.log('  POST /api/combine/from-split/:splitJobId');
   console.log('  POST /api/upload');
   console.log('  POST /api/single-reaction/*');
-  console.log('  POST /api/split-react/*        ← ⚡ SPLIT REACT (NEW!)');
+  console.log('  POST /api/split-react/*');
+  console.log('  POST /api/image-overlay');
+  console.log('  POST /api/webinar');
+  console.log('  GET  /api/webinar/jobs');
+  console.log('  GET  /api/webinar/status/:jobId');
   console.log('  GET  /api/combine/:jobId/download');
   console.log('  GET  /api/split/:jobId/download');
   console.log('  GET  /api/jobs/:jobId/download');
