@@ -2,7 +2,7 @@
  * ⚡ RANT SQUAD VIDEO PROCESSOR API ⚡
  * 
  * Server.js for STAGING environment
- * Includes Audio-Only RANT feature
+ * Includes Audio-Only RANT feature + Multi-file Webinar
  */
 
 const express = require('express');
@@ -25,6 +25,7 @@ const uploadRoutes = require('./routes/upload');
 const voiceRoutes = require('./routes/voice');
 const imageOverlayRoutes = require('./routes/imageOverlay');
 const webinarRoutes = require('./routes/webinar');
+const webinarMultiRoutes = require('./routes/webinarMulti');  // 📁 MULTI-FILE WEBINAR
 
 // Import services
 const cleanupService = require('./services/cleanupService');
@@ -37,7 +38,9 @@ const ensureDirs = async () => {
   const dirs = [
     process.env.OUTPUT_DIR || '/app/outputs',
     process.env.TEMP_DIR || '/app/temp',
-    path.join(process.env.TEMP_DIR || '/app/temp', 'uploads')
+    path.join(process.env.TEMP_DIR || '/app/temp', 'uploads'),
+    path.join(process.env.TEMP_DIR || '/app/temp', 'webinar-sessions'),
+    path.join(process.env.TEMP_DIR || '/app/temp', 'webinar-render')
   ];
   for (const dir of dirs) {
     await fs.ensureDir(dir);
@@ -72,7 +75,7 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     services: {
       admin: 'active',
-      audioReaction: 'active',  // 🎙️ NEW!
+      audioReaction: 'active',
       combine: 'active',
       download: 'active',
       jobs: 'active',
@@ -82,14 +85,15 @@ app.get('/health', (req, res) => {
       splitReact: 'active',
       transcribe: 'active',
       upload: 'active',
-      voice: 'active'
+      voice: 'active',
+      webinarMulti: 'active'  // 📁 NEW!
     }
   });
 });
 
 // Routes
 app.use('/api/admin', adminRoutes);
-app.use('/api/audio-reaction', audioReactionRoutes);  // 🎙️ AUDIO-ONLY RANT
+app.use('/api/audio-reaction', audioReactionRoutes);
 app.use('/api/combine', combineRoutes);
 app.use('/api/download', downloadRoutes);
 app.use('/api/jobs', jobsRoutes);
@@ -102,13 +106,14 @@ app.use('/api/upload', uploadRoutes);
 app.use('/api/voice', voiceRoutes);
 app.use('/api/image-overlay', imageOverlayRoutes);
 app.use('/api/webinar', webinarRoutes);
+app.use('/api/webinar-multi', webinarMultiRoutes);  // 📁 MULTI-FILE WEBINAR
 
 // Error handling for multer
 app.use((err, req, res, next) => {
   if (err.code === 'LIMIT_FILE_SIZE') {
     return res.status(413).json({
       success: false,
-      error: 'File too large. Maximum size is 500MB.'
+      error: 'File too large. Maximum size is 5GB per file.'
     });
   }
   if (err.code === 'LIMIT_FILE_COUNT') {
@@ -143,7 +148,7 @@ const server = app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`\n📡 Available endpoints:`);
   console.log(`   POST /api/admin             - Admin functions`);
-  console.log(`   POST /api/audio-reaction    - 🎙️ Audio-Only RANT (NEW!)`);
+  console.log(`   POST /api/audio-reaction    - 🎙️ Audio-Only RANT`);
   console.log(`   POST /api/combine           - Combine clips with reactions`);
   console.log(`   POST /api/download          - Download video from URL`);
   console.log(`   GET  /api/jobs              - Job status`);
@@ -154,11 +159,12 @@ const server = app.listen(PORT, () => {
   console.log(`   POST /api/transcribe        - Transcribe video audio`);
   console.log(`   POST /api/upload            - Upload video directly`);
   console.log(`   POST /api/voice             - Voice synthesis`);
+  console.log(`   POST /api/webinar-multi     - 📁 Multi-file Webinar (NEW!)`);
   console.log(`   GET  /health                - Health check`);
   console.log(`${'='.repeat(60)}\n`);
 });
 
-// Set longer timeouts for large file uploads (30 minutes)
-server.timeout = 30 * 60 * 1000;
-server.keepAliveTimeout = 30 * 60 * 1000;
-server.headersTimeout = 31 * 60 * 1000;
+// Set longer timeouts for large file uploads (10 minutes)
+server.timeout = 10 * 60 * 1000;
+server.keepAliveTimeout = 10 * 60 * 1000;
+server.headersTimeout = 11 * 60 * 1000;
