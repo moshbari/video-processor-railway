@@ -338,9 +338,11 @@ class WebinarMultiService {
 
   /**
    * Apply full-frame image overlay to video
+   * Scales overlay to match video dimensions
    */
   async applyOverlay(videoPath, imagePath, outputPath, jobId) {
-    const command = `ffmpeg -y -i "${videoPath}" -i "${imagePath}" -filter_complex "[1:v]scale=iw:ih[ovr];[0:v][ovr]overlay=0:0:format=auto" -c:v libx264 -preset medium -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
+    // Use scale2ref to scale overlay image to match video dimensions
+    const command = `ffmpeg -y -i "${videoPath}" -i "${imagePath}" -filter_complex "[0:v][1:v]scale2ref[base][ovr];[base][ovr]overlay=0:0:format=auto" -c:v libx264 -preset medium -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
     
     console.log(`[${jobId}] Applying overlay...`);
     await this.runCommand(command, jobId);
