@@ -7,13 +7,21 @@ const { v4: uuidv4 } = require('uuid');
 const webinarService = require('../services/webinarService');
 const r2Service = require('../services/r2Service');
 
-// Configure multer for file uploads
+// Increase timeout for large file uploads (30 minutes)
+router.use((req, res, next) => {
+  req.setTimeout(30 * 60 * 1000); // 30 minutes
+  res.setTimeout(30 * 60 * 1000); // 30 minutes
+  next();
+});
+
+// Configure multer for file uploads - using disk storage to avoid memory issues
 const storage = multer.diskStorage({
   destination: async (req, file, cb) => {
     const jobId = req.jobId || uuidv4();
     req.jobId = jobId;
     const uploadDir = path.join(process.env.TEMP_DIR || '/app/temp', jobId);
     await fs.ensureDir(uploadDir);
+    console.log(`[${jobId}] Receiving file: ${file.originalname} (${file.fieldname})`);
     cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
@@ -32,7 +40,10 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 10 * 1024 * 1024 * 1024 }, // 10GB max per file
+  limits: { 
+    fileSize: 10 * 1024 * 1024 * 1024, // 10GB max per file
+    fieldSize: 10 * 1024 * 1024 * 1024  // 10GB field size
+  },
   fileFilter: (req, file, cb) => {
     if (file.fieldname === 'video1' || file.fieldname === 'video2') {
       const videoTypes = /mp4|mov|avi|webm|mkv/i;
