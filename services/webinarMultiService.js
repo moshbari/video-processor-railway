@@ -189,16 +189,28 @@ class WebinarMultiService {
   }
 
   /**
-   * Clean up session
+   * Clean up session (delete all files and remove from memory)
    */
   async cleanupSession(sessionId) {
     const session = this.sessions.get(sessionId);
     if (session && session.sessionDir) {
       try {
         await fs.remove(session.sessionDir);
-      } catch (e) { /* ignore */ }
+        console.log(`[Session] Cleaned up session directory: ${sessionId}`);
+      } catch (e) { 
+        console.error(`[Session] Error cleaning up directory:`, e.message);
+      }
     }
     this.sessions.delete(sessionId);
+    console.log(`[Session] Deleted session from memory: ${sessionId}`);
+  }
+
+  /**
+   * Delete a session explicitly (called when user starts new project)
+   */
+  async deleteSession(sessionId) {
+    await this.cleanupSession(sessionId);
+    return { success: true, message: 'Session deleted' };
   }
 
   // ============================================
