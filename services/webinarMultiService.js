@@ -8,6 +8,48 @@ class WebinarMultiService {
     this.tempDir = process.env.TEMP_DIR || '/app/temp';
     this.sessions = new Map(); // Store session data (uploaded files)
     this.jobs = new Map(); // Store render job status
+    this.jobsFilePath = path.join(this.tempDir, 'webinar-jobs.json');
+    
+    // Load persisted jobs on startup
+    this.loadJobsFromFile();
+  }
+
+  // ============================================
+  // JOBS PERSISTENCE
+  // ============================================
+
+  /**
+   * Load jobs from file on startup
+   */
+  async loadJobsFromFile() {
+    try {
+      if (await fs.pathExists(this.jobsFilePath)) {
+        const data = await fs.readJson(this.jobsFilePath);
+        if (data && typeof data === 'object') {
+          Object.entries(data).forEach(([jobId, job]) => {
+            this.jobs.set(jobId, job);
+          });
+          console.log(`[Jobs] Loaded ${this.jobs.size} jobs from file`);
+        }
+      }
+    } catch (error) {
+      console.error('[Jobs] Error loading jobs from file:', error.message);
+    }
+  }
+
+  /**
+   * Save jobs to file for persistence
+   */
+  async saveJobsToFile() {
+    try {
+      const jobsObj = {};
+      this.jobs.forEach((job, jobId) => {
+        jobsObj[jobId] = job;
+      });
+      await fs.writeJson(this.jobsFilePath, jobsObj, { spaces: 2 });
+    } catch (error) {
+      console.error('[Jobs] Error saving jobs to file:', error.message);
+    }
   }
 
   // ============================================
@@ -188,6 +230,9 @@ class WebinarMultiService {
   updateJobStatus(jobId, updates) {
     const job = this.jobs.get(jobId) || {};
     this.jobs.set(jobId, { ...job, ...updates, updatedAt: new Date().toISOString() });
+    
+    // Persist to file
+    this.saveJobsToFile();
   }
 
   // ============================================
@@ -380,14 +425,16 @@ class WebinarMultiService {
   }
 
   /**
-   * Remove old jobs/sessions from memory
+   * Remove old jobs/sessions from memory (keep 7 days to match R2 retention)
    */
   cleanupOldData() {
     const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+    let cleaned = 0;
     
     this.jobs.forEach((job, jobId) => {
       if (new Date(job.createdAt).getTime() < sevenDaysAgo) {
         this.jobs.delete(jobId);
+        cleaned++;
       }
     });
 
@@ -396,6 +443,11 @@ class WebinarMultiService {
         this.cleanupSession(sessionId);
       }
     });
+    
+    if (cleaned > 0) {
+      console.log(`[Jobs] Cleaned up ${cleaned} old jobs`);
+      this.saveJobsToFile();
+    }
   }
 }
 
