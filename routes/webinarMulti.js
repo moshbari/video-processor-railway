@@ -141,6 +141,31 @@ router.get('/session/:sessionId', (req, res) => {
   });
 });
 
+/**
+ * DELETE /api/webinar-multi/session/:sessionId
+ * Delete a session and all its files (used when starting new project)
+ */
+router.delete('/session/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+  
+  console.log(`[Session] Deleting session: ${sessionId}`);
+
+  try {
+    await webinarMultiService.deleteSession(sessionId);
+    
+    res.json({
+      success: true,
+      message: 'Session deleted successfully'
+    });
+  } catch (error) {
+    console.error(`[Session] Error deleting session:`, error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 // ============================================
 // FILE UPLOAD ENDPOINTS
 // ============================================
