@@ -12,6 +12,38 @@ class WebinarMultiService {
     
     // Load persisted jobs on startup
     this.loadJobsFromFile();
+    
+    // Clean up orphaned session directories on startup
+    this.cleanupOrphanedSessions();
+  }
+
+  // ============================================
+  // STARTUP CLEANUP
+  // ============================================
+
+  /**
+   * Clean up orphaned session directories on startup
+   * This prevents old files from being used in new sessions
+   */
+  async cleanupOrphanedSessions() {
+    const sessionsDir = path.join(this.tempDir, 'webinar-sessions');
+    try {
+      if (await fs.pathExists(sessionsDir)) {
+        const dirs = await fs.readdir(sessionsDir);
+        for (const dir of dirs) {
+          const dirPath = path.join(sessionsDir, dir);
+          const stat = await fs.stat(dirPath);
+          if (stat.isDirectory()) {
+            // Delete all session directories on startup
+            // (they're orphaned since sessions Map is empty on restart)
+            await fs.remove(dirPath);
+            console.log(`[Startup] Cleaned up orphaned session: ${dir}`);
+          }
+        }
+      }
+    } catch (error) {
+      console.error('[Startup] Error cleaning orphaned sessions:', error.message);
+    }
   }
 
   // ============================================
