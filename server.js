@@ -114,7 +114,7 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log('');
   console.log('⚡ RANT SQUAD VIDEO PROCESSOR API ⚡');
-  console.log`Listening on port ${PORT}`);
+  console.log(`Listening on port ${PORT}`);
   console.log('');
   console.log('Available endpoints:');
   console.log('  POST /api/download');
