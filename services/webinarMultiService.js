@@ -153,13 +153,17 @@ class WebinarMultiService {
    * Extract order number from filename (e.g., "clip_3.mp4" -> 3)
    */
   extractOrderFromFilename(filename) {
-    // Try to find last number in filename before extension
+    // Extract the FIRST number at the START of the filename
+    // This handles: "1-intro.mp4", "2-main.mp4", "10-outro.mp4", "5-3P.mp4"
     const nameWithoutExt = filename.replace(/\.[^/.]+$/, '');
-    const matches = nameWithoutExt.match(/(\d+)[^\d]*$/);
+    const matches = nameWithoutExt.match(/^(\d+)/);  // Match digits at START
     if (matches) {
-      return parseInt(matches[1], 10);
+      const order = parseInt(matches[1], 10);
+      console.log(`[Order] Extracted order ${order} from filename: ${filename}`);
+      return order;
     }
-    // If no number found, return high number to put at end
+    // If no number at start, return high number to put at end
+    console.log(`[Order] No number at start of filename: ${filename}, using 9999`);
     return 9999;
   }
 
