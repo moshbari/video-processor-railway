@@ -36,6 +36,7 @@ const splitReactService = require('../services/splitReactService');
 const downloadService = require('../services/downloadService');
 const r2Service = require('../services/r2Service');
 const projectMetadataService = require('../services/projectMetadataService');
+const errorHandler = require('../services/errorHandler');
 
 // Store for pre-fetched videos (in-memory, cleared on restart)
 // Key: fetchId, Value: { filePath, originalUrl, fetchedAt, title, duration }
@@ -99,7 +100,7 @@ router.post('/fetch-main', async (req, res) => {
     if (!videoUrl) {
       return res.status(400).json({
         success: false,
-        error: 'videoUrl is required'
+        error: 'Please provide a video URL'
       });
     }
 
@@ -139,10 +140,8 @@ router.post('/fetch-main', async (req, res) => {
 
   } catch (error) {
     console.error('[Split React] Fetch main video error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to fetch video'
-    });
+    const errorResponse = errorHandler.formatErrorResponse(error);
+    res.status(500).json(errorResponse);
   }
 });
 
@@ -186,21 +185,21 @@ router.post('/from-url', upload.fields([
     if (!videoUrl) {
       return res.status(400).json({
         success: false,
-        error: 'videoUrl is required'
+        error: 'Please provide a video URL'
       });
     }
 
     if (!watchClipPath) {
       return res.status(400).json({
         success: false,
-        error: 'watchClip file is required (your video watching the content)'
+        error: 'Please upload your Watch Clip (the video of you watching the content)'
       });
     }
 
     if (!reactClipPath) {
       return res.status(400).json({
         success: false,
-        error: 'reactClip file is required (your reaction video)'
+        error: 'Please upload your React Clip (your reaction video)'
       });
     }
 
@@ -208,7 +207,7 @@ router.post('/from-url', upload.fields([
     if (!['watchReact', 'faceCam'].includes(layoutMode)) {
       return res.status(400).json({
         success: false,
-        error: 'layoutMode must be "watchReact" or "faceCam"'
+        error: 'Please select a valid layout mode (Watch & React or Face Cam)'
       });
     }
 
@@ -336,10 +335,8 @@ router.post('/from-url', upload.fields([
     if (req.files?.watchClip?.[0]?.path) await fs.remove(req.files.watchClip[0].path).catch(() => {});
     if (req.files?.reactClip?.[0]?.path) await fs.remove(req.files.reactClip[0].path).catch(() => {});
     
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to create Split React video'
-    });
+    const errorResponse = errorHandler.formatErrorResponse(error);
+    res.status(500).json(errorResponse);
   }
 });
 
@@ -386,21 +383,21 @@ router.post('/from-upload', upload.fields([
     if (!mainVideoPath) {
       return res.status(400).json({
         success: false,
-        error: 'mainVideo file is required'
+        error: 'Please upload the main video you want to react to'
       });
     }
 
     if (!watchClipPath) {
       return res.status(400).json({
         success: false,
-        error: 'watchClip file is required (your video watching the content)'
+        error: 'Please upload your Watch Clip (the video of you watching the content)'
       });
     }
 
     if (!reactClipPath) {
       return res.status(400).json({
         success: false,
-        error: 'reactClip file is required (your reaction video)'
+        error: 'Please upload your React Clip (your reaction video)'
       });
     }
 
@@ -408,7 +405,7 @@ router.post('/from-upload', upload.fields([
     if (!['watchReact', 'faceCam'].includes(layoutMode)) {
       return res.status(400).json({
         success: false,
-        error: 'layoutMode must be "watchReact" or "faceCam"'
+        error: 'Please select a valid layout mode (Watch & React or Face Cam)'
       });
     }
 
@@ -530,10 +527,8 @@ router.post('/from-upload', upload.fields([
     if (req.files?.watchClip?.[0]?.path) await fs.remove(req.files.watchClip[0].path).catch(() => {});
     if (req.files?.reactClip?.[0]?.path) await fs.remove(req.files.reactClip[0].path).catch(() => {});
     
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to create Split React video'
-    });
+    const errorResponse = errorHandler.formatErrorResponse(error);
+    res.status(500).json(errorResponse);
   }
 });
 
@@ -575,7 +570,7 @@ router.post('/from-fetched', upload.fields([
     if (!fetchId) {
       return res.status(400).json({
         success: false,
-        error: 'fetchId is required (from /fetch-main endpoint)'
+        error: 'Video not loaded. Please fetch the video first by pasting the URL.'
       });
     }
 
@@ -583,21 +578,21 @@ router.post('/from-fetched', upload.fields([
     if (!fetchedData) {
       return res.status(404).json({
         success: false,
-        error: 'Fetched video not found or expired. Please fetch the video again.'
+        error: 'The fetched video has expired. Please paste the URL again to reload it.'
       });
     }
 
     if (!watchClipPath) {
       return res.status(400).json({
         success: false,
-        error: 'watchClip file is required (your video watching the content)'
+        error: 'Please upload your Watch Clip (the video of you watching the content)'
       });
     }
 
     if (!reactClipPath) {
       return res.status(400).json({
         success: false,
-        error: 'reactClip file is required (your reaction video)'
+        error: 'Please upload your React Clip (your reaction video)'
       });
     }
 
@@ -605,7 +600,7 @@ router.post('/from-fetched', upload.fields([
     if (!['watchReact', 'faceCam'].includes(layoutMode)) {
       return res.status(400).json({
         success: false,
-        error: 'layoutMode must be "watchReact" or "faceCam"'
+        error: 'Please select a valid layout mode (Watch & React or Face Cam)'
       });
     }
 
@@ -731,10 +726,8 @@ router.post('/from-fetched', upload.fields([
     if (req.files?.watchClip?.[0]?.path) await fs.remove(req.files.watchClip[0].path).catch(() => {});
     if (req.files?.reactClip?.[0]?.path) await fs.remove(req.files.reactClip[0].path).catch(() => {});
     
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to create Split React video'
-    });
+    const errorResponse = errorHandler.formatErrorResponse(error);
+    res.status(500).json(errorResponse);
   }
 });
 
@@ -760,10 +753,8 @@ router.get('/projects', async (req, res) => {
     });
   } catch (error) {
     console.error('[Split React] List projects error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    const errorResponse = errorHandler.formatErrorResponse(error);
+    res.status(500).json(errorResponse);
   }
 });
 
@@ -779,7 +770,7 @@ router.get('/projects/:projectId', async (req, res) => {
     if (!project) {
       return res.status(404).json({
         success: false,
-        error: 'Project not found'
+        error: 'Project not found. It may have been deleted.'
       });
     }
 
@@ -789,10 +780,8 @@ router.get('/projects/:projectId', async (req, res) => {
     });
   } catch (error) {
     console.error('[Split React] Get project error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    const errorResponse = errorHandler.formatErrorResponse(error);
+    res.status(500).json(errorResponse);
   }
 });
 
@@ -815,14 +804,12 @@ router.delete('/projects/:projectId', async (req, res) => {
     
     res.json({
       success: true,
-      message: `Project ${projectId} deleted`
+      message: 'Project deleted successfully'
     });
   } catch (error) {
     console.error('[Split React] Delete project error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    const errorResponse = errorHandler.formatErrorResponse(error);
+    res.status(500).json(errorResponse);
   }
 });
 
@@ -868,10 +855,8 @@ router.get('/:jobId/download', async (req, res) => {
     
   } catch (error) {
     console.error('[Split React] Download error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    const errorResponse = errorHandler.formatErrorResponse(error);
+    res.status(500).json(errorResponse);
   }
 });
 
@@ -922,16 +907,14 @@ router.get('/:jobId/force-download', async (req, res) => {
       console.error('[Split React] R2 fetch error:', r2Error);
       res.status(404).json({
         success: false,
-        error: 'Video not found or expired'
+        error: 'Video not found. It may have expired after 7 days. Please create a new project.'
       });
     }
     
   } catch (error) {
     console.error('[Split React] Force download error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    const errorResponse = errorHandler.formatErrorResponse(error);
+    res.status(500).json(errorResponse);
   }
 });
 
@@ -970,10 +953,8 @@ router.get('/:jobId/status', async (req, res) => {
     
   } catch (error) {
     console.error('[Split React] Status check error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    const errorResponse = errorHandler.formatErrorResponse(error);
+    res.status(500).json(errorResponse);
   }
 });
 
@@ -988,15 +969,13 @@ router.delete('/:jobId', async (req, res) => {
     
     res.json({
       success: true,
-      message: `Job ${jobId} cleaned up`
+      message: 'Files cleaned up successfully'
     });
     
   } catch (error) {
     console.error('[Split React] Cleanup error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    const errorResponse = errorHandler.formatErrorResponse(error);
+    res.status(500).json(errorResponse);
   }
 });
 
