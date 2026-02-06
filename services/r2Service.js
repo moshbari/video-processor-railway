@@ -272,6 +272,16 @@ class R2Service {
   }
 
   /**
+   * Get the public URL for an R2 key
+   */
+  getPublicUrl(key) {
+    if (this.publicUrl) {
+      return `${this.publicUrl}/${key}`;
+    }
+    return `https://pub-${process.env.R2_ACCOUNT_ID}.r2.dev/${key}`;
+  }
+
+  /**
    * Delete a file from R2
    */
   async deleteFile(fileName) {
