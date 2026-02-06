@@ -1,8 +1,8 @@
 /**
  * ⚡ RANT SQUAD VIDEO PROCESSOR API ⚡
  * 
- * Server.js for STAGING environment
- * Includes Audio-Only RANT feature + Multi-file Webinar
+ * Server.js - Production
+ * Includes all features + Clip Library
  */
 
 const express = require('express');
@@ -12,7 +12,7 @@ const fs = require('fs-extra');
 
 // Import routes (ONLY files that exist in /routes folder)
 const adminRoutes = require('./routes/admin');
-const audioReactionRoutes = require('./routes/audioReaction');  // 🎙️ AUDIO-ONLY RANT
+const audioReactionRoutes = require('./routes/audioReaction');
 const combineRoutes = require('./routes/combine');
 const downloadRoutes = require('./routes/download');
 const jobsRoutes = require('./routes/jobs');
@@ -25,7 +25,8 @@ const uploadRoutes = require('./routes/upload');
 const voiceRoutes = require('./routes/voice');
 const imageOverlayRoutes = require('./routes/imageOverlay');
 const webinarRoutes = require('./routes/webinar');
-const webinarMultiRoutes = require('./routes/webinarMulti');  // 📁 MULTI-FILE WEBINAR
+const webinarMultiRoutes = require('./routes/webinarMulti');
+const clipLibraryRoutes = require('./routes/clipLibrary');  // 📚 CLIP LIBRARY
 
 // Import services
 const cleanupService = require('./services/cleanupService');
@@ -40,7 +41,9 @@ const ensureDirs = async () => {
     process.env.TEMP_DIR || '/app/temp',
     path.join(process.env.TEMP_DIR || '/app/temp', 'uploads'),
     path.join(process.env.TEMP_DIR || '/app/temp', 'webinar-sessions'),
-    path.join(process.env.TEMP_DIR || '/app/temp', 'webinar-render')
+    path.join(process.env.TEMP_DIR || '/app/temp', 'webinar-render'),
+    path.join(process.env.TEMP_DIR || '/app/temp', 'library-uploads'),
+    path.join(process.env.TEMP_DIR || '/app/temp', 'library-thumbs')
   ];
   for (const dir of dirs) {
     await fs.ensureDir(dir);
@@ -51,40 +54,19 @@ ensureDirs();
 // Start cleanup service (runs every hour, deletes files older than 24h)
 cleanupService.startAutoCleanup();
 
-// Middleware - CORS Configuration (permissive for file uploads)
-const corsOptions = {
-  origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or Postman)
-    if (!origin) return callback(null, true);
-    
-    const allowedOrigins = [
-      'https://devrant.99dfy.com',
-      'https://rantsquad.99dfy.com',
-      'http://localhost:3000',
-      'http://localhost:5173',
-      'http://localhost:8080'
-    ];
-    
-    if (allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      console.log('CORS blocked origin:', origin);
-      callback(null, true); // Allow anyway for debugging - change to false in production
-    }
-  },
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Id', 'Accept', 'Origin', 'X-Requested-With'],
-  exposedHeaders: ['Content-Length', 'Content-Type'],
-  credentials: true,
-  maxAge: 86400, // Cache preflight for 24 hours
-  preflightContinue: false,
-  optionsSuccessStatus: 204
-};
-
-app.use(cors(corsOptions));
-
-// Handle preflight requests explicitly for all routes
-app.options('*', cors(corsOptions));
+// Middleware - CORS Configuration
+app.use(cors({
+  origin: [
+    'https://devrant.99dfy.com',
+    'https://rantsquad.99dfy.com',
+    'http://localhost:3000',
+    'http://localhost:5173',
+    'http://localhost:8080'
+  ],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Id'],
+  credentials: true
+}));
 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
@@ -97,6 +79,7 @@ app.get('/health', (req, res) => {
     services: {
       admin: 'active',
       audioReaction: 'active',
+      clipLibrary: 'active',    // 📚 NEW!
       combine: 'active',
       download: 'active',
       jobs: 'active',
@@ -107,7 +90,7 @@ app.get('/health', (req, res) => {
       transcribe: 'active',
       upload: 'active',
       voice: 'active',
-      webinarMulti: 'active'  // 📁 NEW!
+      webinarMulti: 'active'
     }
   });
 });
@@ -115,6 +98,7 @@ app.get('/health', (req, res) => {
 // Routes
 app.use('/api/admin', adminRoutes);
 app.use('/api/audio-reaction', audioReactionRoutes);
+app.use('/api/clip-library', clipLibraryRoutes);  // 📚 CLIP LIBRARY
 app.use('/api/combine', combineRoutes);
 app.use('/api/download', downloadRoutes);
 app.use('/api/jobs', jobsRoutes);
@@ -127,7 +111,7 @@ app.use('/api/upload', uploadRoutes);
 app.use('/api/voice', voiceRoutes);
 app.use('/api/image-overlay', imageOverlayRoutes);
 app.use('/api/webinar', webinarRoutes);
-app.use('/api/webinar-multi', webinarMultiRoutes);  // 📁 MULTI-FILE WEBINAR
+app.use('/api/webinar-multi', webinarMultiRoutes);
 
 // Error handling for multer
 app.use((err, req, res, next) => {
@@ -140,52 +124,25 @@ app.use((err, req, res, next) => {
   if (err.code === 'LIMIT_FILE_COUNT') {
     return res.status(400).json({
       success: false,
-      error: 'Too many files. Maximum is 20 files.'
+      error: 'Too many files.'
     });
   }
-  if (err.message) {
-    return res.status(400).json({
-      success: false,
-      error: err.message
-    });
-  }
-  next(err);
-});
-
-// General error handling
-app.use((err, req, res, next) => {
   console.error('Server error:', err);
   res.status(500).json({
     success: false,
-    error: 'Internal server error'
+    error: err.message || 'Server error'
   });
 });
 
 // Start server
-const server = app.listen(PORT, () => {
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`⚡ RANT SQUAD VIDEO PROCESSOR API - STAGING`);
-  console.log(`${'='.repeat(60)}`);
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`\n📡 Available endpoints:`);
-  console.log(`   POST /api/admin             - Admin functions`);
-  console.log(`   POST /api/audio-reaction    - 🎙️ Audio-Only RANT`);
-  console.log(`   POST /api/combine           - Combine clips with reactions`);
-  console.log(`   POST /api/download          - Download video from URL`);
-  console.log(`   GET  /api/jobs              - Job status`);
-  console.log(`   POST /api/render            - Render reaction video`);
-  console.log(`   POST /api/single-reaction   - Single reaction video`);
-  console.log(`   POST /api/split             - Split video at timestamps`);
-  console.log(`   POST /api/split-react       - Split React feature`);
-  console.log(`   POST /api/transcribe        - Transcribe video audio`);
-  console.log(`   POST /api/upload            - Upload video directly`);
-  console.log(`   POST /api/voice             - Voice synthesis`);
-  console.log(`   POST /api/webinar-multi     - 📁 Multi-file Webinar (NEW!)`);
-  console.log(`   GET  /health                - Health check`);
-  console.log(`${'='.repeat(60)}\n`);
+app.listen(PORT, () => {
+  console.log(`⚡ RANT SQUAD API listening on port ${PORT}`);
+  console.log('Available services:');
+  console.log('  📚 /api/clip-library     - Clip Library (NEW!)');
+  console.log('  🎬 /api/webinar-multi    - Multi-file Webinar');
+  console.log('  🎙️  /api/audio-reaction   - Audio-Only RANT');
+  console.log('  🎥 /api/single-reaction  - Single Reaction');
+  console.log('  ✂️  /api/split-react      - Split React');
+  console.log('  📥 /api/download         - Video Download');
+  console.log('  📝 /api/transcribe       - Transcription');
 });
-
-// Set longer timeouts for large file uploads (10 minutes)
-server.timeout = 10 * 60 * 1000;
-server.keepAliveTimeout = 10 * 60 * 1000;
-server.headersTimeout = 11 * 60 * 1000;
