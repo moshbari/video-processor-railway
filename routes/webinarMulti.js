@@ -364,11 +364,29 @@ async function processInBackground(sessionId, jobId) {
     // Process the webinar
     const result = await webinarMultiService.processWebinar(sessionId, jobId);
 
-    // Generate filename with date
-    const now = new Date();
-    const dateStr = now.toISOString().slice(0, 10).replace(/-/g, '');
-    const timeStr = now.toISOString().slice(11, 16).replace(':', '');
-    const outputFilename = `WEBINAR_${dateStr}_${timeStr}.mp4`;
+    // Generate filename with GST (GMT+4) date and overlay name
+        const now = new Date();
+        const gst = new Date(now.getTime() + (4 * 60 * 60 * 1000)); // GMT+4
+        const dd = String(gst.getUTCDate()).padStart(2, '0');
+        const mm = String(gst.getUTCMonth() + 1).padStart(2, '0');
+        const yy = String(gst.getUTCFullYear()).slice(-2);
+        const hh = String(gst.getUTCHours()).padStart(2, '0');
+        const min = String(gst.getUTCMinutes()).padStart(2, '0');
+        const ss = String(gst.getUTCSeconds()).padStart(2, '0');
+        const dateTimeStr = `${dd}${mm}${yy}-${hh}${min}${ss}-GST`;
+    
+        // Get overlay image name for the filename (remove extension)
+        const session = webinarMultiService.getSession(sessionId);
+        let overlayName = 'WEBINAR';
+        if (session && session.overlayImage && session.overlayImage.originalName) {
+                overlayName = session.overlayImage.originalName.replace(/\.[^/.]+$/, '').trim();
+        }
+    
+        // Clean the overlay name (remove special characters that break filenames)
+        overlayName = overlayName.replace(/[^a-zA-Z0-9\s\-_]/g, '').trim();
+        if (!overlayName) overlayName = 'WEBINAR';
+    
+        const outputFilename = `${overlayName} - ${dateTimeStr}.mp4`;
 
     // Upload to R2
     const r2Key = `webinar-multi/${jobId}/${outputFilename}`;
