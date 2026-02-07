@@ -486,11 +486,10 @@ router.post('/session/:sessionId/import-library', express.json(), async (req, re
 
     const { localPath, clip } = await clipLibraryService.downloadClipToTemp(userId, clipId, destDir);
 
-    // Build a filename that preserves order if provided
-    const orderPrefix = order !== undefined ? `${order}-` : '';
-    const friendlyFilename = `${orderPrefix}${clip.name}${path.extname(clip.filename)}`;
+        // Use the clip's original name as-is (it already has numbering like "1-Price Reveal")
+    const friendlyFilename = `${clip.name}${path.extname(clip.filename)}`;
 
-    // Rename the downloaded file to include order prefix for the auto-sort
+    // Rename the downloaded file
     const finalPath = path.join(destDir, `${Date.now()}_${friendlyFilename}`);
     await fs.move(localPath, finalPath, { overwrite: true });
 
