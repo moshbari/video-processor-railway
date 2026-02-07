@@ -410,6 +410,121 @@ async function processInBackground(sessionId, jobId) {
 }
 
 /**
+ * POST /api/webinar-multi/session/:sessionId/import-library
+ * Import a library clip into the session (download from R2 and register)
+ */
+router.post('/session/:sessionId/import-library', express.json(), async (req, res) => {
+  const { sessionId } = req.params;
+  const { clipId, overlayId, group, order } = req.body;
+  const userId = req.headers['x-user-id'];
+
+  console.log(`[Import Library] Session: ${sessionId}, Group: ${group}, ClipId: ${clipId || 'none'}, OverlayId: ${overlayId || 'none'}`);
+
+  try {
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        error: 'User ID required. Please log in.'
+      });
+    }
+
+    const session = webinarMultiService.getSession(sessionId);
+    if (!session) {
+      return res.status(404).json({
+        success: false,
+        error: 'Session not found'
+      });
+    }
+
+    if (!['content', 'cta', 'overlay'].includes(group)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid group. Must be: content, cta, or overlay'
+      });
+    }
+
+    const clipLibraryService = require('../services/clipLibraryService');
+
+    // Handle overlay import
+    if (group === 'overlay' && overlayId) {
+      const destDir = path.join(session.sessionDir, 'overlay');
+      await fs.ensureDir(destDir);
+
+      const { localPath, overlay } = await clipLibraryService.downloadOverlayToTemp(userId, overlayId, destDir);
+
+      const fileData = webinarMultiService.addFileToSession(sessionId, 'overlay', {
+        filename: overlay.filename,
+        originalName: overlay.name + path.extname(overlay.filename),
+        path: localPath,
+        size: overlay.size || 0
+      });
+
+      console.log(`[Import Library] Overlay "${overlay.name}" imported into session`);
+
+      return res.json({
+        success: true,
+        file: {
+          id: fileData.id,
+          originalName: fileData.originalName,
+          size: fileData.size,
+          status: 'uploaded',
+          source: 'library'
+        }
+      });
+    }
+
+    // Handle clip import
+    if (!clipId) {
+      return res.status(400).json({
+        success: false,
+        error: 'clipId required for content/cta import'
+      });
+    }
+
+    const destDir = path.join(session.sessionDir, group);
+    await fs.ensureDir(destDir);
+
+    const { localPath, clip } = await clipLibraryService.downloadClipToTemp(userId, clipId, destDir);
+
+    // Build a filename that preserves order if provided
+    const orderPrefix = order !== undefined ? `${order}-` : '';
+    const friendlyFilename = `${orderPrefix}${clip.name}${path.extname(clip.filename)}`;
+
+    // Rename the downloaded file to include order prefix for the auto-sort
+    const finalPath = path.join(destDir, `${Date.now()}_${friendlyFilename}`);
+    await fs.move(localPath, finalPath, { overwrite: true });
+
+    const fileData = webinarMultiService.addFileToSession(sessionId, group, {
+      filename: path.basename(finalPath),
+      originalName: friendlyFilename,
+      path: finalPath,
+      size: clip.size || 0
+    });
+
+    console.log(`[Import Library] Clip "${clip.name}" imported into session as ${group} (order: ${fileData.order})`);
+
+    res.json({
+      success: true,
+      file: {
+        id: fileData.id,
+        originalName: fileData.originalName,
+        size: fileData.size,
+        status: 'uploaded',
+        order: fileData.order,
+        source: 'library'
+      }
+    });
+
+  } catch (error) {
+    console.error(`[Import Library] Error:`, error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
  * GET /api/webinar-multi/status/:jobId
  * Get render job status
  */
