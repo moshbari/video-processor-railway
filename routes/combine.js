@@ -7,7 +7,7 @@ const combineService = require('../services/combineService');
 const r2Service = require('../services/r2Service');
 const { v4: uuidv4 } = require('uuid');
 
-// ============================================
+// ===========================================
 // PROGRESS TRACKING - Store progress for each job
 // ============================================
 const renderProgress = {};
@@ -33,7 +33,7 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   limits: {
-    fileSize: 100 * 1024 * 1024,
+    fileSize: 10 * 1024 * 1024 * 1024,
     files: 20
   },
   fileFilter: (req, file, cb) => {
