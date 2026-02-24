@@ -346,6 +346,14 @@ async function combineClipsWithReactions(originalClipPaths, reactionClipPaths, w
   console.log(`Reaction clips: ${reactionClipPaths.filter(r => r).length}`);
   console.log(`Work dir: ${workDir}`);
 
+  // Log the exact inputs for debugging multi-clip sequencing
+  console.log('\n--- INPUT ARRAYS ---');
+  console.log('Original clip paths:');
+  originalClipPaths.forEach((p, i) => console.log(`  [${i}] ${path.basename(p)}`));
+  console.log('Reaction clip paths:');
+  reactionClipPaths.forEach((p, i) => console.log(`  [${i}] ${p ? path.basename(p) : 'null'}`));
+  console.log('--- END INPUT ARRAYS ---');
+
   try {
     updateProgress(renderProgress, jobId, 'processing', 10);
 
@@ -403,6 +411,39 @@ async function combineClipsWithReactions(originalClipPaths, reactionClipPaths, w
     // Concatenate all clips
     console.log(`\n--- Final Concatenation ---`);
     console.log(`Total clips to concatenate: ${processedClips.length}`);
+
+    // VERIFICATION: Log the exact sequence that will be concatenated
+    console.log('\n=== PROCESSED CLIPS SEQUENCE (final order) ===');
+    processedClips.forEach((clipPath, idx) => {
+      const basename = path.basename(clipPath);
+      const isReaction = basename.startsWith('std_reaction_') || basename.startsWith('pip_');
+      console.log(`  [${idx}] ${isReaction ? 'REACTION' : 'ORIGINAL'}: ${basename}`);
+    });
+    console.log('=== END SEQUENCE ===\n');
+
+    // Sanity check: verify interleaving pattern (original, reaction, original, reaction, ...)
+    let lastWasOriginal = false;
+    let interleavingBroken = false;
+    for (let idx = 0; idx < processedClips.length; idx++) {
+      const basename = path.basename(processedClips[idx]);
+      const isReaction = basename.startsWith('std_reaction_') || basename.startsWith('pip_');
+      if (idx === 0 && isReaction) {
+        console.warn('WARNING: First clip in sequence is a reaction, not an original!');
+        interleavingBroken = true;
+      }
+      if (isReaction && !lastWasOriginal) {
+        console.warn(`WARNING: Two reactions in a row at index ${idx}!`);
+        interleavingBroken = true;
+      }
+      if (!isReaction && lastWasOriginal && idx > 0) {
+        console.warn(`WARNING: Two originals in a row at index ${idx} - missing reaction for previous clip!`);
+      }
+      lastWasOriginal = !isReaction;
+    }
+    if (interleavingBroken) {
+      console.error('ERROR: Clip interleaving is broken! Expected: original, reaction, original, reaction, ...');
+    }
+
     updateProgress(renderProgress, jobId, 'concatenating', 85);
 
     // Pass the clip paths directly to concatenateClips (uses concat FILTER now)

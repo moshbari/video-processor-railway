@@ -318,34 +318,53 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
     const reactionClipPaths = new Array(originalClipPaths.length).fill(null);
     
     if (req.files && req.files.length > 0) {
+      console.log(`Received ${req.files.length} reaction file uploads`);
       let indices = null;
       if (req.body.reactionIndices) {
         try {
           indices = JSON.parse(req.body.reactionIndices);
+          console.log(`Parsed reactionIndices: ${JSON.stringify(indices)}`);
         } catch (e) {
           console.warn('Failed to parse reactionIndices, using sequential mapping');
         }
       }
-      
+
       if (indices && Array.isArray(indices)) {
         req.files.forEach((file, i) => {
           const clipIndex = indices[i];
           if (typeof clipIndex === 'number' && clipIndex >= 0 && clipIndex < originalClipPaths.length) {
             reactionClipPaths[clipIndex] = file.path;
-            console.log(`Mapped reaction ${i} to clip ${clipIndex}`);
+            console.log(`Mapped reaction ${i} (${file.originalname}) to clip ${clipIndex}`);
+          } else {
+            console.warn(`Invalid reactionIndices[${i}] = ${clipIndex}, skipping file ${file.originalname}`);
           }
         });
       } else {
+        console.log('Using sequential reaction mapping (no reactionIndices provided)');
         req.files.forEach((file, i) => {
           if (i < originalClipPaths.length) {
             reactionClipPaths[i] = file.path;
+            console.log(`Sequential map: reaction ${i} (${file.originalname}) → clip ${i}`);
+          } else {
+            console.warn(`Extra reaction file ${i} (${file.originalname}) - no matching original clip`);
           }
         });
       }
+    } else {
+      console.warn('WARNING: No reaction files uploaded! All clips will be concatenated without reactions.');
     }
     
     const reactionCount = reactionClipPaths.filter(p => p !== null).length;
-    console.log(`Mapped ${reactionCount} reactions to clips`);
+    console.log(`Mapped ${reactionCount} reactions to ${originalClipPaths.length} clips`);
+
+    // Log the exact clip-reaction pairing for debugging
+    console.log('\n--- CLIP-REACTION MAPPING ---');
+    for (let i = 0; i < originalClipPaths.length; i++) {
+      const origName = path.basename(originalClipPaths[i]);
+      const reactName = reactionClipPaths[i] ? path.basename(reactionClipPaths[i]) : 'NONE';
+      console.log(`  [${i}] ${origName} → ${reactName}`);
+    }
+    console.log('--- END MAPPING ---\n');
 
     // Initialize progress BEFORE responding
     renderProgress[jobId] = {
@@ -416,15 +435,26 @@ router.post('/', upload.fields([
 
     if (req.files && req.files.originalClips) {
       originalClipPaths = req.files.originalClips.map(f => f.path);
-      reactionClipPaths = req.files.reactionClips 
+      reactionClipPaths = req.files.reactionClips
         ? req.files.reactionClips.map(f => f.path)
         : [];
-    } 
+    }
     else if (req.body.originalClipPaths) {
-      originalClipPaths = JSON.parse(req.body.originalClipPaths);
-      reactionClipPaths = req.body.reactionClipPaths 
-        ? JSON.parse(req.body.reactionClipPaths)
-        : [];
+      originalClipPaths = typeof req.body.originalClipPaths === 'string'
+        ? JSON.parse(req.body.originalClipPaths)
+        : req.body.originalClipPaths;
+
+      // Check for uploaded reaction files FIRST (hybrid case: JSON original paths + uploaded reaction files)
+      if (req.files && req.files.reactionClips && req.files.reactionClips.length > 0) {
+        reactionClipPaths = req.files.reactionClips.map(f => f.path);
+        console.log(`Using ${reactionClipPaths.length} uploaded reaction files`);
+      } else if (req.body.reactionClipPaths) {
+        reactionClipPaths = typeof req.body.reactionClipPaths === 'string'
+          ? JSON.parse(req.body.reactionClipPaths)
+          : req.body.reactionClipPaths;
+      } else {
+        reactionClipPaths = [];
+      }
     }
     else {
       return res.status(400).json({
@@ -438,6 +468,16 @@ router.post('/', upload.fields([
         success: false,
         error: 'At least one original clip is required'
       });
+    }
+
+    console.log(`\nDirect combine: ${originalClipPaths.length} originals, ${reactionClipPaths.length} reactions`);
+    if (reactionClipPaths.length === 0 && originalClipPaths.length > 1) {
+      console.warn('WARNING: No reaction clips provided for multi-clip combine!');
+    }
+
+    // Ensure reactionClipPaths is padded to match originalClipPaths length
+    while (reactionClipPaths.length < originalClipPaths.length) {
+      reactionClipPaths.push(null);
     }
 
     const result = await combineService.combineClipsWithReactions(
