@@ -49,12 +49,29 @@ class SplitService {
 
           // Create exactly N clips for N reactions
           // Each clip goes from currentTime to the reaction timestamp
+          // Clips with duration <= 0 are SKIPPED (e.g. reaction at timestamp 0)
+          let clipNumber = 0;
           for (let i = 0; i < sortedReactions.length; i++) {
                     const reaction = sortedReactions[i];
                     const clipEndTime = reaction.timestamp;
                     const duration = clipEndTime - currentTime;
-                    const clipNumber = i + 1;
 
+                // Skip clips with zero or negative duration
+                // (happens when a reaction is at timestamp 0 or duplicate timestamps)
+                if (duration <= 0) {
+                    console.log(`Skipping clip for reaction ${i + 1}: ${currentTime}s to ${clipEndTime}s (${duration.toFixed(2)}s) - zero/negative duration`);
+                    // Still add the reaction guide entry (reaction happens before any video)
+                    reactionGuide.push({
+                                afterClip: clipNumber, // 0 means before any clip
+                                timestamp: reaction.timestamp,
+                                text: reaction.text,
+                                sentiment: reaction.sentiment || 'NEUTRAL'
+                    });
+                    currentTime = clipEndTime;
+                    continue;
+                }
+
+                clipNumber++;
                 const clipFilename = `clip_${clipNumber}.mp4`;
                     const clipPath = path.join(clipsDir, clipFilename);
 
@@ -130,8 +147,13 @@ class SplitService {
                                  const command = ffmpeg(videoPath)
                   .seekInput(startTime);
 
+                                 // ALWAYS set duration to prevent extracting to end of file
                                  if (duration !== null && duration > 0) {
                                            command.duration(duration);
+                                 } else {
+                                           // Safety: if duration is 0 or missing, use minimal duration (1 frame)
+                                           console.warn(`  WARNING: duration is ${duration}, using 0.033s (1 frame) as safety`);
+                                           command.duration(0.033);
                                  }
 
                                  // Re-encode for precise frame-accurate cuts
