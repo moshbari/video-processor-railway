@@ -43,21 +43,61 @@ class SplitService {
           // Sort reactions by timestamp
           const sortedReactions = reactions.sort((a, b) => a.timestamp - b.timestamp);
 
+          // Fix zero/duplicate timestamps by redistributing evenly
+          // If multiple reactions share the same timestamp (e.g. all at 0),
+          // spread them evenly in the range [previousTimestamp, nextDifferentTimestamp]
+          let videoDuration = null; // lazy-loaded only if needed
+          for (let i = 0; i < sortedReactions.length; i++) {
+              // Find a group of reactions with the same timestamp
+              let groupStart = i;
+              let groupTimestamp = sortedReactions[i].timestamp;
+              while (i + 1 < sortedReactions.length && sortedReactions[i + 1].timestamp === groupTimestamp) {
+                  i++;
+              }
+              let groupEnd = i; // inclusive
+
+              // Only fix if there's more than one reaction at this timestamp
+              // OR if the first reaction is at 0 (would create a zero-duration clip from 0→0)
+              if (groupEnd > groupStart || (groupStart === 0 && groupTimestamp === 0)) {
+                  const rangeStart = groupStart > 0 ? sortedReactions[groupStart - 1].timestamp : 0;
+                  let rangeEnd = (groupEnd + 1 < sortedReactions.length)
+                      ? sortedReactions[groupEnd + 1].timestamp
+                      : (groupTimestamp > 0 ? groupTimestamp : null);
+
+                  // If rangeEnd is null (e.g. all reactions at 0), get video duration
+                  if (rangeEnd === null) {
+                      if (videoDuration === null) {
+                          videoDuration = await this.getVideoDuration(videoPath);
+                          console.log(`Video duration (probed): ${videoDuration}s`);
+                      }
+                      rangeEnd = videoDuration;
+                  }
+
+                  if (rangeEnd > rangeStart) {
+                      const count = groupEnd - groupStart + 1;
+                      const step = (rangeEnd - rangeStart) / (count + 1);
+                      for (let j = groupStart; j <= groupEnd; j++) {
+                          const newTimestamp = parseFloat((rangeStart + step * (j - groupStart + 1)).toFixed(2));
+                          console.log(`Redistributing reaction ${j + 1}: ${sortedReactions[j].timestamp}s → ${newTimestamp}s`);
+                          sortedReactions[j].timestamp = newTimestamp;
+                      }
+                  }
+              }
+          }
+
           const clips = [];
               const reactionGuide = [];
               let currentTime = 0;
 
           // Create exactly N clips for N reactions
           // Each clip goes from currentTime to the reaction timestamp
-          // Clips with duration <= 0 are SKIPPED (e.g. reaction at timestamp 0)
           let clipNumber = 0;
           for (let i = 0; i < sortedReactions.length; i++) {
                     const reaction = sortedReactions[i];
                     const clipEndTime = reaction.timestamp;
                     const duration = clipEndTime - currentTime;
 
-                // Skip clips with zero or negative duration
-                // (happens when a reaction is at timestamp 0 or duplicate timestamps)
+                // Skip clips with zero or negative duration (safety check after redistribution)
                 if (duration <= 0) {
                     console.log(`Skipping clip for reaction ${i + 1}: ${currentTime}s to ${clipEndTime}s (${duration.toFixed(2)}s) - zero/negative duration`);
                     // Still add the reaction guide entry (reaction happens before any video)
@@ -223,6 +263,18 @@ class SplitService {
         const mins = Math.floor(seconds / 60);
         const secs = Math.floor(seconds % 60);
         return `${mins}:${secs.toString().padStart(2, '0')}`;
+  }
+
+  /**
+     * Get video duration using ffprobe
+     */
+  getVideoDuration(videoPath) {
+        return new Promise((resolve, reject) => {
+            ffmpeg.ffprobe(videoPath, (err, metadata) => {
+                if (err) return reject(err);
+                resolve(parseFloat(metadata.format.duration));
+            });
+        });
   }
 
   /**
