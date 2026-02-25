@@ -40,47 +40,45 @@ class SplitService {
               console.log('Using PRECISE CUTS (re-encode mode)');
               console.log('='.repeat(50));
 
-          // Sort reactions by timestamp
-          const sortedReactions = reactions.sort((a, b) => a.timestamp - b.timestamp);
+          // Get video duration for timestamp fixing
+          const videoDuration = await this.getVideoDuration(videoPath);
+          console.log(`Video duration: ${videoDuration}s`);
 
-          // Fix zero/duplicate timestamps by redistributing evenly
-          // If multiple reactions share the same timestamp (e.g. all at 0),
-          // spread them evenly in the range [previousTimestamp, nextDifferentTimestamp]
-          let videoDuration = null; // lazy-loaded only if needed
-          for (let i = 0; i < sortedReactions.length; i++) {
-              // Find a group of reactions with the same timestamp
-              let groupStart = i;
-              let groupTimestamp = sortedReactions[i].timestamp;
-              while (i + 1 < sortedReactions.length && sortedReactions[i + 1].timestamp === groupTimestamp) {
-                  i++;
+          // Fix timestamps - preserve original order (don't sort!)
+          // AI generators like RantSquad use timestamp=0 for intro (first) and summary (last).
+          // Sorting would lump them together. Instead, process in order and fix in-place.
+          const fixedReactions = reactions.map(r => ({ ...r })); // clone to avoid mutating input
+
+          // Pass 1: Fix out-of-order/zero timestamps
+          // Walk through in order; any reaction whose timestamp <= the running max
+          // (except the very first at 0) needs a new timestamp assigned.
+          let maxSoFar = -1;
+          const needsFix = []; // indices that need new timestamps
+
+          for (let i = 0; i < fixedReactions.length; i++) {
+              const ts = fixedReactions[i].timestamp;
+              if (ts <= maxSoFar || (i === 0 && ts === 0)) {
+                  needsFix.push(i);
+              } else {
+                  maxSoFar = ts;
               }
-              let groupEnd = i; // inclusive
+          }
 
-              // Only fix if there's more than one reaction at this timestamp
-              // OR if the first reaction is at 0 (would create a zero-duration clip from 0→0)
-              if (groupEnd > groupStart || (groupStart === 0 && groupTimestamp === 0)) {
-                  const rangeStart = groupStart > 0 ? sortedReactions[groupStart - 1].timestamp : 0;
-                  let rangeEnd = (groupEnd + 1 < sortedReactions.length)
-                      ? sortedReactions[groupEnd + 1].timestamp
-                      : (groupTimestamp > 0 ? groupTimestamp : null);
+          if (needsFix.length > 0) {
+              console.log(`Fixing ${needsFix.length} reaction timestamp(s) that would produce zero-duration clips`);
 
-                  // If rangeEnd is null (e.g. all reactions at 0), get video duration
-                  if (rangeEnd === null) {
-                      if (videoDuration === null) {
-                          videoDuration = await this.getVideoDuration(videoPath);
-                          console.log(`Video duration (probed): ${videoDuration}s`);
-                      }
-                      rangeEnd = videoDuration;
-                  }
+              // Evenly divide the ENTIRE video among ALL reactions.
+              // This is the most reliable approach when AI-generated timestamps are broken,
+              // since partial fixes (only adjusting broken ones) can create uneven or
+              // zero-duration clips when broken timestamps cluster at boundaries.
+              const totalReactions = fixedReactions.length;
+              const segmentDuration = videoDuration / totalReactions;
 
-                  if (rangeEnd > rangeStart) {
-                      const count = groupEnd - groupStart + 1;
-                      const step = (rangeEnd - rangeStart) / (count + 1);
-                      for (let j = groupStart; j <= groupEnd; j++) {
-                          const newTimestamp = parseFloat((rangeStart + step * (j - groupStart + 1)).toFixed(2));
-                          console.log(`Redistributing reaction ${j + 1}: ${sortedReactions[j].timestamp}s → ${newTimestamp}s`);
-                          sortedReactions[j].timestamp = newTimestamp;
-                      }
+              for (let i = 0; i < totalReactions; i++) {
+                  const newTs = parseFloat((segmentDuration * (i + 1)).toFixed(2));
+                  if (fixedReactions[i].timestamp !== newTs) {
+                      console.log(`  Reaction ${i + 1}: ${fixedReactions[i].timestamp}s → ${newTs}s`);
+                      fixedReactions[i].timestamp = newTs;
                   }
               }
           }
@@ -92,8 +90,8 @@ class SplitService {
           // Create exactly N clips for N reactions
           // Each clip goes from currentTime to the reaction timestamp
           let clipNumber = 0;
-          for (let i = 0; i < sortedReactions.length; i++) {
-                    const reaction = sortedReactions[i];
+          for (let i = 0; i < fixedReactions.length; i++) {
+                    const reaction = fixedReactions[i];
                     const clipEndTime = reaction.timestamp;
                     const duration = clipEndTime - currentTime;
 
