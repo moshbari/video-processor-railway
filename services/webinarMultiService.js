@@ -347,8 +347,8 @@ class WebinarMultiService {
       finalOutputPath = path.join(workDir, `webinar_${jobId}.mp4`);
 
       if (contentVideoPath && ctaWithOverlayPath) {
-        // Both exist - concatenate them
-        await this.concatenateVideos([contentVideoPath, ctaWithOverlayPath], finalOutputPath, jobId);
+        // Both exist - use seamless re-encoding concat to prevent blank frames at transition
+        await this.concatenateVideosFinal([contentVideoPath, ctaWithOverlayPath], finalOutputPath, jobId);
       } else if (contentVideoPath) {
         // Only content exists
         await fs.copy(contentVideoPath, finalOutputPath);
@@ -432,23 +432,53 @@ class WebinarMultiService {
   }
 
   /**
+   * Safe concatenation for the final Content + CTA join
+   * Uses the concat FILTER (not demuxer) which re-encodes the video
+   * This prevents blank/black frames at the transition point
+   */
+  async concatenateVideosFinal(videoPaths, outputPath, jobId) {
+    if (videoPaths.length === 0) {
+      throw new Error('No videos to concatenate');
+    }
+
+    if (videoPaths.length === 1) {
+      await fs.copy(videoPaths[0], outputPath);
+      return;
+    }
+
+    // Build inputs and filter_complex for concat filter (re-encodes for seamless join)
+    const inputs = videoPaths.map(p => `-i "${p}"`).join(' ');
+    const filterParts = videoPaths.map((_, i) => `[${i}:v:0][${i}:a:0]`).join('');
+    const filterComplex = `${filterParts}concat=n=${videoPaths.length}:v=1:a=1[outv][outa]`;
+
+    const command = `ffmpeg -y ${inputs} -filter_complex "${filterComplex}" -map "[outv]" -map "[outa]" -c:v libx264 -preset medium -crf 23 -r 30 -pix_fmt yuv420p -c:a aac -b:a 128k -ar 44100 -ac 2 -movflags +faststart "${outputPath}"`;
+
+    console.log(`[${jobId}] Final seamless concatenation (re-encoding for smooth transition)...`);
+    await this.runCommand(command, jobId);
+  }
+
+  /**
    * Standardize video for consistent concatenation
+   * Forces consistent resolution, pixel format, frame rate, and audio settings
+   * so there are NO blank frames when videos are joined together
    */
   async standardizeVideo(inputPath, outputPath, jobId) {
-    const command = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset medium -crf 23 -r 30 -c:a aac -b:a 128k -ar 44100 "${outputPath}"`;
-    console.log(`[${jobId}] Standardizing video...`);
+    const command = `ffmpeg -y -i "${inputPath}" -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1" -c:v libx264 -preset medium -crf 23 -r 30 -pix_fmt yuv420p -c:a aac -b:a 128k -ar 44100 -ac 2 "${outputPath}"`;
+    console.log(`[${jobId}] Standardizing video to 1920x1080 @ 30fps...`);
     await this.runCommand(command, jobId);
   }
 
   /**
    * Apply full-frame image overlay to video
    * Scales overlay to match video dimensions
+   * Outputs with same standardized settings to prevent blank frames during transitions
    */
   async applyOverlay(videoPath, imagePath, outputPath, jobId) {
     // Use scale2ref to scale overlay image to match video dimensions
-    const command = `ffmpeg -y -i "${videoPath}" -i "${imagePath}" -filter_complex "[0:v][1:v]scale2ref[base][ovr];[base][ovr]overlay=0:0:format=auto" -c:v libx264 -preset medium -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
+    // Output with same standardized settings as standardizeVideo to prevent transition glitches
+    const command = `ffmpeg -y -i "${videoPath}" -i "${imagePath}" -filter_complex "[0:v][1:v]scale2ref[base][ovr];[base][ovr]overlay=0:0:format=auto" -c:v libx264 -preset medium -crf 23 -r 30 -pix_fmt yuv420p -c:a aac -b:a 128k -ar 44100 -ac 2 "${outputPath}"`;
     
-    console.log(`[${jobId}] Applying overlay...`);
+    console.log(`[${jobId}] Applying overlay (with standardized output)...`);
     await this.runCommand(command, jobId);
   }
 
