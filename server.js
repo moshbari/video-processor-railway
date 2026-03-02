@@ -28,6 +28,7 @@ const webinarRoutes = require('./routes/webinar');
 const webinarMultiRoutes = require('./routes/webinarMulti');
 const clipLibraryRoutes = require('./routes/clipLibrary');  // 📚 CLIP LIBRARY
 const opusClipRoutes = require('./routes/opusClip');        // 🎬 OPUS CLIP
+const manualClipRoutes = require('./routes/manualClip');    // ✂️ MANUAL CLIP
 
 // Import services
 const cleanupService = require('./services/cleanupService');
@@ -45,7 +46,8 @@ const ensureDirs = async () => {
     path.join(process.env.TEMP_DIR || '/app/temp', 'webinar-render'),
     path.join(process.env.TEMP_DIR || '/app/temp', 'library-uploads'),
     path.join(process.env.TEMP_DIR || '/app/temp', 'library-thumbs'),
-    path.join(process.env.TEMP_DIR || '/app/temp', 'opus-uploads')
+    path.join(process.env.TEMP_DIR || '/app/temp', 'opus-uploads'),
+    path.join(process.env.TEMP_DIR || '/app/temp', 'manual-uploads')
   ];
   for (const dir of dirs) {
     await fs.ensureDir(dir);
@@ -86,6 +88,7 @@ app.get('/health', (req, res) => {
       download: 'active',
       jobs: 'active',
       opusClip: 'active',       // 🎬 OPUS CLIP
+      manualClip: 'active',     // ✂️ MANUAL CLIP
       render: 'active',
       singleReaction: 'active',
       split: 'active',
@@ -103,6 +106,7 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/audio-reaction', audioReactionRoutes);
 app.use('/api/clip-library', clipLibraryRoutes);  // 📚 CLIP LIBRARY
 app.use('/api/opus-clip', opusClipRoutes);        // 🎬 OPUS CLIP
+app.use('/api/manual-clip', manualClipRoutes);    // ✂️ MANUAL CLIP
 app.use('/api/combine', combineRoutes);
 app.use('/api/download', downloadRoutes);
 app.use('/api/jobs', jobsRoutes);
@@ -144,6 +148,7 @@ app.listen(PORT, () => {
   console.log('Available services:');
   console.log('  📚 /api/clip-library     - Clip Library (NEW!)');
   console.log('  🎬 /api/opus-clip        - AI Viral Clip Maker');
+  console.log('  ✂️  /api/manual-clip      - Manual Clip Maker');
   console.log('  🎬 /api/webinar-multi    - Multi-file Webinar');
   console.log('  🎙️  /api/audio-reaction   - Audio-Only RANT');
   console.log('  🎥 /api/single-reaction  - Single Reaction');

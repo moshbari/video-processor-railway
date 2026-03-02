@@ -1,0 +1,808 @@
+/**
+ * ✂️ MANUAL CLIP SERVICE
+ * 
+ * Manual video clipping with waveform visualization
+ * User marks their own timestamps, system cuts with:
+ * - Maximum quality (CRF 18 + 192k audio)
+ * - Vertical reframing (9:16)
+ * - Auto-captions (via Whisper transcription)
+ * - Waveform data for visual timeline
+ * - Video uploaded to R2 for in-browser playback
+ */
+
+const ffmpeg = require('fluent-ffmpeg');
+const path = require('path');
+const fs = require('fs-extra');
+const { v4: uuidv4 } = require('uuid');
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const execAsync = promisify(exec);
+
+const r2Service = require('./r2Service');
+const downloadService = require('./downloadService');
+const transcriptionService = require('./transcriptionService');
+
+class ManualClipService {
+  constructor() {
+    this.tempDir = process.env.TEMP_DIR || '/app/temp';
+    this.jobs = new Map();
+  }
+
+  // ============================================================
+  // STEP 1: PREPARE VIDEO
+  // Download → Upload to R2 for playback → Generate waveform
+  // ============================================================
+
+  /**
+   * Prepare a video for manual clipping
+   * - Downloads from URL (or uses uploaded file)
+   * - Uploads the full video to R2 so the frontend can play it
+   * - Generates audio waveform data (peaks array)
+   * - Returns video info + waveform + playback URL
+   */
+  async prepareVideo(input) {
+    const jobId = uuidv4();
+    const workDir = path.join(this.tempDir, `manual-${jobId}`);
+    await fs.ensureDir(workDir);
+
+    this.jobs.set(jobId, {
+      status: 'preparing',
+      step: 'starting',
+      progress: 0,
+      error: null,
+      videoPath: null,
+      playbackUrl: null,
+      waveform: null,
+      videoDuration: 0,
+      videoTitle: ''
+    });
+
+    try {
+      let videoPath;
+      let videoTitle = 'Uploaded Video';
+      let videoDuration = 0;
+
+      // --- Download or use uploaded file ---
+      this.updateJob(jobId, { step: 'downloading', progress: 5 });
+
+      if (input.url) {
+        console.log(`[ManualClip ${jobId}] Downloading from URL: ${input.url}`);
+        const downloadResult = await downloadService.downloadVideo(input.url, `manual-dl-${jobId}`);
+        videoPath = downloadResult.videoPath;
+        videoTitle = downloadResult.title || 'Downloaded Video';
+        videoDuration = downloadResult.duration || 0;
+      } else if (input.videoPath) {
+        videoPath = input.videoPath;
+      } else {
+        throw new Error('Please provide a video URL or upload a video file.');
+      }
+
+      // Get duration if not known
+      if (!videoDuration) {
+        videoDuration = await this.getVideoDuration(videoPath);
+      }
+
+      console.log(`[ManualClip ${jobId}] Video: "${videoTitle}" (${this.formatTime(videoDuration)})`);
+
+      this.updateJob(jobId, {
+        videoPath,
+        videoTitle,
+        videoDuration,
+        progress: 25
+      });
+
+      // --- Upload video to R2 for browser playback ---
+      this.updateJob(jobId, { step: 'uploading_for_playback', progress: 30 });
+      console.log(`[ManualClip ${jobId}] Uploading to R2 for playback...`);
+
+      const r2VideoKey = `manual-clip/${jobId}/source.mp4`;
+      const uploadResult = await r2Service.uploadFile(videoPath, r2VideoKey, 'video/mp4');
+      const playbackUrl = uploadResult.downloadUrl;
+
+      console.log(`[ManualClip ${jobId}] Playback URL: ${playbackUrl}`);
+
+      this.updateJob(jobId, {
+        playbackUrl,
+        progress: 55
+      });
+
+      // --- Generate waveform data ---
+      this.updateJob(jobId, { step: 'generating_waveform', progress: 60 });
+      console.log(`[ManualClip ${jobId}] Generating waveform...`);
+
+      const waveform = await this.generateWaveform(videoPath, workDir, videoDuration);
+
+      console.log(`[ManualClip ${jobId}] Waveform generated: ${waveform.peaks.length} peaks`);
+
+      // --- Done preparing ---
+      const result = {
+        success: true,
+        jobId,
+        videoTitle,
+        videoDuration,
+        videoDurationFormatted: this.formatTime(videoDuration),
+        playbackUrl,
+        waveform
+      };
+
+      this.updateJob(jobId, {
+        status: 'ready',
+        step: 'ready',
+        progress: 100,
+        waveform,
+        playbackUrl
+      });
+
+      console.log(`[ManualClip ${jobId}] ✓ Video ready for manual clipping`);
+
+      return result;
+
+    } catch (error) {
+      console.error(`[ManualClip ${jobId}] Preparation failed:`, error.message);
+      this.updateJob(jobId, {
+        status: 'error',
+        error: error.message,
+        progress: 0
+      });
+      throw error;
+    }
+  }
+
+  // ============================================================
+  // WAVEFORM GENERATION
+  // ============================================================
+
+  /**
+   * Generate audio waveform data from video
+   * Returns an array of peak values (0.0 - 1.0) for drawing in the frontend
+   * 
+   * Uses FFmpeg to extract raw audio samples, then compute peaks
+   * Target: ~800 peaks (enough resolution for a nice waveform)
+   */
+  async generateWaveform(videoPath, workDir, duration) {
+    const rawAudioPath = path.join(workDir, 'waveform_audio.raw');
+
+    try {
+      // Extract mono raw audio at low sample rate for peak computation
+      // 8000 Hz mono = 8000 samples per second
+      // For a 10-minute video: 4.8M samples → we'll downsample to ~800 peaks
+      await new Promise((resolve, reject) => {
+        ffmpeg(videoPath)
+          .noVideo()
+          .audioChannels(1)
+          .audioFrequency(8000)
+          .format('s16le') // 16-bit signed little-endian raw PCM
+          .on('end', resolve)
+          .on('error', (err) => {
+            console.error('Waveform audio extraction error:', err.message);
+            reject(err);
+          })
+          .save(rawAudioPath);
+      });
+
+      // Read raw audio data
+      const rawBuffer = await fs.readFile(rawAudioPath);
+
+      // Convert to 16-bit samples
+      const numSamples = rawBuffer.length / 2; // 2 bytes per sample (s16le)
+      const sampleRate = 8000;
+
+      // Target number of peaks for the waveform display
+      const targetPeaks = 800;
+      const samplesPerPeak = Math.max(1, Math.floor(numSamples / targetPeaks));
+
+      const peaks = [];
+
+      for (let i = 0; i < targetPeaks && i * samplesPerPeak < numSamples; i++) {
+        const start = i * samplesPerPeak;
+        const end = Math.min(start + samplesPerPeak, numSamples);
+
+        let maxAbs = 0;
+        for (let j = start; j < end; j++) {
+          const offset = j * 2;
+          if (offset + 1 < rawBuffer.length) {
+            const sample = rawBuffer.readInt16LE(offset);
+            const abs = Math.abs(sample);
+            if (abs > maxAbs) maxAbs = abs;
+          }
+        }
+
+        // Normalize to 0.0 - 1.0
+        peaks.push(Math.round((maxAbs / 32768) * 1000) / 1000);
+      }
+
+      // Clean up raw audio
+      await fs.remove(rawAudioPath).catch(() => {});
+
+      return {
+        peaks,
+        duration,
+        sampleRate: targetPeaks / duration, // peaks per second
+        totalPeaks: peaks.length
+      };
+
+    } catch (error) {
+      console.error('Waveform generation failed:', error.message);
+      // Return a minimal flat waveform as fallback so the UI still works
+      const fallbackPeaks = Array(800).fill(0).map(() =>
+        Math.round(Math.random() * 0.3 * 1000) / 1000
+      );
+      return {
+        peaks: fallbackPeaks,
+        duration,
+        sampleRate: 800 / duration,
+        totalPeaks: 800,
+        fallback: true
+      };
+    }
+  }
+
+  // ============================================================
+  // STEP 2: GENERATE CLIPS
+  // Cut at user-specified timestamps with max quality
+  // ============================================================
+
+  /**
+   * Generate clips from user-defined timestamps
+   * 
+   * @param {string} jobId - Job ID from prepare step
+   * @param {Array} clips - Array of { title, startTime, endTime }
+   * @param {Object} options - { format, captionStyle, addCaptions }
+   */
+  async generateManualClips(jobId, clips, options = {}) {
+    const job = this.jobs.get(jobId);
+    if (!job || !job.videoPath) {
+      throw new Error('Video not found. Please prepare the video first.');
+    }
+
+    const {
+      format = 'vertical',
+      captionStyle = 'bold_white',
+      addCaptions = true
+    } = options;
+
+    const videoPath = job.videoPath;
+    const videoDuration = job.videoDuration;
+    const workDir = path.join(this.tempDir, `manual-${jobId}`);
+    const clipsDir = path.join(workDir, 'clips');
+    await fs.ensureDir(clipsDir);
+
+    const totalClips = clips.length;
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`[ManualClip ${jobId}] GENERATING ${totalClips} CLIPS`);
+    console.log(`  Format: ${format} | Captions: ${addCaptions} | Style: ${captionStyle}`);
+    console.log(`  Quality: CRF 18 + 192k audio (MAXIMUM)`);
+    console.log('='.repeat(60));
+
+    this.updateJob(jobId, {
+      status: 'generating',
+      step: 'starting_generation',
+      progress: 0,
+      totalClips,
+      completedClips: 0,
+      currentClip: '',
+      generatedClips: []
+    });
+
+    // If captions requested, we need transcription for the relevant segments
+    let transcription = null;
+    if (addCaptions) {
+      try {
+        this.updateJob(jobId, { step: 'transcribing_for_captions', progress: 5, currentClip: 'Transcribing audio for captions...' });
+        console.log(`[ManualClip ${jobId}] Transcribing for captions...`);
+
+        const audioPath = path.join(workDir, 'caption_audio.mp3');
+        await this.extractAudioForTranscription(videoPath, audioPath);
+
+        const audioStats = await fs.stat(audioPath);
+        const audioSizeMB = audioStats.size / (1024 * 1024);
+
+        if (audioSizeMB <= 25) {
+          transcription = await transcriptionService.transcribe(audioPath, {
+            response_format: 'verbose_json'
+          });
+        } else {
+          transcription = await this.transcribeLongAudio(audioPath, workDir, jobId);
+        }
+
+        console.log(`[ManualClip ${jobId}] Transcription complete: ${transcription.segments.length} segments`);
+        await fs.remove(audioPath).catch(() => {});
+      } catch (transcribeError) {
+        console.error(`[ManualClip ${jobId}] Transcription failed, continuing without captions:`, transcribeError.message);
+        transcription = null;
+      }
+    }
+
+    const generatedClips = [];
+    const clipStartProgress = addCaptions ? 15 : 5; // After transcription or immediately
+    const progressPerClip = (95 - clipStartProgress) / totalClips;
+
+    for (let i = 0; i < totalClips; i++) {
+      const clip = clips[i];
+      const clipNum = i + 1;
+
+      try {
+        // Validate timestamps
+        let startTime = parseFloat(clip.startTime);
+        let endTime = parseFloat(clip.endTime);
+        const title = clip.title || `Clip ${clipNum}`;
+
+        if (isNaN(startTime) || isNaN(endTime)) {
+          throw new Error('Invalid timestamps');
+        }
+
+        // Clamp to video bounds
+        startTime = Math.max(0, startTime);
+        endTime = Math.min(endTime, videoDuration);
+
+        if (endTime <= startTime) {
+          throw new Error('End time must be after start time');
+        }
+
+        const clipDuration = endTime - startTime;
+        console.log(`\n[ManualClip ${jobId}] Clip ${clipNum}/${totalClips}: "${title}" (${this.formatTime(startTime)} → ${this.formatTime(endTime)}, ${this.formatTime(clipDuration)})`);
+
+        this.updateJob(jobId, {
+          step: `generating_clip_${clipNum}`,
+          progress: Math.round(clipStartProgress + (i * progressPerClip)),
+          completedClips: i,
+          currentClip: title
+        });
+
+        // Step A: Extract raw clip at MAXIMUM QUALITY
+        const rawClipPath = path.join(clipsDir, `raw_${clipNum}.mp4`);
+        await this.extractClipMaxQuality(videoPath, startTime, endTime, rawClipPath);
+
+        // Step B: Get transcript segments for this time range (for captions)
+        let clipSegments = [];
+        if (addCaptions && transcription && transcription.segments) {
+          clipSegments = this.getSegmentsForTimeRange(transcription.segments, startTime, endTime);
+        }
+
+        // Step C: Generate subtitle file if we have segments
+        let subtitlePath = null;
+        if (addCaptions && clipSegments.length > 0) {
+          subtitlePath = path.join(clipsDir, `subs_${clipNum}.ass`);
+          await this.generateStyledSubtitles(clipSegments, startTime, subtitlePath, captionStyle);
+        }
+
+        // Step D: Apply vertical reframe + burn captions (MAX QUALITY)
+        const finalClipPath = path.join(clipsDir, `clip_${clipNum}.mp4`);
+        await this.processClipMaxQuality(rawClipPath, finalClipPath, {
+          format,
+          subtitlePath,
+          addCaptions: addCaptions && subtitlePath !== null
+        });
+
+        // Step E: Upload to R2
+        const safeTitle = this.sanitizeFilename(title);
+        const r2FileName = `manual-clips/${jobId}/clip_${clipNum}_${safeTitle}.mp4`;
+        const uploadResult = await r2Service.uploadFile(finalClipPath, r2FileName);
+
+        generatedClips.push({
+          clipNumber: clipNum,
+          title,
+          startTime,
+          endTime,
+          duration: clipDuration,
+          durationFormatted: this.formatTime(clipDuration),
+          startFormatted: this.formatTime(startTime),
+          endFormatted: this.formatTime(endTime),
+          downloadUrl: uploadResult.downloadUrl,
+          hasCaptions: addCaptions && clipSegments.length > 0
+        });
+
+        console.log(`✓ Clip ${clipNum} complete: ${uploadResult.downloadUrl}`);
+
+        // Clean up intermediary files
+        await fs.remove(rawClipPath).catch(() => {});
+        if (subtitlePath) await fs.remove(subtitlePath).catch(() => {});
+
+      } catch (clipError) {
+        console.error(`✗ Clip ${clipNum} failed:`, clipError.message);
+        generatedClips.push({
+          clipNumber: clipNum,
+          title: clip.title || `Clip ${clipNum}`,
+          startTime: clip.startTime,
+          endTime: clip.endTime,
+          error: `This clip could not be generated: ${clipError.message}`
+        });
+      }
+    }
+
+    // Final status
+    const successCount = generatedClips.filter(c => c.downloadUrl).length;
+
+    this.updateJob(jobId, {
+      status: 'complete',
+      step: 'done',
+      progress: 100,
+      completedClips: totalClips,
+      generatedClips
+    });
+
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`[ManualClip ${jobId}] GENERATION COMPLETE`);
+    console.log(`${successCount}/${totalClips} clips generated successfully`);
+    console.log('='.repeat(60));
+
+    // Clean up work directory (keep clips until they expire naturally)
+    // The R2 lifecycle will handle cleanup of uploaded clips
+
+    return {
+      success: true,
+      jobId,
+      totalClips,
+      successCount,
+      clips: generatedClips
+    };
+  }
+
+  // ============================================================
+  // VIDEO PROCESSING — MAXIMUM QUALITY
+  // ============================================================
+
+  /**
+   * Extract a clip at MAXIMUM quality
+   * CRF 18 = visually lossless
+   * 192k AAC audio
+   */
+  extractClipMaxQuality(videoPath, startTime, endTime, outputPath) {
+    const duration = endTime - startTime;
+
+    return new Promise((resolve, reject) => {
+      ffmpeg(videoPath)
+        .seekInput(startTime)
+        .duration(duration)
+        .outputOptions([
+          '-c:v', 'libx264',
+          '-preset', 'medium',       // Better quality than 'fast' at cost of speed
+          '-crf', '18',              // MAXIMUM visual quality (visually lossless)
+          '-c:a', 'aac',
+          '-ar', '48000',            // 48kHz audio (studio quality)
+          '-ac', '2',                // Stereo
+          '-b:a', '192k',            // High bitrate audio
+          '-avoid_negative_ts', 'make_zero',
+          '-y'
+        ])
+        .on('start', () => {
+          console.log(`  Extracting (CRF 18): ${this.formatTime(startTime)} → ${this.formatTime(endTime)}`);
+        })
+        .on('end', () => {
+          console.log(`  ✓ Raw clip extracted (max quality)`);
+          resolve(outputPath);
+        })
+        .on('error', (err) => {
+          console.error('  ✗ Extraction error:', err.message);
+          reject(new Error('Could not extract this clip. Please check the timestamps and try again.'));
+        })
+        .save(outputPath);
+    });
+  }
+
+  /**
+   * Process clip with MAX quality: vertical reframe + burn captions
+   * CRF 18 + 192k audio
+   */
+  async processClipMaxQuality(inputPath, outputPath, options) {
+    const { format, subtitlePath, addCaptions } = options;
+
+    let filterParts = [];
+
+    // --- Reframing ---
+    if (format === 'vertical') {
+      // 9:16 vertical (1080x1920)
+      filterParts.push('scale=-1:1920');
+      filterParts.push('crop=1080:1920');
+    } else if (format === 'square') {
+      // 1:1 square (1080x1080)
+      filterParts.push('scale=-1:1080');
+      filterParts.push('crop=1080:1080');
+    }
+    // 'original' = no reframing
+
+    // --- Captions ---
+    if (addCaptions && subtitlePath && await fs.pathExists(subtitlePath)) {
+      const escapedSubPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
+      filterParts.push(`ass='${escapedSubPath}'`);
+    }
+
+    // If no processing needed, just copy
+    if (filterParts.length === 0) {
+      await fs.copy(inputPath, outputPath);
+      return;
+    }
+
+    const filterChain = filterParts.join(',');
+
+    return new Promise((resolve, reject) => {
+      ffmpeg(inputPath)
+        .outputOptions([
+          '-vf', filterChain,
+          '-c:v', 'libx264',
+          '-preset', 'medium',       // Better quality
+          '-crf', '18',              // MAXIMUM visual quality
+          '-c:a', 'aac',
+          '-ar', '48000',
+          '-ac', '2',
+          '-b:a', '192k',            // High bitrate audio
+          '-y'
+        ])
+        .on('start', () => {
+          console.log(`  Processing (MAX quality): ${format} + ${addCaptions ? 'captions' : 'no captions'}`);
+        })
+        .on('end', () => {
+          console.log(`  ✓ Clip processed (CRF 18 + 192k)`);
+          resolve(outputPath);
+        })
+        .on('error', (err) => {
+          console.error('  ✗ Processing error:', err.message);
+          reject(new Error('Could not process this clip. Please try again.'));
+        })
+        .save(outputPath);
+    });
+  }
+
+  // ============================================================
+  // TRANSCRIPTION & CAPTIONS (reused from opusClipService pattern)
+  // ============================================================
+
+  /**
+   * Extract audio for Whisper transcription (compressed)
+   */
+  extractAudioForTranscription(videoPath, audioPath) {
+    return new Promise((resolve, reject) => {
+      ffmpeg(videoPath)
+        .noVideo()
+        .audioCodec('libmp3lame')
+        .audioBitrate('64k')
+        .audioChannels(1)
+        .audioFrequency(16000)
+        .format('mp3')
+        .on('end', () => {
+          console.log('✓ Audio extracted for transcription');
+          resolve(audioPath);
+        })
+        .on('error', (err) => {
+          reject(new Error('Could not extract audio from video.'));
+        })
+        .save(audioPath);
+    });
+  }
+
+  /**
+   * Transcribe long audio by splitting into 10-minute chunks
+   */
+  async transcribeLongAudio(audioPath, workDir, jobId) {
+    const chunksDir = path.join(workDir, 'audio_chunks');
+    await fs.ensureDir(chunksDir);
+
+    const duration = await this.getAudioDuration(audioPath);
+    const chunkDuration = 600; // 10 minutes
+    const numChunks = Math.ceil(duration / chunkDuration);
+
+    console.log(`[ManualClip ${jobId}] Splitting audio into ${numChunks} chunks`);
+
+    let allSegments = [];
+    let fullText = '';
+
+    for (let i = 0; i < numChunks; i++) {
+      const startTime = i * chunkDuration;
+      const chunkPath = path.join(chunksDir, `chunk_${i + 1}.mp3`);
+
+      await new Promise((resolve, reject) => {
+        ffmpeg(audioPath)
+          .seekInput(startTime)
+          .duration(chunkDuration)
+          .audioCodec('libmp3lame')
+          .audioBitrate('64k')
+          .audioChannels(1)
+          .audioFrequency(16000)
+          .on('end', resolve)
+          .on('error', reject)
+          .save(chunkPath);
+      });
+
+      console.log(`[ManualClip ${jobId}] Transcribing chunk ${i + 1}/${numChunks}...`);
+      const chunkTranscription = await transcriptionService.transcribe(chunkPath, {
+        response_format: 'verbose_json'
+      });
+
+      const adjustedSegments = (chunkTranscription.segments || []).map(seg => ({
+        ...seg,
+        start: seg.start + startTime,
+        end: seg.end + startTime
+      }));
+
+      allSegments = allSegments.concat(adjustedSegments);
+      fullText += ' ' + (chunkTranscription.text || '');
+    }
+
+    await fs.remove(chunksDir).catch(() => {});
+
+    return {
+      text: fullText.trim(),
+      segments: allSegments,
+      duration
+    };
+  }
+
+  /**
+   * Get transcript segments that fall within a time range
+   */
+  getSegmentsForTimeRange(segments, startTime, endTime) {
+    return segments.filter(seg => {
+      // Include segments that overlap with our time range
+      return seg.end > startTime && seg.start < endTime;
+    }).map(seg => ({
+      ...seg,
+      // Clamp segment times to clip boundaries
+      start: Math.max(seg.start, startTime),
+      end: Math.min(seg.end, endTime)
+    }));
+  }
+
+  /**
+   * Generate styled ASS subtitles for a clip
+   * Same format as opusClipService for consistency
+   */
+  async generateStyledSubtitles(segments, clipStartTime, outputPath, style) {
+    let fontName = 'Arial';
+    let fontSize = 48;
+    let primaryColor = '&H00FFFFFF';
+    let outlineColor = '&H00000000';
+    let outlineWidth = 3;
+    let shadowDepth = 2;
+    let bold = 1;
+    let alignment = 2; // Bottom center
+
+    switch (style) {
+      case 'bold_white':
+        primaryColor = '&H00FFFFFF';
+        outlineColor = '&H00000000';
+        fontSize = 52;
+        bold = 1;
+        break;
+      case 'yellow_outline':
+        primaryColor = '&H0000FFFF'; // Yellow in ASS (BGR)
+        outlineColor = '&H00000000';
+        fontSize = 48;
+        bold = 1;
+        break;
+      case 'neon_green':
+        primaryColor = '&H0000FF00';
+        outlineColor = '&H00000000';
+        fontSize = 48;
+        bold = 1;
+        break;
+      case 'clean_minimal':
+        primaryColor = '&H00FFFFFF';
+        outlineColor = '&H80000000';
+        fontSize = 42;
+        outlineWidth = 2;
+        shadowDepth = 1;
+        bold = 0;
+        break;
+    }
+
+    // Build ASS file
+    let assContent = `[Script Info]
+Title: Manual Clip Captions
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,${fontName},${fontSize},${primaryColor},&H000000FF,${outlineColor},&H00000000,${bold},0,0,0,100,100,0,0,1,${outlineWidth},${shadowDepth},${alignment},40,40,80,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+`;
+
+    // Add dialogue lines
+    for (const seg of segments) {
+      // Adjust timing relative to clip start
+      const relStart = Math.max(0, seg.start - clipStartTime);
+      const relEnd = seg.end - clipStartTime;
+
+      const startAss = this.secondsToAssTime(relStart);
+      const endAss = this.secondsToAssTime(relEnd);
+
+      // Word wrap for vertical video
+      const wrappedText = this.wrapText(seg.text.trim(), 35);
+      const assText = wrappedText.replace(/\n/g, '\\N');
+
+      if (assText) {
+        assContent += `Dialogue: 0,${startAss},${endAss},Default,,0,0,0,,${assText}\n`;
+      }
+    }
+
+    await fs.writeFile(outputPath, assContent, 'utf8');
+    return outputPath;
+  }
+
+  // ============================================================
+  // UTILITY METHODS
+  // ============================================================
+
+  getVideoDuration(videoPath) {
+    return new Promise((resolve, reject) => {
+      ffmpeg.ffprobe(videoPath, (err, metadata) => {
+        if (err) {
+          reject(new Error('Could not read video file.'));
+          return;
+        }
+        resolve(metadata.format.duration || 0);
+      });
+    });
+  }
+
+  getAudioDuration(audioPath) {
+    return new Promise((resolve, reject) => {
+      ffmpeg.ffprobe(audioPath, (err, metadata) => {
+        if (err) {
+          reject(new Error('Could not read audio file.'));
+          return;
+        }
+        resolve(metadata.format.duration || 0);
+      });
+    });
+  }
+
+  formatTime(seconds) {
+    if (!seconds || seconds <= 0) return '0:00';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    if (h > 0) {
+      return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    }
+    return `${m}:${String(s).padStart(2, '0')}`;
+  }
+
+  secondsToAssTime(seconds) {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    const cs = Math.floor((seconds % 1) * 100);
+    return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(cs).padStart(2, '0')}`;
+  }
+
+  wrapText(text, maxWidth) {
+    if (text.length <= maxWidth) return text;
+    const words = text.split(' ');
+    let lines = [];
+    let currentLine = '';
+    for (const word of words) {
+      if ((currentLine + ' ' + word).trim().length <= maxWidth) {
+        currentLine = (currentLine + ' ' + word).trim();
+      } else {
+        if (currentLine) lines.push(currentLine);
+        currentLine = word;
+      }
+    }
+    if (currentLine) lines.push(currentLine);
+    return lines.join('\n');
+  }
+
+  sanitizeFilename(name) {
+    return name
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '_')
+      .replace(/_+/g, '_')
+      .substring(0, 50);
+  }
+
+  updateJob(jobId, updates) {
+    const current = this.jobs.get(jobId) || {};
+    this.jobs.set(jobId, { ...current, ...updates });
+  }
+
+  getJobStatus(jobId) {
+    return this.jobs.get(jobId) || null;
+  }
+}
+
+module.exports = new ManualClipService();
