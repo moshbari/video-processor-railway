@@ -418,7 +418,8 @@ class ManualClipService {
       step: 'done',
       progress: 100,
       completedClips: totalClips,
-      generatedClips
+      generatedClips,
+      completedAt: new Date().toISOString()
     });
 
     console.log(`\n${'='.repeat(60)}`);
@@ -802,6 +803,44 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
   getJobStatus(jobId) {
     return this.jobs.get(jobId) || null;
+  }
+
+  /**
+   * Get all completed manual clip jobs (for import into Multi-Clip Editor)
+   * Returns jobs that have successfully generated clips with R2 download URLs
+   */
+  getAllCompletedJobs() {
+    const completedJobs = [];
+
+    for (const [jobId, job] of this.jobs.entries()) {
+      if (job.status === 'complete' && job.generatedClips && job.generatedClips.length > 0) {
+        // Only include clips that have a download URL (successfully uploaded to R2)
+        const successfulClips = job.generatedClips.filter(c => c.downloadUrl);
+
+        if (successfulClips.length > 0) {
+          completedJobs.push({
+            jobId,
+            videoTitle: job.videoTitle || 'Untitled Video',
+            clipCount: successfulClips.length,
+            createdAt: job.completedAt || new Date().toISOString(),
+            clips: successfulClips.map(c => ({
+              clipNumber: c.clipNumber,
+              title: c.title,
+              duration: c.duration,
+              durationFormatted: c.durationFormatted,
+              startFormatted: c.startFormatted,
+              endFormatted: c.endFormatted,
+              downloadUrl: c.downloadUrl
+            }))
+          });
+        }
+      }
+    }
+
+    // Sort newest first
+    completedJobs.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    return completedJobs;
   }
 }
 

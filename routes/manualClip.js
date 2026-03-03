@@ -271,4 +271,29 @@ router.get('/status/:jobId', async (req, res) => {
   }
 });
 
+// ============================================================
+// GET /api/manual-clip/jobs
+// List recent completed Manual Clip Maker jobs
+// Used by Multi-Clip Editor to import reaction clips
+// ============================================================
+router.get('/jobs', async (req, res) => {
+  try {
+    const allJobs = manualClipService.getAllCompletedJobs();
+
+    console.log(`[ManualClip] Jobs endpoint: returning ${allJobs.length} completed jobs`);
+
+    res.json({
+      success: true,
+      jobs: allJobs
+    });
+
+  } catch (error) {
+    console.error('[ManualClip] Jobs list error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Could not retrieve clip maker jobs.'
+    });
+  }
+});
+
 module.exports = router;

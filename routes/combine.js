@@ -148,6 +148,38 @@ async function ensureSplitClipsAvailable(splitJobId) {
 }
 
 /**
+ * Download reaction clips from R2 URLs to local temp directory
+ * Used when importing reactions from Manual Clip Maker
+ */
+async function downloadReactionsFromR2(r2Urls, jobId) {
+  const tempDir = process.env.TEMP_DIR || '/app/temp';
+  const reactionsDir = path.join(tempDir, `reactions-${jobId}`);
+  await fs.ensureDir(reactionsDir);
+
+  const localPaths = [];
+
+  for (let i = 0; i < r2Urls.length; i++) {
+    const url = r2Urls[i];
+    if (!url) {
+      localPaths.push(null);
+      continue;
+    }
+
+    const localPath = path.join(reactionsDir, `reaction_${i + 1}.mp4`);
+    try {
+      console.log(`Downloading reaction ${i + 1} from R2: ${url}`);
+      await r2Service.downloadFile(url, localPath);
+      localPaths.push(localPath);
+    } catch (err) {
+      console.error(`Failed to download reaction ${i + 1}: ${err.message}`);
+      localPaths.push(null);
+    }
+  }
+
+  return localPaths;
+}
+
+/**
  * Validate pipPosition parameter
  */
 function validatePipPosition(position) {
@@ -314,10 +346,54 @@ router.post('/from-split/:splitJobId', upload.array('reactionClips', 20), async 
     const originalClipPaths = originalClipFiles.map(f => path.join(splitDir, f));
     console.log(`Found ${originalClipPaths.length} original clips`);
     
-    // Process reaction clips
+    // Process reaction clips — from file uploads OR from R2 URLs (Clip Maker import)
     const reactionClipPaths = new Array(originalClipPaths.length).fill(null);
     
-    if (req.files && req.files.length > 0) {
+    // Check if reactions are coming from R2 URLs (Clip Maker import)
+    let reactionR2Urls = null;
+    if (req.body.reactionR2Urls) {
+      try {
+        reactionR2Urls = JSON.parse(req.body.reactionR2Urls);
+      } catch (e) {
+        console.warn('Failed to parse reactionR2Urls');
+      }
+    }
+
+    if (reactionR2Urls && Array.isArray(reactionR2Urls) && reactionR2Urls.length > 0) {
+      // === CLIP MAKER IMPORT PATH ===
+      console.log(`\n📥 Importing ${reactionR2Urls.length} reactions from Clip Maker (R2 URLs)`);
+      
+      const downloadedPaths = await downloadReactionsFromR2(reactionR2Urls, jobId);
+      
+      // Map downloaded reactions to clip positions
+      let indices = null;
+      if (req.body.reactionIndices) {
+        try {
+          indices = JSON.parse(req.body.reactionIndices);
+        } catch (e) {
+          console.warn('Failed to parse reactionIndices for R2 import, using sequential mapping');
+        }
+      }
+
+      if (indices && Array.isArray(indices)) {
+        downloadedPaths.forEach((filePath, i) => {
+          if (filePath) {
+            const clipIndex = indices[i];
+            if (typeof clipIndex === 'number' && clipIndex >= 0 && clipIndex < originalClipPaths.length) {
+              reactionClipPaths[clipIndex] = filePath;
+              console.log(`Mapped R2 reaction ${i} to clip ${clipIndex}`);
+            }
+          }
+        });
+      } else {
+        downloadedPaths.forEach((filePath, i) => {
+          if (filePath && i < originalClipPaths.length) {
+            reactionClipPaths[i] = filePath;
+          }
+        });
+      }
+    } else if (req.files && req.files.length > 0) {
+      // === NORMAL FILE UPLOAD PATH ===
       let indices = null;
       if (req.body.reactionIndices) {
         try {
