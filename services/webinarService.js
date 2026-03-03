@@ -110,9 +110,9 @@ class WebinarService {
    * Standardize video for consistent concatenation
    */
   async standardizeVideo(inputPath, outputPath, jobId) {
-    const command = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset medium -crf 23 -r 30 -c:a aac -b:a 128k -ar 44100 "${outputPath}"`;
+    const command = `ffmpeg -y -i "${inputPath}" -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1" -c:v libx264 -preset medium -crf 23 -r 30 -pix_fmt yuv420p -c:a aac -b:a 128k -ar 44100 -ac 2 "${outputPath}"`;
     
-    console.log(`[${jobId}] Standardizing video...`);
+    console.log(`[${jobId}] Standardizing video to 1920x1080 @ 30fps...`);
     await this.runCommand(command, jobId);
   }
 
@@ -120,9 +120,11 @@ class WebinarService {
    * Apply full-frame image overlay to video
    */
   async applyOverlay(videoPath, imagePath, outputPath, jobId) {
-    const command = `ffmpeg -y -i "${videoPath}" -i "${imagePath}" -filter_complex "[1:v]scale=iw:ih[ovr];[0:v][ovr]overlay=0:0:format=auto" -c:v libx264 -preset medium -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
+    // Use scale2ref to scale overlay image to match video dimensions
+    // Output with same standardized settings as standardizeVideo to prevent transition glitches
+    const command = `ffmpeg -y -i "${videoPath}" -i "${imagePath}" -filter_complex "[0:v][1:v]scale2ref[base][ovr];[base][ovr]overlay=0:0:format=auto" -c:v libx264 -preset medium -crf 23 -r 30 -pix_fmt yuv420p -c:a aac -b:a 128k -ar 44100 -ac 2 "${outputPath}"`;
     
-    console.log(`[${jobId}] Applying overlay...`);
+    console.log(`[${jobId}] Applying overlay (with standardized output)...`);
     await this.runCommand(command, jobId);
   }
 
@@ -130,10 +132,10 @@ class WebinarService {
    * Concatenate two videos using concat filter
    */
   async concatenateVideos(video1Path, video2Path, outputPath, jobId) {
-    // Using concat filter for reliable concatenation
-    const command = `ffmpeg -y -i "${video1Path}" -i "${video2Path}" -filter_complex "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[outv][outa]" -map "[outv]" -map "[outa]" -c:v libx264 -preset medium -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
+    // Using concat filter with full re-encoding for seamless, gap-free transitions
+    const command = `ffmpeg -y -i "${video1Path}" -i "${video2Path}" -filter_complex "[0:v:0][0:a:0][1:v:0][1:a:0]concat=n=2:v=1:a=1[outv][outa]" -map "[outv]" -map "[outa]" -c:v libx264 -preset medium -crf 23 -r 30 -pix_fmt yuv420p -c:a aac -b:a 128k -ar 44100 -ac 2 -movflags +faststart "${outputPath}"`;
     
-    console.log(`[${jobId}] Concatenating videos...`);
+    console.log(`[${jobId}] Concatenating videos (re-encoding for seamless transition)...`);
     await this.runCommand(command, jobId);
   }
 
