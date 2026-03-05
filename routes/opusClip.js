@@ -17,9 +17,25 @@ const { v4: uuidv4 } = require('uuid');
 
 const opusClipService = require('../services/opusClipService');
 
+// Upload directory
+const opusUploadDir = path.join(process.env.TEMP_DIR || '/app/temp', 'opus-uploads');
+fs.ensureDirSync(opusUploadDir);
+
+// Use custom DiskStorage to ensure directory exists before every upload
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    fs.ensureDirSync(opusUploadDir);
+    cb(null, opusUploadDir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueName = require('crypto').randomBytes(16).toString('hex') + path.extname(file.originalname);
+    cb(null, uniqueName);
+  }
+});
+
 // Configure multer for video uploads (max 5GB)
 const upload = multer({
-  dest: path.join(process.env.TEMP_DIR || '/app/temp', 'opus-uploads'),
+  storage: storage,
   limits: { fileSize: 5 * 1024 * 1024 * 1024 } // 5GB
 });
 

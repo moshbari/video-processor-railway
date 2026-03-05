@@ -16,14 +16,29 @@ const fs = require('fs-extra');
 
 const manualClipService = require('../services/manualClipService');
 
-// Ensure upload directory exists (safety net — cleanup service should never delete it,
-// but this guarantees it exists even if the server just restarted)
+// Upload directory for manual clip videos
 const uploadDir = path.join(process.env.TEMP_DIR || '/app/temp', 'manual-uploads');
-fs.mkdirSync(uploadDir, { recursive: true });
+
+// Ensure it exists at startup
+fs.ensureDirSync(uploadDir);
+
+// Use custom DiskStorage so the directory is verified before EVERY upload
+// (Railway's ephemeral filesystem can lose directories between requests)
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    fs.ensureDirSync(uploadDir);  // Re-ensure before each upload
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    // Use a unique ID + original extension for the temp file
+    const uniqueName = require('crypto').randomBytes(16).toString('hex') + path.extname(file.originalname);
+    cb(null, uniqueName);
+  }
+});
 
 // Configure multer for video uploads (max 5GB)
 const upload = multer({
-  dest: uploadDir,
+  storage: storage,
   limits: { fileSize: 5 * 1024 * 1024 * 1024 } // 5GB
 });
 
