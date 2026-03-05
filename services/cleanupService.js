@@ -34,6 +34,17 @@ class CleanupService {
       
       const now = Date.now();
       const maxAge = this.retentionHours * 60 * 60 * 1000;
+
+      // These subdirectories must NEVER be deleted — only their contents
+      const PERMANENT_SUBDIRS = new Set([
+        'uploads',
+        'manual-uploads',
+        'library-uploads',
+        'library-thumbs',
+        'webinar-sessions',
+        'webinar-render',
+        'opus-uploads'
+      ]);
       
       if (!await fs.pathExists(this.tempDir)) {
         console.log('   Temp directory does not exist, nothing to clean');
@@ -46,7 +57,8 @@ class CleanupService {
       let freedBytes = 0;
 
       for (const entry of entries) {
-        if (entry === 'uploads') continue;
+        // Never delete permanent subdirectories themselves
+        if (PERMANENT_SUBDIRS.has(entry)) continue;
 
         const entryPath = path.join(this.tempDir, entry);
         
@@ -69,26 +81,34 @@ class CleanupService {
         }
       }
 
-      // Also clean uploads folder
-      const uploadsDir = path.join(this.tempDir, 'uploads');
-      if (await fs.pathExists(uploadsDir)) {
-        const uploadEntries = await fs.readdir(uploadsDir);
-        for (const entry of uploadEntries) {
-          const entryPath = path.join(uploadsDir, entry);
-          try {
-            const stats = await fs.stat(entryPath);
-            const age = now - stats.mtimeMs;
-            if (age > maxAge) {
-              const size = await this.getDirectorySize(entryPath);
-              freedBytes += size;
-              await fs.remove(entryPath);
-              console.log(`   ✓ Deleted upload: ${entry}`);
-              deleted++;
+      // Clean individual files inside permanent upload subdirectories
+      const uploadSubdirs = ['uploads', 'manual-uploads', 'opus-uploads', 'library-uploads'];
+      for (const dirName of uploadSubdirs) {
+        const dirPath = path.join(this.tempDir, dirName);
+        if (await fs.pathExists(dirPath)) {
+          const dirEntries = await fs.readdir(dirPath);
+          for (const entry of dirEntries) {
+            const entryPath = path.join(dirPath, entry);
+            try {
+              const stats = await fs.stat(entryPath);
+              const age = now - stats.mtimeMs;
+              if (age > maxAge) {
+                const size = await this.getDirectorySize(entryPath);
+                freedBytes += size;
+                await fs.remove(entryPath);
+                console.log(`   ✓ Deleted ${dirName}/${entry}`);
+                deleted++;
+              }
+            } catch (err) {
+              console.error(`   ✗ Error processing ${dirName}/${entry}:`, err.message);
             }
-          } catch (err) {
-            console.error(`   ✗ Error processing upload ${entry}:`, err.message);
           }
         }
+      }
+
+      // Re-ensure all permanent subdirectories still exist after cleanup
+      for (const dirName of PERMANENT_SUBDIRS) {
+        await fs.ensureDir(path.join(this.tempDir, dirName));
       }
 
       console.log(`🧹 Cleanup complete: ${deleted} deleted, ${kept} kept, ${this.formatBytes(freedBytes)} freed`);

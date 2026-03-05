@@ -16,9 +16,14 @@ const fs = require('fs-extra');
 
 const manualClipService = require('../services/manualClipService');
 
+// Ensure upload directory exists (safety net — cleanup service should never delete it,
+// but this guarantees it exists even if the server just restarted)
+const uploadDir = path.join(process.env.TEMP_DIR || '/app/temp', 'manual-uploads');
+fs.mkdirSync(uploadDir, { recursive: true });
+
 // Configure multer for video uploads (max 5GB)
 const upload = multer({
-  dest: path.join(process.env.TEMP_DIR || '/app/temp', 'manual-uploads'),
+  dest: uploadDir,
   limits: { fileSize: 5 * 1024 * 1024 * 1024 } // 5GB
 });
 
