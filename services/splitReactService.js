@@ -106,7 +106,9 @@ class TwoClipReactionService {
       '-preset', 'fast',
       '-crf', '23',
       '-c:a', 'aac',
-      '-b:a', '128k',
+      '-ar', '48000',
+      '-ac', '2',
+      '-b:a', '192k',
       outputPath
     ];
     
@@ -367,7 +369,9 @@ class TwoClipReactionService {
       '-preset', 'fast',
       '-crf', '23',
       '-c:a', 'aac',
-      '-b:a', '128k',
+      '-ar', '48000',
+      '-ac', '2',
+      '-b:a', '192k',
       '-shortest',
       outputPath
     ];
@@ -516,10 +520,9 @@ class TwoClipReactionService {
         '-crf', '23',
         '-pix_fmt', 'yuv420p',
         '-c:a', 'aac',
-        '-ar', '44100',
+        '-ar', '48000',
         '-ac', '2',
-        '-b:a', '128k',
-        '-async', '1',  // Force audio sync
+        '-b:a', '192k',
         normalizedBgPath
       ];
       await runFFmpegCommand(pass1Args);
@@ -632,10 +635,9 @@ class TwoClipReactionService {
         '-crf', '23',
         '-pix_fmt', 'yuv420p',
         '-c:a', 'aac',
-        '-ar', '44100',
+        '-ar', '48000',
         '-ac', '2',
-        '-b:a', '128k',
-        '-async', '1',  // Force audio sync
+        '-b:a', '192k',
         normalizedPipPath
       ];
       await runFFmpegCommand(pass2Args);
@@ -688,22 +690,46 @@ class TwoClipReactionService {
    */
   async concatenateVideos(videoPaths, outputPath) {
     const workDir = path.dirname(outputPath);
-    const concatListPath = path.join(workDir, 'concat_list.txt');
-
-    // Create concat list file
-    const concatContent = videoPaths.map(p => `file '${p}'`).join('\n');
-    await fs.writeFile(concatListPath, concatContent);
-
+    
+    console.log(`  Concatenating ${videoPaths.length} videos with concat filter...`);
+    
+    // Build input arguments
+    const inputArgs = [];
+    videoPaths.forEach(p => {
+      inputArgs.push('-i', p);
+    });
+    
+    // Build filter_complex to normalize all clips before concatenating
+    const filterParts = [];
+    const concatInputs = [];
+    
+    for (let i = 0; i < videoPaths.length; i++) {
+      // Normalize video: consistent resolution, fps, pixel format
+      filterParts.push(`[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p,setsar=1[v${i}]`);
+      // Normalize audio: consistent sample rate, channels, format
+      filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
+      concatInputs.push(`[v${i}][a${i}]`);
+    }
+    
+    // Concat all normalized streams
+    filterParts.push(`${concatInputs.join('')}concat=n=${videoPaths.length}:v=1:a=1[outv][outa]`);
+    
+    const filterComplex = filterParts.join(';');
+    
     const args = [
       '-y',
-      '-f', 'concat',
-      '-safe', '0',
-      '-i', concatListPath,
+      ...inputArgs,
+      '-filter_complex', filterComplex,
+      '-map', '[outv]',
+      '-map', '[outa]',
       '-c:v', 'libx264',
       '-preset', 'fast',
       '-crf', '23',
       '-c:a', 'aac',
-      '-b:a', '128k',
+      '-ar', '48000',
+      '-ac', '2',
+      '-b:a', '192k',
+      '-movflags', '+faststart',
       outputPath
     ];
 

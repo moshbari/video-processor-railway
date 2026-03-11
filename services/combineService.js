@@ -88,7 +88,7 @@ async function standardizeClipTo30fps(inputPath, outputPath) {
     
     // Simple re-encode with fixed parameters
     // The concat FILTER will handle the rest, but this ensures clean input
-    const cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset fast -crf 23 -r 30 -c:a aac -ar 44100 -b:a 128k -pix_fmt yuv420p "${outputPath}"`;
+    const cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset fast -crf 23 -r 30 -c:a aac -ar 48000 -ac 2 -b:a 192k -pix_fmt yuv420p "${outputPath}"`;
     
     exec(cmd, (error, stdout, stderr) => {
       if (error) {
@@ -259,7 +259,7 @@ async function concatenateClips(clipPaths, outputPath) {
       // Scale each video to same size and fps
       filterParts.push(`[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p[v${i}]`);
       // Normalize audio format
-      filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a${i}]`);
+      filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
       concatInputs += `[v${i}][a${i}]`;
     }
     
