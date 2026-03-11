@@ -699,14 +699,15 @@ class TwoClipReactionService {
       inputArgs.push('-i', p);
     });
     
-    // Build filter_complex to normalize all clips before concatenating
+    // Build filter_complex - normalize audio format to prevent pitch issues
+    // Video streams are already normalized upstream, so just pass them through
     const filterParts = [];
     const concatInputs = [];
     
     for (let i = 0; i < videoPaths.length; i++) {
-      // Normalize video: consistent resolution, fps, pixel format
-      filterParts.push(`[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p,setsar=1[v${i}]`);
-      // Normalize audio: consistent sample rate, channels, format
+      // Pass video through with consistent fps and pixel format (lightweight)
+      filterParts.push(`[${i}:v]fps=30,format=yuv420p,setsar=1[v${i}]`);
+      // Normalize audio: consistent sample rate to prevent pitch shifting
       filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
       concatInputs.push(`[v${i}][a${i}]`);
     }
