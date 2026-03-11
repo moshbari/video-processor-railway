@@ -457,12 +457,12 @@ class ManualClipService {
         .duration(duration)
         .outputOptions([
           '-c:v', 'libx264',
-          '-preset', 'medium',       // Better quality than 'fast' at cost of speed
+          '-preset', 'slow',       // Better quality than 'fast' at cost of speed
           '-crf', '18',              // MAXIMUM visual quality (visually lossless)
           '-c:a', 'aac',
           '-ar', '48000',            // 48kHz audio (studio quality)
           '-ac', '2',                // Stereo
-          '-b:a', '192k',            // High bitrate audio
+          '-b:a', '320k',            // High bitrate audio
           '-avoid_negative_ts', 'make_zero',
           '-y'
         ])
@@ -521,12 +521,12 @@ class ManualClipService {
         .outputOptions([
           '-vf', filterChain,
           '-c:v', 'libx264',
-          '-preset', 'medium',       // Better quality
+          '-preset', 'slow',       // Better quality
           '-crf', '18',              // MAXIMUM visual quality
           '-c:a', 'aac',
           '-ar', '48000',
           '-ac', '2',
-          '-b:a', '192k',            // High bitrate audio
+          '-b:a', '320k',            // High bitrate audio
           '-y'
         ])
         .on('start', () => {

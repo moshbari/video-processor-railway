@@ -540,12 +540,12 @@ RESPOND WITH ONLY valid JSON in this exact format (no markdown, no backticks, no
         .duration(duration)
         .outputOptions([
           '-c:v', 'libx264',
-          '-preset', 'fast',
-          '-crf', '23',
+          '-preset', 'slow',
+          '-crf', '18',
           '-c:a', 'aac',
-          '-ar', '44100',
+          '-ar', '48000',
           '-ac', '2',
-          '-b:a', '128k',
+          '-b:a', '320k',
           '-avoid_negative_ts', 'make_zero',
           '-y'
         ])
@@ -616,12 +616,12 @@ RESPOND WITH ONLY valid JSON in this exact format (no markdown, no backticks, no
       command.outputOptions([
         '-vf', filterChain,
         '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
+        '-preset', 'slow',
+        '-crf', '18',
         '-c:a', 'aac',
-        '-ar', '44100',
+        '-ar', '48000',
         '-ac', '2',
-        '-b:a', '128k',
+        '-b:a', '320k',
         '-y'
       ]);
 
