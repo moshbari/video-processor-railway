@@ -176,13 +176,13 @@ class SingleReactionService {
     const frozenPath = outputPath.replace('.mp4', '_frozen.mp4');
     
     // Pass 1: Create frozen frame video with silent audio
-    const frozenCmd = `ffmpeg -loop 1 -i "${lastFramePath}" -f lavfi -i anullsrc=r=48000:cl=stereo -t ${freezeDuration} -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -r 30 -c:a aac -ar 48000 -ac 2 -b:a 256k -shortest -y "${frozenPath}"`;
+    const frozenCmd = `ffmpeg -loop 1 -i "${lastFramePath}" -f lavfi -i anullsrc=r=48000:cl=stereo -t ${freezeDuration} -c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p -r 30 -c:a aac -ar 48000 -ac 2 -b:a 320k -shortest -y "${frozenPath}"`;
     console.log('Creating frozen segment:', frozenCmd);
     await execPromise(frozenCmd);
 
     // Normalize main video to same format
     const normalizedMainPath = outputPath.replace('.mp4', '_normalized.mp4');
-    const normalizeCmd = `ffmpeg -i "${mainVideoPath}" -vf "scale=${dimensions.width}:${dimensions.height}:force_original_aspect_ratio=decrease,pad=${dimensions.width}:${dimensions.height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1" -r 30 -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -c:a aac -ar 48000 -ac 2 -b:a 256k -y "${normalizedMainPath}"`;
+    const normalizeCmd = `ffmpeg -i "${mainVideoPath}" -vf "scale=${dimensions.width}:${dimensions.height}:force_original_aspect_ratio=decrease,pad=${dimensions.width}:${dimensions.height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1" -r 30 -c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p -c:a aac -ar 48000 -ac 2 -b:a 320k -y "${normalizedMainPath}"`;
     console.log('Normalizing main video:', normalizeCmd);
     await execPromise(normalizeCmd);
 
@@ -265,7 +265,7 @@ class SingleReactionService {
       `[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0[outa]`
     ].join(';');
 
-    const cmd = `ffmpeg -i "${backgroundVideoPath}" -i "${pipVideoPath}" -filter_complex "${filterComplex}" -map "[outv]" -map "[outa]" -c:v libx264 -preset medium -crf 20 -c:a aac -ar 48000 -ac 2 -b:a 256k -movflags +faststart -y "${outputPath}"`;
+    const cmd = `ffmpeg -i "${backgroundVideoPath}" -i "${pipVideoPath}" -filter_complex "${filterComplex}" -map "[outv]" -map "[outa]" -c:v libx264 -preset slow -crf 18 -c:a aac -ar 48000 -ac 2 -b:a 320k -movflags +faststart -y "${outputPath}"`;
     
     console.log('Creating PiP video (single pass):', cmd);
     await execPromise(cmd);
