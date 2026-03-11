@@ -103,12 +103,12 @@ class TwoClipReactionService {
       '-i', inputPath,
       '-t', duration.toString(),
       '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '23',
+      '-preset', 'medium',
+      '-crf', '20',
       '-c:a', 'aac',
       '-ar', '48000',
       '-ac', '2',
-      '-b:a', '192k',
+      '-b:a', '256k',
       outputPath
     ];
     
@@ -366,12 +366,12 @@ class TwoClipReactionService {
       '-map', '[outv]',
       '-map', audioMap,
       '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '23',
+      '-preset', 'medium',
+      '-crf', '20',
       '-c:a', 'aac',
       '-ar', '48000',
       '-ac', '2',
-      '-b:a', '192k',
+      '-b:a', '256k',
       '-shortest',
       outputPath
     ];
@@ -516,13 +516,13 @@ class TwoClipReactionService {
         '-vf', `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
         '-r', '30',
         '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
+        '-preset', 'medium',
+        '-crf', '20',
         '-pix_fmt', 'yuv420p',
         '-c:a', 'aac',
         '-ar', '48000',
         '-ac', '2',
-        '-b:a', '192k',
+        '-b:a', '256k',
         normalizedBgPath
       ];
       await runFFmpegCommand(pass1Args);
@@ -548,8 +548,8 @@ class TwoClipReactionService {
         '-vf', `scale=${pipWidth}:-2,setsar=1`,
         '-r', '30',
         '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
+        '-preset', 'medium',
+        '-crf', '20',
         '-pix_fmt', 'yuv420p',
         '-an',
         normalizedPipPath
@@ -574,8 +574,8 @@ class TwoClipReactionService {
         '-map', '[outv]',
         '-map', '0:a',
         '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
+        '-preset', 'medium',
+        '-crf', '20',
         '-c:a', 'copy',  // Just copy the already-normalized audio
         '-movflags', '+faststart',
         outputPath
@@ -609,8 +609,8 @@ class TwoClipReactionService {
         '-vf', `scale=${targetWidth}:${targetHeight},setsar=1`,
         '-r', '30',
         '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
+        '-preset', 'medium',
+        '-crf', '20',
         '-pix_fmt', 'yuv420p',
         '-an',  // No audio
         normalizedBgPath
@@ -631,13 +631,13 @@ class TwoClipReactionService {
         '-vf', `scale=${pipWidth}:-2,setsar=1`,
         '-r', '30',
         '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
+        '-preset', 'medium',
+        '-crf', '20',
         '-pix_fmt', 'yuv420p',
         '-c:a', 'aac',
         '-ar', '48000',
         '-ac', '2',
-        '-b:a', '192k',
+        '-b:a', '256k',
         normalizedPipPath
       ];
       await runFFmpegCommand(pass2Args);
@@ -660,8 +660,8 @@ class TwoClipReactionService {
         '-map', '[outv]',
         '-map', '1:a',  // Audio from PiP (the react clip)
         '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
+        '-preset', 'medium',
+        '-crf', '20',
         '-c:a', 'copy',  // Just copy already-normalized audio
         '-movflags', '+faststart',
         '-shortest',
@@ -724,12 +724,12 @@ class TwoClipReactionService {
       '-map', '[outv]',
       '-map', '[outa]',
       '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '23',
+      '-preset', 'medium',
+      '-crf', '20',
       '-c:a', 'aac',
       '-ar', '48000',
       '-ac', '2',
-      '-b:a', '192k',
+      '-b:a', '256k',
       '-movflags', '+faststart',
       outputPath
     ];

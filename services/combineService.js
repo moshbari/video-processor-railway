@@ -88,7 +88,7 @@ async function standardizeClipTo30fps(inputPath, outputPath) {
     
     // Simple re-encode with fixed parameters
     // The concat FILTER will handle the rest, but this ensures clean input
-    const cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset fast -crf 23 -r 30 -c:a aac -ar 48000 -ac 2 -b:a 192k -pix_fmt yuv420p "${outputPath}"`;
+    const cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset medium -crf 20 -r 30 -c:a aac -ar 48000 -ac 2 -b:a 192k -pix_fmt yuv420p "${outputPath}"`;
     
     exec(cmd, (error, stdout, stderr) => {
       if (error) {
@@ -122,7 +122,7 @@ async function extractLastFrame(videoPath, outputPath) {
 
 async function createBackgroundVideo(framePath, outputPath, duration, width, height, audioSource) {
   return new Promise((resolve, reject) => {
-    const cmd = `ffmpeg -y -loop 1 -i "${framePath}" -i "${audioSource}" -t ${duration} -vf "scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=30" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -shortest "${outputPath}"`;
+    const cmd = `ffmpeg -y -loop 1 -i "${framePath}" -i "${audioSource}" -t ${duration} -vf "scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=30" -c:v libx264 -preset medium -crf 20 -c:a aac -b:a 256k -shortest "${outputPath}"`;
     exec(cmd, (error, stdout, stderr) => {
       if (error) {
         console.error('Background video error:', stderr);
@@ -141,7 +141,7 @@ async function overlayPip(bgPath, pipPath, outputPath, coords, targetWidth, targ
     const pipHeight = Math.floor(targetHeight * 0.25);
 
     const filterComplex = `[1:v]scale=${pipWidth}:${pipHeight}[pip];[0:v][pip]overlay=${coords.x}:${coords.y}[outv]`;
-    const cmd = `ffmpeg -y -i "${bgPath}" -i "${pipPath}" -filter_complex "${filterComplex}" -map "[outv]" -map 0:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
+    const cmd = `ffmpeg -y -i "${bgPath}" -i "${pipPath}" -filter_complex "${filterComplex}" -map "[outv]" -map 0:a -c:v libx264 -preset medium -crf 20 -c:a aac -b:a 256k "${outputPath}"`;
 
     exec(cmd, (error, stdout, stderr) => {
       if (error) {
@@ -195,7 +195,7 @@ async function createPipSegment(originalPath, reactionPath, outputPath, targetWi
   console.log(`  Creating frozen background (${reactionDuration}s)...`);
   
   await new Promise((resolve, reject) => {
-    const cmd = `ffmpeg -y -loop 1 -i "${lastFramePath}" -i "${reactionPath}" -t ${reactionDuration} -vf "scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,fps=30" -map 0:v -map 1:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -shortest "${frozenBgPath}"`;
+    const cmd = `ffmpeg -y -loop 1 -i "${lastFramePath}" -i "${reactionPath}" -t ${reactionDuration} -vf "scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,fps=30" -map 0:v -map 1:a -c:v libx264 -preset medium -crf 20 -c:a aac -b:a 256k -shortest "${frozenBgPath}"`;
     exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
       if (error) reject(error);
       else resolve();
@@ -212,7 +212,7 @@ async function createPipSegment(originalPath, reactionPath, outputPath, targetWi
   ].join(';');
 
   // Use audio from frozen background (which has reaction audio)
-  const cmd = `ffmpeg -y -i "${frozenBgPath}" -i "${reactionPath}" -filter_complex "${filterComplex}" -map "[outv]" -map 0:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
+  const cmd = `ffmpeg -y -i "${frozenBgPath}" -i "${reactionPath}" -filter_complex "${filterComplex}" -map "[outv]" -map 0:a -c:v libx264 -preset medium -crf 20 -c:a aac -b:a 256k "${outputPath}"`;
 
   await new Promise((resolve, reject) => {
     exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
@@ -278,10 +278,10 @@ async function concatenateClips(clipPaths, outputPath) {
       '-map', '[outv]',
       '-map', '[outa]',
       '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '23',
+      '-preset', 'medium',
+      '-crf', '20',
       '-c:a', 'aac',
-      '-b:a', '128k',
+      '-b:a', '256k',
       '-movflags', '+faststart',
       outputPath
     ];
