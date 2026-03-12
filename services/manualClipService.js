@@ -73,6 +73,11 @@ class ManualClipService {
         videoDuration = downloadResult.duration || 0;
       } else if (input.videoPath) {
         videoPath = input.videoPath;
+        // Use the original filename (without extension) as the title
+        if (input.originalFilename) {
+          const nameWithoutExt = require('path').parse(input.originalFilename).name;
+          videoTitle = nameWithoutExt;
+        }
       } else {
         throw new Error('Please provide a video URL or upload a video file.');
       }

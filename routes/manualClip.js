@@ -70,6 +70,7 @@ router.post('/prepare', upload.single('video'), async (req, res) => {
       input.url = url;
     } else if (req.file) {
       input.videoPath = req.file.path;
+      input.originalFilename = req.file.originalname;
     }
 
     // Start preparation (synchronous — returns when ready)
@@ -131,6 +132,7 @@ router.post('/prepare-async', upload.single('video'), async (req, res) => {
       input.url = url;
     } else if (req.file) {
       input.videoPath = req.file.path;
+      input.originalFilename = req.file.originalname;
     }
 
     // Run in background (don't await)
