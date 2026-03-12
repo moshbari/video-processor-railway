@@ -176,11 +176,14 @@ router.post('/from-url', upload.fields([
       layoutMode = 'watchReact',
       pipPosition = 'top-right', 
       pipScale = 35,
-      title = ''
+      title = '',
+      captions = 'false',
+      captionStyle = 'boldPop'
     } = req.body;
     
     const watchClipPath = req.files?.watchClip?.[0]?.path;
     const reactClipPath = req.files?.reactClip?.[0]?.path;
+    const captionsEnabled = captions === 'true' || captions === true;
 
     // Validate inputs
     if (!videoUrl) {
@@ -217,6 +220,7 @@ router.post('/from-url', upload.fields([
     console.log(`Mode: ${modeName}`);
     console.log(`URL: ${videoUrl}`);
     console.log(`Position: ${pipPosition}, Scale: ${pipScale}%`);
+    console.log(`Captions: ${captionsEnabled ? `ON (${captionStyle})` : 'OFF'}`);
 
     // Download main video
     console.log('Downloading main video...');
@@ -232,7 +236,9 @@ router.post('/from-url', upload.fields([
       {
         layoutMode,
         pipPosition,
-        pipScale: parseInt(pipScale, 10)
+        pipScale: parseInt(pipScale, 10),
+        captions: captionsEnabled,
+        captionStyle
       }
     );
 
@@ -374,13 +380,16 @@ router.post('/from-upload', upload.fields([
       layoutMode = 'watchReact',
       pipPosition = 'top-right', 
       pipScale = 35,
-      title = ''
+      title = '',
+      captions = 'false',
+      captionStyle = 'boldPop'
     } = req.body;
     
     const mainVideoPath = req.files?.mainVideo?.[0]?.path;
     const mainVideoName = req.files?.mainVideo?.[0]?.originalname || '';
     const watchClipPath = req.files?.watchClip?.[0]?.path;
     const reactClipPath = req.files?.reactClip?.[0]?.path;
+    const captionsEnabled = captions === 'true' || captions === true;
 
     // Validate inputs
     if (!mainVideoPath) {
@@ -418,6 +427,7 @@ router.post('/from-upload', upload.fields([
     console.log(`Watch clip: ${watchClipPath}`);
     console.log(`React clip: ${reactClipPath}`);
     console.log(`Position: ${pipPosition}, Scale: ${pipScale}%`);
+    console.log(`Captions: ${captionsEnabled ? `ON (${captionStyle})` : 'OFF'}`);
 
     // Create Split React video
     const result = await splitReactService.createTwoClipReactionVideo(
@@ -427,7 +437,9 @@ router.post('/from-upload', upload.fields([
       {
         layoutMode,
         pipPosition,
-        pipScale: parseInt(pipScale, 10)
+        pipScale: parseInt(pipScale, 10),
+        captions: captionsEnabled,
+        captionStyle
       }
     );
 
@@ -565,11 +577,14 @@ router.post('/from-fetched', upload.fields([
       layoutMode = 'watchReact',
       pipPosition = 'top-right', 
       pipScale = 35,
-      title = ''
+      title = '',
+      captions = 'false',
+      captionStyle = 'boldPop'
     } = req.body;
     
     const watchClipPath = req.files?.watchClip?.[0]?.path;
     const reactClipPath = req.files?.reactClip?.[0]?.path;
+    const captionsEnabled = captions === 'true' || captions === true;
 
     // Validate fetchId
     if (!fetchId) {
@@ -616,6 +631,7 @@ router.post('/from-fetched', upload.fields([
     console.log(`Main video: ${fetchedData.filePath}`);
     console.log(`Original URL: ${fetchedData.originalUrl}`);
     console.log(`Position: ${pipPosition}, Scale: ${pipScale}%`);
+    console.log(`Captions: ${captionsEnabled ? `ON (${captionStyle})` : 'OFF'}`);
 
     // Create Split React video
     const result = await splitReactService.createTwoClipReactionVideo(
@@ -625,7 +641,9 @@ router.post('/from-fetched', upload.fields([
       {
         layoutMode,
         pipPosition,
-        pipScale: parseInt(pipScale, 10)
+        pipScale: parseInt(pipScale, 10),
+        captions: captionsEnabled,
+        captionStyle
       }
     );
 
@@ -998,6 +1016,34 @@ router.delete('/:jobId', async (req, res) => {
       error: error.message
     });
   }
+});
+
+// ============================================================
+// CAPTION STYLES ENDPOINT
+// ============================================================
+
+/**
+ * GET /api/split-react/caption-styles
+ * Returns available caption styles for the frontend picker
+ */
+router.get('/caption-styles', (req, res) => {
+  const captionService = require('../services/captionService');
+  
+  const styles = [
+    { id: 'boldPop', name: 'Bold Pop', tag: 'MRBEAST', tagColor: '#FFE500', description: 'MrBeast viral style — big, punchy, yellow highlight on active word' },
+    { id: 'hormoziStack', name: 'Hormozi Stack', tag: 'COACHING', tagColor: '#22c55e', description: 'One giant word at a time, slams into center screen — maximum impact' },
+    { id: 'karaokeWipe', name: 'Karaoke Wipe', tag: 'TRENDING', tagColor: '#ff6b6b', description: 'Color fills each word left-to-right as spoken — smooth and satisfying' },
+    { id: 'neonGlow', name: 'Neon Glow', tag: 'RANT SQUAD', tagColor: '#00d4ff', description: 'RANT Squad signature — electric blue glow, on-brand' },
+    { id: 'subtleClean', name: 'Subtle Clean', tag: 'PROFESSIONAL', tagColor: '#94a3b8', description: 'Minimal white text on dark bar — great for podcasts and interviews' },
+    { id: 'boxHighlight', name: 'Box Highlight', tag: 'REELS', tagColor: '#a78bfa', description: 'Active word gets a colored box behind it — clean and readable' },
+    { id: 'aliAbdaal', name: 'Ali Abdaal', tag: 'EDUCATIONAL', tagColor: '#60a5fa', description: 'Clean and modern — spoken words fade to dark, active word stays bright' },
+    { id: 'emojiBurst', name: 'Emoji Burst', tag: 'VIRAL', tagColor: '#f97316', description: 'Bold captions + auto emoji on keywords — the #1 Submagic-style trend' },
+  ];
+
+  res.json({
+    success: true,
+    data: styles
+  });
 });
 
 // ============================================================

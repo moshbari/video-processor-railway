@@ -22,6 +22,7 @@ const { v4: uuidv4 } = require('uuid');
 const { exec, spawn } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
+const captionService = require('./captionService');
 
 /**
  * Run FFmpeg command safely with spawn (handles spaces in filenames better)
@@ -178,7 +179,9 @@ class TwoClipReactionService {
     const {
       layoutMode = 'watchReact',  // 'watchReact' or 'faceCam'
       pipPosition = 'top-right',
-      pipScale = 35
+      pipScale = 35,
+      captions = false,
+      captionStyle = 'boldPop'
     } = options;
 
     const jobId = uuidv4();
@@ -189,6 +192,7 @@ class TwoClipReactionService {
     console.log(`⚡ SPLIT REACT - Job: ${jobId}`);
     console.log(`Layout Mode: ${layoutMode === 'watchReact' ? '👀 Watch & React' : '🤳 Face Cam'}`);
     console.log(`PiP Position: ${pipPosition}, Scale: ${pipScale}%`);
+    console.log(`Captions: ${captions ? `✅ ON (${captionStyle})` : '❌ OFF'}`);
     console.log(`========================================\n`);
 
     try {
@@ -273,10 +277,25 @@ class TwoClipReactionService {
         }
       );
 
-      // Step 8: Concatenate Part 1 and Part 2
-      console.log('\nStep 7: Concatenating parts into final video...');
+      // Step 8: Optionally add captions to Part 2 (reaction segment)
+      let finalPart2Path = part2Path;
+      if (captions && captionService.isValidStyle(captionStyle)) {
+        console.log(`\nStep 7: Adding ${captionStyle} captions to reaction segment...`);
+        const captionedPart2Path = path.join(workDir, 'part2_captioned.mp4');
+        await captionService.addCaptionsToVideo(
+          part2Path,
+          captionedPart2Path,
+          captionStyle,
+          { width: targetWidth, height: targetHeight }
+        );
+        finalPart2Path = captionedPart2Path;
+        console.log('✓ Captions added to Part 2');
+      }
+
+      // Step 9: Concatenate Part 1 and Part 2
+      console.log('\nStep 8: Concatenating parts into final video...');
       const finalPath = path.join(workDir, 'final_two_clip_reaction.mp4');
-      await this.concatenateVideos([part1Path, part2Path], finalPath);
+      await this.concatenateVideos([part1Path, finalPart2Path], finalPath);
 
       // Get final file stats
       const stats = await fs.stat(finalPath);
