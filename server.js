@@ -10,6 +10,43 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs-extra');
 
+// ============================================================
+// Set FFmpeg/FFprobe paths globally for fluent-ffmpeg
+// Ensures all services can find the binaries regardless of
+// how they were installed (apt-get, static binary, etc.)
+// ============================================================
+const ffmpeg = require('fluent-ffmpeg');
+const { execSync } = require('child_process');
+
+try {
+  // Try to find ffmpeg and ffprobe in the system PATH
+  const ffmpegPath = execSync('which ffmpeg').toString().trim();
+  const ffprobePath = execSync('which ffprobe').toString().trim();
+  ffmpeg.setFfmpegPath(ffmpegPath);
+  ffmpeg.setFfprobePath(ffprobePath);
+  console.log(`✓ FFmpeg found at: ${ffmpegPath}`);
+  console.log(`✓ FFprobe found at: ${ffprobePath}`);
+} catch (e) {
+  // Fallback: try common paths
+  const commonPaths = ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg'];
+  const commonProbes = ['/usr/bin/ffprobe', '/usr/local/bin/ffprobe'];
+  
+  for (const p of commonPaths) {
+    if (fs.existsSync(p)) {
+      ffmpeg.setFfmpegPath(p);
+      console.log(`✓ FFmpeg found at: ${p}`);
+      break;
+    }
+  }
+  for (const p of commonProbes) {
+    if (fs.existsSync(p)) {
+      ffmpeg.setFfprobePath(p);
+      console.log(`✓ FFprobe found at: ${p}`);
+      break;
+    }
+  }
+}
+
 // Import routes (ONLY files that exist in /routes folder)
 const adminRoutes = require('./routes/admin');
 const audioReactionRoutes = require('./routes/audioReaction');
