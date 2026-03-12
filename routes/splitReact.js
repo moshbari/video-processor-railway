@@ -14,6 +14,7 @@
  * - POST /api/split-react/from-url - Create from video URL + two uploaded clips
  * - POST /api/split-react/from-upload - Create from three uploaded videos
  * - POST /api/split-react/from-fetched - Create from pre-fetched video + two uploaded clips
+ * - POST /api/split-react/from-clip-maker - Create from Manual Clip Maker clip (R2 URL) + two uploaded clips
  * - GET /api/split-react/projects - List all saved projects
  * - GET /api/split-react/projects/:projectId - Get single project
  * - DELETE /api/split-react/projects/:projectId - Delete project
@@ -1014,6 +1015,215 @@ router.delete('/:jobId', async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message
+    });
+  }
+});
+
+// ============================================================
+// CREATE FROM CLIP MAKER (R2 URL)
+// ============================================================
+
+/**
+ * POST /api/split-react/from-clip-maker
+ * 
+ * Create Split React video using a Manual Clip Maker clip as the main video.
+ * Downloads the clip from R2 instead of requiring a file upload or URL download.
+ * 
+ * Body (multipart/form-data):
+ * - clipUrl: R2 download URL of the clip from Manual Clip Maker
+ * - clipTitle: Title of the selected clip (for project naming)
+ * - watchClip: Uploaded "watching" video file
+ * - reactClip: Uploaded "reaction" video file
+ * - layoutMode: 'watchReact' (default) | 'faceCam'
+ * - pipPosition: 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left' | 'random'
+ * - pipScale: PiP size percentage (default 35)
+ * - title: Optional project title
+ * - captions: 'true' | 'false'
+ * - captionStyle: caption style id
+ */
+router.post('/from-clip-maker', upload.fields([
+  { name: 'watchClip', maxCount: 1 },
+  { name: 'reactClip', maxCount: 1 }
+]), async (req, res) => {
+  let mainVideoPath = null;
+
+  try {
+    const {
+      clipUrl,
+      clipTitle = '',
+      layoutMode = 'watchReact',
+      pipPosition = 'top-right',
+      pipScale = 35,
+      title = '',
+      captions = 'false',
+      captionStyle = 'boldPop'
+    } = req.body;
+
+    const watchClipPath = req.files?.watchClip?.[0]?.path;
+    const reactClipPath = req.files?.reactClip?.[0]?.path;
+    const captionsEnabled = captions === 'true' || captions === true;
+
+    // Validate clipUrl
+    if (!clipUrl) {
+      return res.status(400).json({
+        success: false,
+        error: 'clipUrl is required (the R2 URL of the clip from Manual Clip Maker)'
+      });
+    }
+
+    if (!watchClipPath) {
+      return res.status(400).json({
+        success: false,
+        error: 'watchClip file is required (your video watching the content)'
+      });
+    }
+
+    if (!reactClipPath) {
+      return res.status(400).json({
+        success: false,
+        error: 'reactClip file is required (your reaction video)'
+      });
+    }
+
+    // Validate layoutMode
+    if (!['watchReact', 'faceCam'].includes(layoutMode)) {
+      return res.status(400).json({
+        success: false,
+        error: 'layoutMode must be "watchReact" or "faceCam"'
+      });
+    }
+
+    const modeName = layoutMode === 'watchReact' ? '👀 Watch & React' : '🤳 Face Cam';
+    console.log(`\n⚡ SPLIT REACT FROM CLIP MAKER ⚡`);
+    console.log(`Mode: ${modeName}`);
+    console.log(`Clip URL: ${clipUrl}`);
+    console.log(`Clip Title: ${clipTitle}`);
+    console.log(`Position: ${pipPosition}, Scale: ${pipScale}%`);
+    console.log(`Captions: ${captionsEnabled ? `ON (${captionStyle})` : 'OFF'}`);
+
+    // Download the clip from R2 to local temp
+    const tempDir = process.env.TEMP_DIR || '/app/temp';
+    fs.ensureDirSync(tempDir);
+    mainVideoPath = path.join(tempDir, `clipmaker_${uuidv4()}.mp4`);
+    
+    console.log('Downloading clip from R2...');
+    await r2Service.downloadFile(clipUrl, mainVideoPath);
+    console.log(`✓ Downloaded clip to: ${mainVideoPath}`);
+
+    // Create Split React video
+    const result = await splitReactService.createTwoClipReactionVideo(
+      mainVideoPath,
+      watchClipPath,
+      reactClipPath,
+      {
+        layoutMode,
+        pipPosition,
+        pipScale: parseInt(pipScale, 10),
+        captions: captionsEnabled,
+        captionStyle
+      }
+    );
+
+    // Upload ALL files to R2 for persistent storage
+    console.log('Uploading all files to R2...');
+
+    // 1. Upload main/original video (the clip from Clip Maker)
+    const mainVideoR2Key = `split-react/${result.jobId}/original.mp4`;
+    await r2Service.uploadFile(mainVideoPath, mainVideoR2Key);
+    console.log(`✓ Uploaded original: ${mainVideoR2Key}`);
+
+    // 2. Upload watch clip
+    const watchClipR2Key = `split-react/${result.jobId}/watch_clip.mp4`;
+    await r2Service.uploadFile(watchClipPath, watchClipR2Key);
+    console.log(`✓ Uploaded watch clip: ${watchClipR2Key}`);
+
+    // 3. Upload react clip
+    const reactClipR2Key = `split-react/${result.jobId}/react_clip.mp4`;
+    await r2Service.uploadFile(reactClipPath, reactClipR2Key);
+    console.log(`✓ Uploaded react clip: ${reactClipR2Key}`);
+
+    // 4. Upload final rendered video
+    const r2Key = `split-react/${result.jobId}/final.mp4`;
+    const r2Result = await r2Service.uploadFile(result.outputPath, r2Key);
+    console.log(`✓ Uploaded final: ${r2Key}`);
+
+    // Generate download URLs
+    const baseUrl = 'https://pub-f59b46a864a6463ea4d6747002fd515d.r2.dev';
+    const downloadUrl = r2Result.url || `${baseUrl}/${r2Key}`;
+    const originalVideoUrl = `${baseUrl}/${mainVideoR2Key}`;
+    const watchClipUrl = `${baseUrl}/${watchClipR2Key}`;
+    const reactClipUrl = `${baseUrl}/${reactClipR2Key}`;
+
+    // Save project metadata
+    console.log('Saving project metadata...');
+    const projectTitle = title || clipTitle || 'Split React (from Clip Maker)';
+    const savedProject = await projectMetadataService.addProject({
+      type: 'split-react',
+      title: projectTitle,
+      jobId: result.jobId,
+      layoutMode,
+      layoutModeName: result.layoutModeName,
+      pipPosition,
+      pipScale: parseInt(pipScale, 10),
+      sourceUrl: clipUrl,
+      sourceType: 'clip-maker',
+      originalDuration: result.originalDuration,
+      watchClipDuration: result.watchClipDuration,
+      reactClipDuration: result.reactClipDuration,
+      totalDuration: result.totalDuration,
+      fileSize: result.fileSize,
+      fileSizeMB: result.fileSizeMB,
+      r2Keys: {
+        original: mainVideoR2Key,
+        watchClip: watchClipR2Key,
+        reactClip: reactClipR2Key,
+        final: r2Key
+      },
+      urls: {
+        original: originalVideoUrl,
+        watchClip: watchClipUrl,
+        reactClip: reactClipUrl,
+        final: downloadUrl
+      },
+      downloadUrl,
+      r2Key,
+      createdAt: new Date().toISOString()
+    });
+    console.log(`✓ Project saved: ${savedProject?.id || 'unknown'}`);
+
+    // Cleanup temp files
+    await fs.remove(mainVideoPath).catch(() => {});
+    await fs.remove(watchClipPath).catch(() => {});
+    await fs.remove(reactClipPath).catch(() => {});
+
+    res.json({
+      success: true,
+      data: {
+        ...result,
+        projectId: savedProject?.id,
+        projectTitle,
+        downloadUrl,
+        r2Key,
+        urls: {
+          original: originalVideoUrl,
+          watchClip: watchClipUrl,
+          reactClip: reactClipUrl,
+          final: downloadUrl
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('[Split React] From Clip Maker error:', error);
+
+    // Cleanup on error
+    if (mainVideoPath) await fs.remove(mainVideoPath).catch(() => {});
+    if (req.files?.watchClip?.[0]?.path) await fs.remove(req.files.watchClip[0].path).catch(() => {});
+    if (req.files?.reactClip?.[0]?.path) await fs.remove(req.files.reactClip[0].path).catch(() => {});
+
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to create Split React video from Clip Maker clip'
     });
   }
 });
