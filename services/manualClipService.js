@@ -84,6 +84,14 @@ class ManualClipService {
 
       // Get duration if not known
       if (!videoDuration) {
+        console.log(`[ManualClip ${jobId}] Getting duration for: ${videoPath}`);
+        // Verify the file actually exists and is readable
+        const fileExists = await fs.pathExists(videoPath);
+        console.log(`[ManualClip ${jobId}] File exists: ${fileExists}`);
+        if (fileExists) {
+          const stats = await fs.stat(videoPath);
+          console.log(`[ManualClip ${jobId}] File size: ${(stats.size / 1024 / 1024).toFixed(1)}MB`);
+        }
         videoDuration = await this.getVideoDuration(videoPath);
       }
 
@@ -737,6 +745,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return new Promise((resolve, reject) => {
       ffmpeg.ffprobe(videoPath, (err, metadata) => {
         if (err) {
+          console.error(`[ManualClip] FFprobe error for ${videoPath}:`, err.message || err);
           reject(new Error('Could not read video file.'));
           return;
         }
