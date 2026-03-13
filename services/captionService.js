@@ -455,8 +455,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         '-i', videoPath,
         '-vf', `ass='${escapedAssPath}'`,
         '-c:v', 'libx264',
-        '-preset', 'slow',
-        '-crf', '18',
+        '-preset', 'medium',
+        '-crf', '20',
         '-c:a', 'copy',
         '-movflags', '+faststart',
         outputPath

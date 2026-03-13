@@ -28,6 +28,13 @@
 
 const express = require('express');
 const router = express.Router();
+
+// Increase timeout for video processing (15 minutes)
+router.use((req, res, next) => {
+  req.setTimeout(15 * 60 * 1000);
+  res.setTimeout(15 * 60 * 1000);
+  next();
+});
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs-extra');

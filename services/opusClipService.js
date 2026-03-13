@@ -540,8 +540,8 @@ RESPOND WITH ONLY valid JSON in this exact format (no markdown, no backticks, no
         .duration(duration)
         .outputOptions([
           '-c:v', 'libx264',
-          '-preset', 'slow',
-          '-crf', '18',
+          '-preset', 'medium',
+          '-crf', '20',
           '-c:a', 'aac',
           '-ar', '48000',
           '-ac', '2',
@@ -616,8 +616,8 @@ RESPOND WITH ONLY valid JSON in this exact format (no markdown, no backticks, no
       command.outputOptions([
         '-vf', filterChain,
         '-c:v', 'libx264',
-        '-preset', 'slow',
-        '-crf', '18',
+        '-preset', 'medium',
+        '-crf', '20',
         '-c:a', 'aac',
         '-ar', '48000',
         '-ac', '2',

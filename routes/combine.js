@@ -7,6 +7,13 @@ const combineService = require('../services/combineService');
 const r2Service = require('../services/r2Service');
 const { v4: uuidv4 } = require('uuid');
 
+// Increase timeout for video processing (15 minutes)
+router.use((req, res, next) => {
+  req.setTimeout(15 * 60 * 1000);
+  res.setTimeout(15 * 60 * 1000);
+  next();
+});
+
 // ============================================
 // PROGRESS TRACKING - Store progress for each job
 // ============================================
