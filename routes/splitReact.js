@@ -49,6 +49,20 @@ const projectMetadataService = require('../services/projectMetadataService');
 // Key: fetchId, Value: { filePath, originalUrl, fetchedAt, title, duration }
 const fetchedVideos = new Map();
 
+// ============================================================
+// JOB TRACKING - Background render processing
+// ============================================================
+const renderJobs = new Map(); // Key: jobId, Value: { status, progress, step, ... }
+
+function updateRenderJob(jobId, data) {
+  const existing = renderJobs.get(jobId) || {};
+  renderJobs.set(jobId, { ...existing, ...data });
+}
+
+function getRenderJob(jobId) {
+  return renderJobs.get(jobId) || null;
+}
+
 // Cleanup old fetched videos every 30 minutes
 setInterval(() => {
   const now = Date.now();
@@ -87,6 +101,124 @@ const upload = multer({
       cb(new Error('Only video files are allowed'), false);
     }
   }
+});
+
+// ============================================================
+// BACKGROUND RENDER PROCESSOR
+// ============================================================
+
+/**
+ * Process Split React render in background
+ * Renders video, uploads to R2, saves project metadata
+ */
+async function processRenderInBackground(renderJobId, mainVideoPath, watchClipPath, reactClipPath, options, mainVideoName, sourceType) {
+  try {
+    updateRenderJob(renderJobId, { status: 'rendering', progress: 10, step: 'Starting render...' });
+
+    // Create Split React video
+    const result = await splitReactService.createTwoClipReactionVideo(
+      mainVideoPath, watchClipPath, reactClipPath, options
+    );
+
+    updateRenderJob(renderJobId, { status: 'uploading', progress: 70, step: 'Uploading to storage...' });
+
+    // Upload ALL files to R2
+    console.log('Uploading all files to R2...');
+    const mainVideoR2Key = `split-react/${result.jobId}/original.mp4`;
+    await r2Service.uploadFile(mainVideoPath, mainVideoR2Key);
+    
+    const watchClipR2Key = `split-react/${result.jobId}/watch_clip.mp4`;
+    await r2Service.uploadFile(watchClipPath, watchClipR2Key);
+    
+    const reactClipR2Key = `split-react/${result.jobId}/react_clip.mp4`;
+    await r2Service.uploadFile(reactClipPath, reactClipR2Key);
+    
+    const r2Key = `split-react/${result.jobId}/final.mp4`;
+    const r2Result = await r2Service.uploadFile(result.outputPath, r2Key);
+
+    updateRenderJob(renderJobId, { progress: 90, step: 'Saving project...' });
+
+    // Generate download URLs
+    const baseUrl = 'https://pub-f59b46a864a6463ea4d6747002fd515d.r2.dev';
+    const downloadUrl = r2Result.url || `${baseUrl}/${r2Key}`;
+    const originalVideoUrl = `${baseUrl}/${mainVideoR2Key}`;
+    const watchClipUrl = `${baseUrl}/${watchClipR2Key}`;
+    const reactClipUrl = `${baseUrl}/${reactClipR2Key}`;
+
+    // Save project metadata
+    const projectTitle = options.title || mainVideoName.replace(/\.[^.]+$/, '') || 'Split React Project';
+    const savedProject = await projectMetadataService.addProject({
+      type: 'split-react',
+      title: projectTitle,
+      jobId: result.jobId,
+      layoutMode: options.layoutMode,
+      layoutModeName: result.layoutModeName,
+      pipPosition: options.pipPosition,
+      pipScale: options.pipScale,
+      sourceType,
+      originalDuration: result.originalDuration,
+      watchClipDuration: result.watchClipDuration,
+      reactClipDuration: result.reactClipDuration,
+      totalDuration: result.totalDuration,
+      fileSize: result.fileSize,
+      fileSizeMB: result.fileSizeMB,
+      r2Keys: { original: mainVideoR2Key, watchClip: watchClipR2Key, reactClip: reactClipR2Key, final: r2Key },
+      urls: { original: originalVideoUrl, watchClip: watchClipUrl, reactClip: reactClipUrl, final: downloadUrl },
+      downloadUrl,
+      r2Key,
+      createdAt: new Date().toISOString()
+    });
+
+    // Update job with completion data
+    updateRenderJob(renderJobId, {
+      status: 'complete',
+      progress: 100,
+      step: 'Complete',
+      data: {
+        ...result,
+        projectId: savedProject?.id,
+        projectTitle,
+        downloadUrl,
+        r2Key,
+        urls: { original: originalVideoUrl, watchClip: watchClipUrl, reactClip: reactClipUrl, final: downloadUrl }
+      }
+    });
+
+    console.log(`[Split React] Background render complete: ${renderJobId}`);
+
+    // Cleanup temp files
+    await fs.remove(mainVideoPath).catch(() => {});
+    await fs.remove(watchClipPath).catch(() => {});
+    await fs.remove(reactClipPath).catch(() => {});
+
+  } catch (error) {
+    console.error(`[Split React] Background render failed: ${renderJobId}`, error.message);
+    updateRenderJob(renderJobId, {
+      status: 'failed',
+      progress: 0,
+      step: 'Failed',
+      error: error.message
+    });
+  }
+}
+
+// ============================================================
+// RENDER STATUS ENDPOINT
+// ============================================================
+
+/**
+ * GET /api/split-react/render-status/:jobId
+ * Poll for background render status
+ */
+router.get('/render-status/:renderJobId', (req, res) => {
+  const { renderJobId } = req.params;
+  const job = getRenderJob(renderJobId);
+
+  if (!job) {
+    return res.status(404).json({ success: false, error: 'Render job not found' });
+  }
+
+  res.json({ success: true, renderJobId, ...job });
 });
 
 // ============================================================
@@ -236,111 +368,27 @@ router.post('/from-url', upload.fields([
     mainVideoPath = downloadResult.filePath;
     console.log(`✓ Downloaded: ${mainVideoPath}`);
 
-    // Create Split React video
-    const result = await splitReactService.createTwoClipReactionVideo(
-      mainVideoPath,
-      watchClipPath,
-      reactClipPath,
-      {
-        layoutMode,
-        pipPosition,
-        pipScale: parseInt(pipScale, 10),
-        captions: captionsEnabled,
-        captionStyle
-      }
-    );
-
-    // Upload ALL files to R2 for persistent storage
-    console.log('Uploading all files to R2...');
-    
-    // 1. Upload main/original video
-    const mainVideoR2Key = `split-react/${result.jobId}/original.mp4`;
-    await r2Service.uploadFile(mainVideoPath, mainVideoR2Key);
-    console.log(`✓ Uploaded original: ${mainVideoR2Key}`);
-    
-    // 2. Upload watch clip
-    const watchClipR2Key = `split-react/${result.jobId}/watch_clip.mp4`;
-    await r2Service.uploadFile(watchClipPath, watchClipR2Key);
-    console.log(`✓ Uploaded watch clip: ${watchClipR2Key}`);
-    
-    // 3. Upload react clip
-    const reactClipR2Key = `split-react/${result.jobId}/react_clip.mp4`;
-    await r2Service.uploadFile(reactClipPath, reactClipR2Key);
-    console.log(`✓ Uploaded react clip: ${reactClipR2Key}`);
-    
-    // 4. Upload final rendered video
-    const r2Key = `split-react/${result.jobId}/final.mp4`;
-    const r2Result = await r2Service.uploadFile(result.outputPath, r2Key);
-    console.log(`✓ Uploaded final: ${r2Key}`);
-
-    // Generate download URLs
-    const baseUrl = 'https://pub-f59b46a864a6463ea4d6747002fd515d.r2.dev';
-    const downloadUrl = r2Result.url || `${baseUrl}/${r2Key}`;
-    const originalVideoUrl = `${baseUrl}/${mainVideoR2Key}`;
-    const watchClipUrl = `${baseUrl}/${watchClipR2Key}`;
-    const reactClipUrl = `${baseUrl}/${reactClipR2Key}`;
-
-    // Save project metadata for Recent Projects (with all file URLs)
-    console.log('Saving project metadata...');
-    const projectTitle = title || downloadResult.title || 'Split React Project';
-    const savedProject = await projectMetadataService.addProject({
-      type: 'split-react',
-      title: projectTitle,
-      jobId: result.jobId,
-      layoutMode,
-      layoutModeName: result.layoutModeName,
-      pipPosition,
-      pipScale: parseInt(pipScale, 10),
-      sourceUrl: videoUrl,
-      sourceType: 'url',
-      originalDuration: result.originalDuration,
-      watchClipDuration: result.watchClipDuration,
-      reactClipDuration: result.reactClipDuration,
-      totalDuration: result.totalDuration,
-      fileSize: result.fileSize,
-      fileSizeMB: result.fileSizeMB,
-      // All R2 keys for file retrieval
-      r2Keys: {
-        original: mainVideoR2Key,
-        watchClip: watchClipR2Key,
-        reactClip: reactClipR2Key,
-        final: r2Key
-      },
-      // All download URLs
-      urls: {
-        original: originalVideoUrl,
-        watchClip: watchClipUrl,
-        reactClip: reactClipUrl,
-        final: downloadUrl
-      },
-      downloadUrl,  // Keep for backwards compatibility
-      r2Key,        // Keep for backwards compatibility
+    // Generate render job ID and respond immediately
+    const renderJobId = uuidv4();
+    updateRenderJob(renderJobId, {
+      status: 'queued',
+      progress: 0,
+      step: 'Queued - starting render...',
       createdAt: new Date().toISOString()
     });
-    console.log(`✓ Project saved: ${savedProject?.id || 'unknown'}`);
-
-    // Cleanup temp files (they're now in R2)
-    await fs.remove(mainVideoPath).catch(() => {});
-    await fs.remove(watchClipPath).catch(() => {});
-    await fs.remove(reactClipPath).catch(() => {});
 
     res.json({
       success: true,
-      data: {
-        ...result,
-        projectId: savedProject?.id,
-        projectTitle,
-        downloadUrl,
-        r2Key,
-        // Include all URLs in response
-        urls: {
-          original: originalVideoUrl,
-          watchClip: watchClipUrl,
-          reactClip: reactClipUrl,
-          final: downloadUrl
-        }
-      }
+      renderJobId,
+      message: 'Render started. Poll /api/split-react/render-status/' + renderJobId
     });
+
+    // Process in background
+    processRenderInBackground(
+      renderJobId, mainVideoPath, watchClipPath, reactClipPath,
+      { layoutMode, pipPosition, pipScale: parseInt(pipScale, 10), captions: captionsEnabled, captionStyle, title: title || downloadResult.title },
+      downloadResult.title || '', 'url'
+    );
 
   } catch (error) {
     console.error('[Split React] From URL error:', error);
@@ -437,110 +485,28 @@ router.post('/from-upload', upload.fields([
     console.log(`Position: ${pipPosition}, Scale: ${pipScale}%`);
     console.log(`Captions: ${captionsEnabled ? `ON (${captionStyle})` : 'OFF'}`);
 
-    // Create Split React video
-    const result = await splitReactService.createTwoClipReactionVideo(
-      mainVideoPath,
-      watchClipPath,
-      reactClipPath,
-      {
-        layoutMode,
-        pipPosition,
-        pipScale: parseInt(pipScale, 10),
-        captions: captionsEnabled,
-        captionStyle
-      }
-    );
-
-    // Upload ALL files to R2 for persistent storage
-    console.log('Uploading all files to R2...');
-    
-    // 1. Upload main/original video
-    const mainVideoR2Key = `split-react/${result.jobId}/original.mp4`;
-    await r2Service.uploadFile(mainVideoPath, mainVideoR2Key);
-    console.log(`✓ Uploaded original: ${mainVideoR2Key}`);
-    
-    // 2. Upload watch clip
-    const watchClipR2Key = `split-react/${result.jobId}/watch_clip.mp4`;
-    await r2Service.uploadFile(watchClipPath, watchClipR2Key);
-    console.log(`✓ Uploaded watch clip: ${watchClipR2Key}`);
-    
-    // 3. Upload react clip
-    const reactClipR2Key = `split-react/${result.jobId}/react_clip.mp4`;
-    await r2Service.uploadFile(reactClipPath, reactClipR2Key);
-    console.log(`✓ Uploaded react clip: ${reactClipR2Key}`);
-    
-    // 4. Upload final rendered video
-    const r2Key = `split-react/${result.jobId}/final.mp4`;
-    const r2Result = await r2Service.uploadFile(result.outputPath, r2Key);
-    console.log(`✓ Uploaded final: ${r2Key}`);
-
-    // Generate download URLs
-    const baseUrl = 'https://pub-f59b46a864a6463ea4d6747002fd515d.r2.dev';
-    const downloadUrl = r2Result.url || `${baseUrl}/${r2Key}`;
-    const originalVideoUrl = `${baseUrl}/${mainVideoR2Key}`;
-    const watchClipUrl = `${baseUrl}/${watchClipR2Key}`;
-    const reactClipUrl = `${baseUrl}/${reactClipR2Key}`;
-
-    // Save project metadata for Recent Projects (with all file URLs)
-    console.log('Saving project metadata...');
-    const projectTitle = title || mainVideoName.replace(/\.[^.]+$/, '') || 'Split React Project';
-    const savedProject = await projectMetadataService.addProject({
-      type: 'split-react',
-      title: projectTitle,
-      jobId: result.jobId,
-      layoutMode,
-      layoutModeName: result.layoutModeName,
-      pipPosition,
-      pipScale: parseInt(pipScale, 10),
-      sourceType: 'upload',
-      originalDuration: result.originalDuration,
-      watchClipDuration: result.watchClipDuration,
-      reactClipDuration: result.reactClipDuration,
-      totalDuration: result.totalDuration,
-      fileSize: result.fileSize,
-      fileSizeMB: result.fileSizeMB,
-      // All R2 keys for file retrieval
-      r2Keys: {
-        original: mainVideoR2Key,
-        watchClip: watchClipR2Key,
-        reactClip: reactClipR2Key,
-        final: r2Key
-      },
-      // All download URLs
-      urls: {
-        original: originalVideoUrl,
-        watchClip: watchClipUrl,
-        reactClip: reactClipUrl,
-        final: downloadUrl
-      },
-      downloadUrl,  // Keep for backwards compatibility
-      r2Key,        // Keep for backwards compatibility
+    // Generate render job ID and respond immediately
+    const renderJobId = uuidv4();
+    updateRenderJob(renderJobId, {
+      status: 'queued',
+      progress: 0,
+      step: 'Queued - starting render...',
       createdAt: new Date().toISOString()
     });
-    console.log(`✓ Project saved: ${savedProject?.id || 'unknown'}`);
 
-    // Cleanup temp files (they're now in R2)
-    await fs.remove(mainVideoPath).catch(() => {});
-    await fs.remove(watchClipPath).catch(() => {});
-    await fs.remove(reactClipPath).catch(() => {});
-
+    // Respond immediately so frontend doesn't time out
     res.json({
       success: true,
-      data: {
-        ...result,
-        projectId: savedProject?.id,
-        projectTitle,
-        downloadUrl,
-        r2Key,
-        // Include all URLs in response
-        urls: {
-          original: originalVideoUrl,
-          watchClip: watchClipUrl,
-          reactClip: reactClipUrl,
-          final: downloadUrl
-        }
-      }
+      renderJobId,
+      message: 'Render started. Poll /api/split-react/render-status/' + renderJobId
     });
+
+    // Process in background (don't await)
+    processRenderInBackground(
+      renderJobId, mainVideoPath, watchClipPath, reactClipPath,
+      { layoutMode, pipPosition, pipScale: parseInt(pipScale, 10), captions: captionsEnabled, captionStyle, title },
+      mainVideoName, 'upload'
+    );
 
   } catch (error) {
     console.error('[Split React] From upload error:', error);
@@ -641,114 +607,30 @@ router.post('/from-fetched', upload.fields([
     console.log(`Position: ${pipPosition}, Scale: ${pipScale}%`);
     console.log(`Captions: ${captionsEnabled ? `ON (${captionStyle})` : 'OFF'}`);
 
-    // Create Split React video
-    const result = await splitReactService.createTwoClipReactionVideo(
-      fetchedData.filePath,
-      watchClipPath,
-      reactClipPath,
-      {
-        layoutMode,
-        pipPosition,
-        pipScale: parseInt(pipScale, 10),
-        captions: captionsEnabled,
-        captionStyle
-      }
-    );
-
-    // Upload ALL files to R2 for persistent storage
-    console.log('Uploading all files to R2...');
-    
-    // 1. Upload main/original video
-    const mainVideoR2Key = `split-react/${result.jobId}/original.mp4`;
-    await r2Service.uploadFile(fetchedData.filePath, mainVideoR2Key);
-    console.log(`✓ Uploaded original: ${mainVideoR2Key}`);
-    
-    // 2. Upload watch clip
-    const watchClipR2Key = `split-react/${result.jobId}/watch_clip.mp4`;
-    await r2Service.uploadFile(watchClipPath, watchClipR2Key);
-    console.log(`✓ Uploaded watch clip: ${watchClipR2Key}`);
-    
-    // 3. Upload react clip
-    const reactClipR2Key = `split-react/${result.jobId}/react_clip.mp4`;
-    await r2Service.uploadFile(reactClipPath, reactClipR2Key);
-    console.log(`✓ Uploaded react clip: ${reactClipR2Key}`);
-    
-    // 4. Upload final rendered video
-    const r2Key = `split-react/${result.jobId}/final.mp4`;
-    const r2Result = await r2Service.uploadFile(result.outputPath, r2Key);
-    console.log(`✓ Uploaded final: ${r2Key}`);
-
-    // Generate download URLs
-    const baseUrl = 'https://pub-f59b46a864a6463ea4d6747002fd515d.r2.dev';
-    const downloadUrl = r2Result.url || `${baseUrl}/${r2Key}`;
-    const originalVideoUrl = `${baseUrl}/${mainVideoR2Key}`;
-    const watchClipUrl = `${baseUrl}/${watchClipR2Key}`;
-    const reactClipUrl = `${baseUrl}/${reactClipR2Key}`;
-
-    // Save project metadata for Recent Projects (with all file URLs)
-    console.log('Saving project metadata...');
-    const projectTitle = title || fetchedData.title || 'Split React Project';
-    const savedProject = await projectMetadataService.addProject({
-      type: 'split-react',
-      title: projectTitle,
-      jobId: result.jobId,
-      layoutMode,
-      layoutModeName: result.layoutModeName,
-      pipPosition,
-      pipScale: parseInt(pipScale, 10),
-      sourceUrl: fetchedData.originalUrl,
-      sourceType: 'fetched',
-      originalDuration: result.originalDuration,
-      watchClipDuration: result.watchClipDuration,
-      reactClipDuration: result.reactClipDuration,
-      totalDuration: result.totalDuration,
-      fileSize: result.fileSize,
-      fileSizeMB: result.fileSizeMB,
-      // All R2 keys for file retrieval
-      r2Keys: {
-        original: mainVideoR2Key,
-        watchClip: watchClipR2Key,
-        reactClip: reactClipR2Key,
-        final: r2Key
-      },
-      // All download URLs
-      urls: {
-        original: originalVideoUrl,
-        watchClip: watchClipUrl,
-        reactClip: reactClipUrl,
-        final: downloadUrl
-      },
-      downloadUrl,  // Keep for backwards compatibility
-      r2Key,        // Keep for backwards compatibility
+    // Create Split React video in background
+    const renderJobId = uuidv4();
+    updateRenderJob(renderJobId, {
+      status: 'queued',
+      progress: 0,
+      step: 'Queued - starting render...',
       createdAt: new Date().toISOString()
     });
-    console.log(`✓ Project saved: ${savedProject?.id || 'unknown'}`);
-
-    // Cleanup fetched video from memory store (already uploaded to R2)
-    fetchedVideos.delete(fetchId);
-    await fs.remove(fetchedData.filePath).catch(() => {});
-    
-    // Cleanup uploaded clips (already uploaded to R2)
-    await fs.remove(watchClipPath).catch(() => {});
-    await fs.remove(reactClipPath).catch(() => {});
 
     res.json({
       success: true,
-      data: {
-        ...result,
-        projectId: savedProject?.id,
-        projectTitle,
-        downloadUrl,
-        r2Key,
-        // Include all URLs in response
-        urls: {
-          original: originalVideoUrl,
-          watchClip: watchClipUrl,
-          reactClip: reactClipUrl,
-          final: downloadUrl
-        }
-      }
+      renderJobId,
+      message: 'Render started. Poll /api/split-react/render-status/' + renderJobId
     });
+
+    // Remove from fetched store (background process has the file path)
+    fetchedVideos.delete(fetchId);
+
+    // Process in background
+    processRenderInBackground(
+      renderJobId, fetchedData.filePath, watchClipPath, reactClipPath,
+      { layoutMode, pipPosition, pipScale: parseInt(pipScale, 10), captions: captionsEnabled, captionStyle, title: title || fetchedData.title },
+      fetchedData.title || '', 'fetched'
+    );
 
   } catch (error) {
     console.error('[Split React] From fetched error:', error);
@@ -1117,108 +999,27 @@ router.post('/from-clip-maker', upload.fields([
     await r2Service.downloadFile(clipUrl, mainVideoPath);
     console.log(`✓ Downloaded clip to: ${mainVideoPath}`);
 
-    // Create Split React video
-    const result = await splitReactService.createTwoClipReactionVideo(
-      mainVideoPath,
-      watchClipPath,
-      reactClipPath,
-      {
-        layoutMode,
-        pipPosition,
-        pipScale: parseInt(pipScale, 10),
-        captions: captionsEnabled,
-        captionStyle
-      }
-    );
-
-    // Upload ALL files to R2 for persistent storage
-    console.log('Uploading all files to R2...');
-
-    // 1. Upload main/original video (the clip from Clip Maker)
-    const mainVideoR2Key = `split-react/${result.jobId}/original.mp4`;
-    await r2Service.uploadFile(mainVideoPath, mainVideoR2Key);
-    console.log(`✓ Uploaded original: ${mainVideoR2Key}`);
-
-    // 2. Upload watch clip
-    const watchClipR2Key = `split-react/${result.jobId}/watch_clip.mp4`;
-    await r2Service.uploadFile(watchClipPath, watchClipR2Key);
-    console.log(`✓ Uploaded watch clip: ${watchClipR2Key}`);
-
-    // 3. Upload react clip
-    const reactClipR2Key = `split-react/${result.jobId}/react_clip.mp4`;
-    await r2Service.uploadFile(reactClipPath, reactClipR2Key);
-    console.log(`✓ Uploaded react clip: ${reactClipR2Key}`);
-
-    // 4. Upload final rendered video
-    const r2Key = `split-react/${result.jobId}/final.mp4`;
-    const r2Result = await r2Service.uploadFile(result.outputPath, r2Key);
-    console.log(`✓ Uploaded final: ${r2Key}`);
-
-    // Generate download URLs
-    const baseUrl = 'https://pub-f59b46a864a6463ea4d6747002fd515d.r2.dev';
-    const downloadUrl = r2Result.url || `${baseUrl}/${r2Key}`;
-    const originalVideoUrl = `${baseUrl}/${mainVideoR2Key}`;
-    const watchClipUrl = `${baseUrl}/${watchClipR2Key}`;
-    const reactClipUrl = `${baseUrl}/${reactClipR2Key}`;
-
-    // Save project metadata
-    console.log('Saving project metadata...');
-    const projectTitle = title || clipTitle || 'Split React (from Clip Maker)';
-    const savedProject = await projectMetadataService.addProject({
-      type: 'split-react',
-      title: projectTitle,
-      jobId: result.jobId,
-      layoutMode,
-      layoutModeName: result.layoutModeName,
-      pipPosition,
-      pipScale: parseInt(pipScale, 10),
-      sourceUrl: clipUrl,
-      sourceType: 'clip-maker',
-      originalDuration: result.originalDuration,
-      watchClipDuration: result.watchClipDuration,
-      reactClipDuration: result.reactClipDuration,
-      totalDuration: result.totalDuration,
-      fileSize: result.fileSize,
-      fileSizeMB: result.fileSizeMB,
-      r2Keys: {
-        original: mainVideoR2Key,
-        watchClip: watchClipR2Key,
-        reactClip: reactClipR2Key,
-        final: r2Key
-      },
-      urls: {
-        original: originalVideoUrl,
-        watchClip: watchClipUrl,
-        reactClip: reactClipUrl,
-        final: downloadUrl
-      },
-      downloadUrl,
-      r2Key,
+    // Create Split React video in background
+    const renderJobId = uuidv4();
+    updateRenderJob(renderJobId, {
+      status: 'queued',
+      progress: 0,
+      step: 'Queued - starting render...',
       createdAt: new Date().toISOString()
     });
-    console.log(`✓ Project saved: ${savedProject?.id || 'unknown'}`);
-
-    // Cleanup temp files
-    await fs.remove(mainVideoPath).catch(() => {});
-    await fs.remove(watchClipPath).catch(() => {});
-    await fs.remove(reactClipPath).catch(() => {});
 
     res.json({
       success: true,
-      data: {
-        ...result,
-        projectId: savedProject?.id,
-        projectTitle,
-        downloadUrl,
-        r2Key,
-        urls: {
-          original: originalVideoUrl,
-          watchClip: watchClipUrl,
-          reactClip: reactClipUrl,
-          final: downloadUrl
-        }
-      }
+      renderJobId,
+      message: 'Render started. Poll /api/split-react/render-status/' + renderJobId
     });
+
+    // Process in background
+    processRenderInBackground(
+      renderJobId, mainVideoPath, watchClipPath, reactClipPath,
+      { layoutMode, pipPosition, pipScale: parseInt(pipScale, 10), captions: captionsEnabled, captionStyle, title: title || clipTitle },
+      clipTitle || '', 'clip-maker'
+    );
 
   } catch (error) {
     console.error('[Split React] From Clip Maker error:', error);
