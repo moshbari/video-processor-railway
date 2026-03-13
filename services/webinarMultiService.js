@@ -321,29 +321,29 @@ class WebinarMultiService {
       // Step 1: Concatenate content files (if any)
       let contentVideoPath = null;
       if (session.contentFiles.length > 0) {
-        this.updateJobStatus(jobId, { progress: 10, step: 'Combining content videos...' });
+        this.updateJobStatus(jobId, { progress: 5, step: `Preparing content videos (0/${session.contentFiles.length})...` });
         contentVideoPath = path.join(workDir, 'content_combined.mp4');
-        await this.concatenateVideos(session.contentFiles.map(f => f.path), contentVideoPath, jobId);
+        await this.concatenateVideos(session.contentFiles.map(f => f.path), contentVideoPath, jobId, 'Content', 5, 45);
       }
 
       // Step 2: Concatenate CTA files (if any)
       let ctaVideoPath = null;
       if (session.ctaFiles.length > 0) {
-        this.updateJobStatus(jobId, { progress: 30, step: 'Combining CTA videos...' });
+        this.updateJobStatus(jobId, { progress: 45, step: `Preparing CTA videos (0/${session.ctaFiles.length})...` });
         ctaVideoPath = path.join(workDir, 'cta_combined.mp4');
-        await this.concatenateVideos(session.ctaFiles.map(f => f.path), ctaVideoPath, jobId);
+        await this.concatenateVideos(session.ctaFiles.map(f => f.path), ctaVideoPath, jobId, 'CTA', 45, 70);
       }
 
       // Step 3: Apply overlay to CTA video (if overlay exists)
       let ctaWithOverlayPath = ctaVideoPath;
       if (ctaVideoPath && session.overlayImage) {
-        this.updateJobStatus(jobId, { progress: 50, step: 'Applying overlay to CTA...' });
+        this.updateJobStatus(jobId, { progress: 72, step: 'Applying overlay to CTA...' });
         ctaWithOverlayPath = path.join(workDir, 'cta_with_overlay.mp4');
         await this.applyOverlay(ctaVideoPath, session.overlayImage.path, ctaWithOverlayPath, jobId);
       }
 
       // Step 4: Combine content + CTA (or just use whichever exists)
-      this.updateJobStatus(jobId, { progress: 75, step: 'Creating final video...' });
+      this.updateJobStatus(jobId, { progress: 80, step: 'Creating final video...' });
       finalOutputPath = path.join(workDir, `webinar_${jobId}.mp4`);
 
       if (contentVideoPath && ctaWithOverlayPath) {
@@ -391,7 +391,7 @@ class WebinarMultiService {
   /**
    * Concatenate multiple videos using concat filter
    */
-  async concatenateVideos(videoPaths, outputPath, jobId) {
+  async concatenateVideos(videoPaths, outputPath, jobId, groupLabel = '', progressStart = 0, progressEnd = 100) {
     if (videoPaths.length === 0) {
       throw new Error('No videos to concatenate');
     }
@@ -406,13 +406,25 @@ class WebinarMultiService {
     const concatDir = path.dirname(outputPath);
     const listPath = path.join(concatDir, `concat_list_${Date.now()}.txt`);
     
-    // First, standardize all videos
+    // First, standardize all videos — with per-file progress updates
     const standardizedPaths = [];
-    for (let i = 0; i < videoPaths.length; i++) {
+    const totalFiles = videoPaths.length;
+    for (let i = 0; i < totalFiles; i++) {
+      // Calculate progress within the allocated range
+      const fileProgress = Math.round(progressStart + ((i / totalFiles) * (progressEnd - progressStart)));
+      const stepText = groupLabel 
+        ? `Processing ${groupLabel} video ${i + 1} of ${totalFiles}...`
+        : `Standardizing video ${i + 1} of ${totalFiles}...`;
+      this.updateJobStatus(jobId, { progress: fileProgress, step: stepText });
+      
       const stdPath = path.join(concatDir, `std_${i}.mp4`);
       await this.standardizeVideo(videoPaths[i], stdPath, jobId);
       standardizedPaths.push(stdPath);
     }
+
+    // Update progress for the concat step itself
+    const concatStepText = groupLabel ? `Joining ${totalFiles} ${groupLabel} videos...` : `Joining ${totalFiles} videos...`;
+    this.updateJobStatus(jobId, { progress: progressEnd - 1, step: concatStepText });
 
     // Create concat list file
     const listContent = standardizedPaths.map(p => `file '${p}'`).join('\n');
