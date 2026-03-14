@@ -882,14 +882,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         const localPath = path.join(workDir, `input_${i + 1}.mp4`);
         console.log(`[ComboClip] Downloading clip ${i + 1}/${clipUrls.length}...`);
         
-        const response = await fetch(clipUrls[i]);
-        if (!response.ok) {
-          throw new Error(`Failed to download clip ${i + 1}: ${response.statusText}`);
-        }
-        const buffer = Buffer.from(await response.arrayBuffer());
-        await fs.writeFile(localPath, buffer);
+        await r2Service.downloadFile(clipUrls[i], localPath);
         localPaths.push(localPath);
-        console.log(`[ComboClip] ✓ Clip ${i + 1} downloaded (${(buffer.length / 1024 / 1024).toFixed(1)}MB)`);
+        
+        const fileSize = (await fs.stat(localPath)).size;
+        console.log(`[ComboClip] ✓ Clip ${i + 1} downloaded (${(fileSize / 1024 / 1024).toFixed(1)}MB)`);
       }
 
       // Step 2: Concatenate using the same proven concat filter as Split React
