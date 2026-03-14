@@ -889,8 +889,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         console.log(`[ComboClip] ✓ Clip ${i + 1} downloaded (${(fileSize / 1024 / 1024).toFixed(1)}MB)`);
       }
 
-      // Step 2: Concatenate using the same proven concat filter as Split React
-      // This ensures no pitch issues, no gaps, no format mismatches
+      // Step 2: Probe first clip to check if it has audio
+      const hasAudio = await new Promise((resolve) => {
+        const probe = spawn('ffprobe', [
+          '-v', 'quiet',
+          '-select_streams', 'a',
+          '-show_entries', 'stream=index',
+          '-of', 'csv=p=0',
+          localPaths[0]
+        ]);
+        let output = '';
+        probe.stdout.on('data', (data) => { output += data.toString(); });
+        probe.on('close', () => {
+          resolve(output.trim().length > 0);
+        });
+        probe.on('error', () => resolve(false));
+      });
+
+      console.log(`[ComboClip] Audio detected: ${hasAudio}`);
+
+      // Step 3: Concatenate using concat filter
       const outputPath = path.join(workDir, 'combo_output.mp4');
 
       const inputArgs = [];
@@ -898,17 +916,27 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         inputArgs.push('-i', p);
       });
 
-      // Build filter_complex — normalize all streams before concat
+      // Build filter_complex — handle both with-audio and without-audio cases
       const filterParts = [];
       const concatInputs = [];
 
-      for (let i = 0; i < localPaths.length; i++) {
-        filterParts.push(`[${i}:v]fps=30,format=yuv420p,setsar=1[v${i}]`);
-        filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
-        concatInputs.push(`[v${i}][a${i}]`);
+      if (hasAudio) {
+        // Clips have audio — normalize both video and audio streams
+        for (let i = 0; i < localPaths.length; i++) {
+          filterParts.push(`[${i}:v]fps=30,format=yuv420p,setsar=1[v${i}]`);
+          filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
+          concatInputs.push(`[v${i}][a${i}]`);
+        }
+        filterParts.push(`${concatInputs.join('')}concat=n=${localPaths.length}:v=1:a=1[outv][outa]`);
+      } else {
+        // No audio — video-only concat, generate silent audio
+        for (let i = 0; i < localPaths.length; i++) {
+          filterParts.push(`[${i}:v]fps=30,format=yuv420p,setsar=1[v${i}]`);
+          concatInputs.push(`[v${i}]`);
+        }
+        filterParts.push(`${concatInputs.join('')}concat=n=${localPaths.length}:v=1:a=0[outv]`);
       }
 
-      filterParts.push(`${concatInputs.join('')}concat=n=${localPaths.length}:v=1:a=1[outv][outa]`);
       const filterComplex = filterParts.join(';');
 
       const ffmpegArgs = [
@@ -916,17 +944,20 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         ...inputArgs,
         '-filter_complex', filterComplex,
         '-map', '[outv]',
-        '-map', '[outa]',
+      ];
+
+      if (hasAudio) {
+        ffmpegArgs.push('-map', '[outa]');
+        ffmpegArgs.push('-c:a', 'aac', '-ar', '48000', '-ac', '2', '-b:a', '320k');
+      }
+
+      ffmpegArgs.push(
         '-c:v', 'libx264',
         '-preset', 'medium',
         '-crf', '20',
-        '-c:a', 'aac',
-        '-ar', '48000',
-        '-ac', '2',
-        '-b:a', '320k',
         '-movflags', '+faststart',
         outputPath
-      ];
+      );
 
       console.log(`[ComboClip] Concatenating ${localPaths.length} clips...`);
 
