@@ -856,6 +856,139 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     return completedJobs;
   }
+
+  /**
+   * 🔗 COMBO CLIPS — Combine selected clips into one sequential video
+   * 
+   * Downloads selected clips from R2, concatenates them in order,
+   * uploads the result back to R2 under combo-clips/ prefix.
+   * 
+   * Quality matches Split React: CRF 20, medium preset, 320k audio, 48000 Hz
+   * Filename: COMBO-[videoTitle]-[dd-mm-yy]-[hh-mm-ss-GST].mp4
+   */
+  async combineClips(clipUrls, videoTitle) {
+    const { spawn } = require('child_process');
+    const comboId = uuidv4();
+    const tempDir = process.env.TEMP_DIR || '/app/temp';
+    const workDir = path.join(tempDir, `combo-${comboId}`);
+    await fs.ensureDir(workDir);
+
+    console.log(`[ComboClip] Starting combo: ${clipUrls.length} clips, title: "${videoTitle}"`);
+
+    try {
+      // Step 1: Download all clips from R2 to local temp
+      const localPaths = [];
+      for (let i = 0; i < clipUrls.length; i++) {
+        const localPath = path.join(workDir, `input_${i + 1}.mp4`);
+        console.log(`[ComboClip] Downloading clip ${i + 1}/${clipUrls.length}...`);
+        
+        const response = await fetch(clipUrls[i]);
+        if (!response.ok) {
+          throw new Error(`Failed to download clip ${i + 1}: ${response.statusText}`);
+        }
+        const buffer = Buffer.from(await response.arrayBuffer());
+        await fs.writeFile(localPath, buffer);
+        localPaths.push(localPath);
+        console.log(`[ComboClip] ✓ Clip ${i + 1} downloaded (${(buffer.length / 1024 / 1024).toFixed(1)}MB)`);
+      }
+
+      // Step 2: Concatenate using the same proven concat filter as Split React
+      // This ensures no pitch issues, no gaps, no format mismatches
+      const outputPath = path.join(workDir, 'combo_output.mp4');
+
+      const inputArgs = [];
+      localPaths.forEach(p => {
+        inputArgs.push('-i', p);
+      });
+
+      // Build filter_complex — normalize all streams before concat
+      const filterParts = [];
+      const concatInputs = [];
+
+      for (let i = 0; i < localPaths.length; i++) {
+        filterParts.push(`[${i}:v]fps=30,format=yuv420p,setsar=1[v${i}]`);
+        filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
+        concatInputs.push(`[v${i}][a${i}]`);
+      }
+
+      filterParts.push(`${concatInputs.join('')}concat=n=${localPaths.length}:v=1:a=1[outv][outa]`);
+      const filterComplex = filterParts.join(';');
+
+      const ffmpegArgs = [
+        '-y',
+        ...inputArgs,
+        '-filter_complex', filterComplex,
+        '-map', '[outv]',
+        '-map', '[outa]',
+        '-c:v', 'libx264',
+        '-preset', 'medium',
+        '-crf', '20',
+        '-c:a', 'aac',
+        '-ar', '48000',
+        '-ac', '2',
+        '-b:a', '320k',
+        '-movflags', '+faststart',
+        outputPath
+      ];
+
+      console.log(`[ComboClip] Concatenating ${localPaths.length} clips...`);
+
+      await new Promise((resolve, reject) => {
+        const proc = spawn('ffmpeg', ffmpegArgs);
+        let stderr = '';
+        proc.stderr.on('data', (data) => { stderr += data.toString(); });
+        proc.on('close', (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`FFmpeg concat failed (code ${code}): ${stderr.slice(-500)}`));
+        });
+        proc.on('error', (err) => reject(err));
+      });
+
+      console.log(`[ComboClip] ✓ Concat complete`);
+
+      // Step 3: Generate filename with GST timestamp (UTC+4)
+      const now = new Date();
+      const gst = new Date(now.getTime() + (4 * 60 * 60 * 1000)); // UTC+4
+      const dd = String(gst.getUTCDate()).padStart(2, '0');
+      const mm = String(gst.getUTCMonth() + 1).padStart(2, '0');
+      const yy = String(gst.getUTCFullYear()).slice(-2);
+      const hh = String(gst.getUTCHours()).padStart(2, '0');
+      const min = String(gst.getUTCMinutes()).padStart(2, '0');
+      const ss = String(gst.getUTCSeconds()).padStart(2, '0');
+
+      // Clean title for filename safety
+      const safeTitle = (videoTitle || 'untitled')
+        .replace(/[^a-zA-Z0-9\s-]/g, '')
+        .replace(/\s+/g, '-')
+        .substring(0, 50);
+
+      const comboFileName = `COMBO-${safeTitle}-${dd}-${mm}-${yy}-${hh}-${min}-${ss}-GST.mp4`;
+      const r2Key = `combo-clips/${comboId}/${comboFileName}`;
+
+      // Step 4: Upload to R2
+      console.log(`[ComboClip] Uploading to R2: ${r2Key}`);
+      const uploadResult = await r2Service.uploadFile(outputPath, r2Key, 'video/mp4');
+      console.log(`[ComboClip] ✓ Upload complete: ${uploadResult.downloadUrl}`);
+
+      // Step 5: Cleanup temp files
+      await fs.remove(workDir).catch(() => {});
+
+      return {
+        success: true,
+        comboId,
+        fileName: comboFileName,
+        downloadUrl: uploadResult.downloadUrl,
+        r2Key,
+        clipCount: clipUrls.length
+      };
+
+    } catch (error) {
+      console.error(`[ComboClip] Error:`, error.message);
+      // Cleanup on error
+      await fs.remove(workDir).catch(() => {});
+      throw error;
+    }
+  }
 }
 
 module.exports = new ManualClipService();

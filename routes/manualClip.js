@@ -318,4 +318,46 @@ router.get('/jobs', async (req, res) => {
   }
 });
 
+// ============================================================
+// POST /api/manual-clip/combo
+// Combine selected clips into one sequential video
+// Body: { clipUrls: [...], videoTitle: "..." }
+// ============================================================
+router.post('/combo', async (req, res) => {
+  try {
+    const { clipUrls, videoTitle } = req.body;
+
+    // Validate input
+    if (!clipUrls || !Array.isArray(clipUrls) || clipUrls.length < 2) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please select at least 2 clips to combine.'
+      });
+    }
+
+    if (clipUrls.length > 20) {
+      return res.status(400).json({
+        success: false,
+        error: 'You can combine up to 20 clips at a time.'
+      });
+    }
+
+    console.log(`[ManualClip] Combo request: ${clipUrls.length} clips, title: "${videoTitle || 'untitled'}"`);
+
+    const result = await manualClipService.combineClips(clipUrls, videoTitle || 'untitled');
+
+    res.json({
+      success: true,
+      data: result
+    });
+
+  } catch (error) {
+    console.error('[ManualClip] Combo error:', error.message);
+    res.status(500).json({
+      success: false,
+      error: 'Something went wrong while combining your clips. Please try again.'
+    });
+  }
+});
+
 module.exports = router;
