@@ -122,6 +122,7 @@ class WebinarMultiService {
     if (!session) throw new Error('Session not found');
 
     const fileId = uuidv4();
+    const orderInfo = this.extractOrderFromFilename(fileInfo.originalName);
     const fileData = {
       id: fileId,
       filename: fileInfo.filename,
@@ -129,18 +130,19 @@ class WebinarMultiService {
       path: fileInfo.path,
       size: fileInfo.size,
       status: 'uploaded',
-      order: this.extractOrderFromFilename(fileInfo.originalName),
+      order: orderInfo.order,
+      orderSuffix: orderInfo.suffix,
       uploadedAt: new Date().toISOString()
     };
 
     if (group === 'content') {
       session.contentFiles.push(fileData);
       // Auto-sort by order
-      session.contentFiles.sort((a, b) => a.order - b.order);
+      session.contentFiles.sort((a, b) => a.order - b.order || (a.orderSuffix || '').localeCompare(b.orderSuffix || ''));
     } else if (group === 'cta') {
       session.ctaFiles.push(fileData);
       // Auto-sort by order
-      session.ctaFiles.sort((a, b) => a.order - b.order);
+      session.ctaFiles.sort((a, b) => a.order - b.order || (a.orderSuffix || '').localeCompare(b.orderSuffix || ''));
     } else if (group === 'overlay') {
       session.overlayImage = fileData;
     }
@@ -149,33 +151,48 @@ class WebinarMultiService {
     return fileData;
   }
   /**
-   * Extract order number from filename
-   * Looks for the FIRST number in the filename
+   * Extract order number AND letter suffix from filename
+   * Returns { order: number, suffix: string }
    * Examples:
-   *   "1-intro.mp4" -> 1
-   *   "3-Price Reveal.mp4" -> 3
-   *   "10-Quiz.mp4" -> 10
-   *   "intro.mp4" -> 9999 (no number found, sort to end)
+   *   "1-Hook.mp4"           -> { order: 1, suffix: "" }
+   *   "1a-digi product.mp4"  -> { order: 1, suffix: "a" }
+   *   "1b-Now How.mp4"       -> { order: 1, suffix: "b" }
+   *   "10-Quiz.mp4"          -> { order: 10, suffix: "" }
+   *   "10a-Bonus-1.mp4"      -> { order: 10, suffix: "a" }
+   *   "10b-Bonus2.mp4"       -> { order: 10, suffix: "b" }
+   *   "25a-Ambreen.mp4"      -> { order: 25, suffix: "a" }
+   *   "intro.mp4"            -> { order: 9999, suffix: "" }
    */
   extractOrderFromFilename(filename) {
     // Remove extension first
     const nameWithoutExt = filename.replace(/\.[^/.]+$/, '');
     
-    // Match the FIRST number in the filename
-    const match = nameWithoutExt.match(/^(\d+)/);
+    // Match number at the START, optionally followed by a letter suffix
+    // Examples: "1-Hook" -> num=1, suffix=""
+    //           "1a-digi" -> num=1, suffix="a"
+    //           "10b-Bonus" -> num=10, suffix="b"
+    //           "25a-Ambreen" -> num=25, suffix="a"
+    const match = nameWithoutExt.match(/^(\d+)([a-zA-Z])?/);
     
     if (match) {
-      return parseInt(match[1], 10);
+      const order = parseInt(match[1], 10);
+      const suffix = (match[2] || '').toLowerCase();
+      console.log(`[Order] Extracted order=${order}, suffix="${suffix}" from filename: ${filename}`);
+      return { order, suffix };
     }
     
     // If no number at the start, try to find first number anywhere
-    const anyMatch = nameWithoutExt.match(/(\d+)/);
+    const anyMatch = nameWithoutExt.match(/(\d+)([a-zA-Z])?/);
     if (anyMatch) {
-      return parseInt(anyMatch[1], 10);
+      const order = parseInt(anyMatch[1], 10);
+      const suffix = (anyMatch[2] || '').toLowerCase();
+      console.log(`[Order] Extracted order=${order}, suffix="${suffix}" from filename (non-start): ${filename}`);
+      return { order, suffix };
     }
     
     // No number found - put at the end
-    return 9999;
+    console.log(`[Order] No number found in filename: ${filename}, using 9999`);
+    return { order: 9999, suffix: '' };
   }
 
   /**
@@ -196,7 +213,7 @@ class WebinarMultiService {
     });
 
     // Re-sort
-    files.sort((a, b) => a.order - b.order);
+    files.sort((a, b) => a.order - b.order || (a.orderSuffix || '').localeCompare(b.orderSuffix || ''));
     this.sessions.set(sessionId, session);
 
     return files;
@@ -312,7 +329,20 @@ class WebinarMultiService {
     console.log(`[${jobId}] Content files: ${session.contentFiles.length}`);
     console.log(`[${jobId}] CTA files: ${session.ctaFiles.length}`);
     console.log(`[${jobId}] Overlay: ${session.overlayImage ? 'Yes' : 'No'}`);
-
+    
+    // Log the exact order files will be rendered in
+    if (session.contentFiles.length > 0) {
+      console.log(`[${jobId}] === CONTENT ORDER ===`);
+      session.contentFiles.forEach((f, i) => {
+        console.log(`[${jobId}]   ${i + 1}. "${f.originalName}" (order: ${f.order}, suffix: "${f.orderSuffix || ''}")`);
+      });
+    }
+    if (session.ctaFiles.length > 0) {
+      console.log(`[${jobId}] === CTA ORDER ===`);
+      session.ctaFiles.forEach((f, i) => {
+        console.log(`[${jobId}]   ${i + 1}. "${f.originalName}" (order: ${f.order}, suffix: "${f.orderSuffix || ''}")`);
+      });
+    }
     this.updateJobStatus(jobId, { status: 'processing', progress: 0, step: 'Starting...' });
 
     try {
