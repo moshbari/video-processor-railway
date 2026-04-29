@@ -211,6 +211,143 @@ router.get('/progress/:jobId', (req, res) => {
 });
 
 /**
+ * POST /api/audio-reaction/generate-voiceovers
+ *
+ * Generate AI voiceovers for all reaction scripts in one call.
+ * Eliminates the manual external-audio creation step.
+ *
+ * Body (JSON):
+ * {
+ *   "jobId": "abc123",                          // the split job ID
+ *   "provider": "openai" | "elevenlabs",        // optional, default "openai"
+ *   "reactions": [
+ *     { "clipIndex": 1, "text": "Hold on..." },
+ *     { "clipIndex": 2, "text": "Quick teacher moment..." }
+ *   ]
+ * }
+ *
+ * Returns immediately with the jobId; generation runs in the background.
+ * Frontend should poll GET /voiceover-progress/:jobId to check status,
+ * and read the final reactions array (with audioPath + audioR2Url) when
+ * status becomes 'complete' or 'complete_with_errors'.
+ */
+router.post('/generate-voiceovers', async (req, res) => {
+  try {
+    const { jobId, provider, reactions } = req.body;
+
+    // Validate
+    if (!jobId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing jobId. Please split a video first.'
+      });
+    }
+
+    if (!reactions || !Array.isArray(reactions) || reactions.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No reactions provided. Send an array of { clipIndex, text }.'
+      });
+    }
+
+    for (const reaction of reactions) {
+      if (!reaction.clipIndex || !reaction.text || !reaction.text.trim()) {
+        return res.status(400).json({
+          success: false,
+          error: 'Each reaction must have clipIndex and non-empty text.'
+        });
+      }
+    }
+
+    const normalizedProvider = (provider || 'openai').toLowerCase();
+    if (!['openai', 'elevenlabs', '11labs'].includes(normalizedProvider)) {
+      return res.status(400).json({
+        success: false,
+        error: `Unknown provider: ${provider}. Supported: 'openai', 'elevenlabs'.`
+      });
+    }
+
+    console.log(`\n[AudioReaction API] 🎙️ Starting voiceover generation`);
+    console.log(`[AudioReaction API] Job: ${jobId}`);
+    console.log(`[AudioReaction API] Provider: ${normalizedProvider}`);
+    console.log(`[AudioReaction API] Reactions: ${reactions.length}`);
+
+    // Mark progress as starting BEFORE we respond, so the frontend's
+    // first poll always finds something.
+    audioReactionService.updateVoiceoverProgress(
+      jobId,
+      'starting',
+      0,
+      `Starting voiceover generation with ${normalizedProvider}...`
+    );
+
+    // Respond immediately, generate in background
+    res.json({
+      success: true,
+      message: 'Voiceover generation started',
+      jobId,
+      provider: normalizedProvider,
+      reactionCount: reactions.length
+    });
+
+    // Run in background — poll /voiceover-progress/:jobId for results
+    audioReactionService.generateVoiceoversForJob(jobId, normalizedProvider, reactions)
+      .then(result => {
+        console.log(`[AudioReaction API] ✅ Voiceover gen done: ${result.totalGenerated} ok, ${result.totalFailed} failed`);
+      })
+      .catch(err => {
+        console.error(`[AudioReaction API] ❌ Voiceover gen failed:`, err.message);
+        audioReactionService.updateVoiceoverProgress(
+          jobId,
+          'error',
+          0,
+          err.message
+        );
+      });
+
+  } catch (error) {
+    console.error('[AudioReaction API] generate-voiceovers error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * GET /api/audio-reaction/voiceover-progress/:jobId
+ *
+ * Check voiceover-generation progress.
+ *
+ * Response shape (during generation):
+ *   { success: true, jobId, status: 'generating', progress: 60, message: '...' }
+ *
+ * Response shape (when complete):
+ *   {
+ *     success: true,
+ *     jobId,
+ *     status: 'complete' | 'complete_with_errors' | 'error',
+ *     progress: 100,
+ *     message: '...',
+ *     reactions: [{ clipIndex, text, audioPath, audioR2Url, success }, ...],
+ *     totalGenerated: 3,
+ *     totalFailed: 0,
+ *     provider: 'openai'
+ *   }
+ */
+router.get('/voiceover-progress/:jobId', (req, res) => {
+  const { jobId } = req.params;
+
+  const progress = audioReactionService.getVoiceoverProgress(jobId);
+
+  res.json({
+    success: true,
+    jobId,
+    ...progress
+  });
+});
+
+/**
  * POST /api/audio-reaction/render-sync
  * 
  * Render and wait for completion (for testing)

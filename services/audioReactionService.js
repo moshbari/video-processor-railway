@@ -18,9 +18,13 @@ const path = require('path');
 const fs = require('fs-extra');
 const { v4: uuidv4 } = require('uuid');
 const r2Service = require('./r2Service');
+const voiceService = require('./voiceService');
 
 // Store render progress for polling
 const renderProgress = {};
+
+// Store voiceover-generation progress for polling (separate from render progress)
+const voiceoverProgress = {};
 
 const TEMP_DIR = process.env.TEMP_DIR || '/app/temp';
 
@@ -443,6 +447,161 @@ class AudioReactionService {
     console.log(`[AudioReaction] ✅ Audio reaction ${clipIndex} saved: ${audioPath}`);
     
     return audioPath;
+  }
+
+  // ===========================================================================
+  // VOICEOVER GENERATION (NEW - April 2026)
+  // ===========================================================================
+  // Generates audio from reaction scripts using OpenAI TTS or 11Labs,
+  // saves locally + uploads to R2, and returns data ready for /render.
+  // Eliminates the manual external-audio-creation step from the user flow.
+
+  /**
+   * Get current voiceover-generation progress
+   */
+  getVoiceoverProgress(jobId) {
+    return voiceoverProgress[jobId] || { status: 'unknown', progress: 0 };
+  }
+
+  /**
+   * Update voiceover-generation progress
+   */
+  updateVoiceoverProgress(jobId, status, progress, message = '', extra = {}) {
+    voiceoverProgress[jobId] = {
+      status,
+      progress: Math.round(progress),
+      message,
+      updatedAt: Date.now(),
+      ...extra
+    };
+    console.log(`[Voiceover] Job ${jobId}: ${status} - ${Math.round(progress)}% ${message}`);
+  }
+
+  /**
+   * MAIN FUNCTION: Generate voiceovers for all reaction scripts
+   *
+   * For each reaction: calls TTS, saves locally (so existing /render flow
+   * works unchanged), and ALSO uploads to R2 as a backup (in case Railway
+   * restarts before user clicks Render).
+   *
+   * @param {string} jobId - the split job ID (same as the Audio RANT session)
+   * @param {string} provider - 'openai' (default) or 'elevenlabs'
+   * @param {Array} reactions - [{ clipIndex, text, timestamp? }]
+   * @returns {object} { success, jobId, provider, reactions: [...], totalGenerated, totalFailed }
+   */
+  async generateVoiceoversForJob(jobId, provider, reactions) {
+    const workDir = path.join(this.tempDir, jobId, 'audio_reactions');
+    await fs.ensureDir(workDir);
+
+    const total = reactions.length;
+    const normalizedProvider = (provider || 'openai').toLowerCase();
+
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`[Voiceover] 🎙️ Generating ${total} voiceovers (${normalizedProvider})`);
+    console.log(`[Voiceover] Job: ${jobId}`);
+    console.log(`${'='.repeat(60)}\n`);
+
+    this.updateVoiceoverProgress(jobId, 'starting', 0, `Generating ${total} voiceovers with ${normalizedProvider}...`);
+
+    const results = [];
+
+    for (let i = 0; i < total; i++) {
+      const reaction = reactions[i];
+      const clipIndex = parseInt(reaction.clipIndex, 10);
+      const text = (reaction.text || '').trim();
+
+      const baseProgress = 5 + (i / total) * 85;
+
+      try {
+        if (!clipIndex || isNaN(clipIndex)) {
+          throw new Error(`Invalid clipIndex: ${reaction.clipIndex}`);
+        }
+        if (!text) {
+          throw new Error('Reaction text is empty');
+        }
+
+        this.updateVoiceoverProgress(
+          jobId,
+          'generating',
+          baseProgress,
+          `Generating voiceover ${i + 1} of ${total}...`
+        );
+
+        // 1. Call TTS
+        const audioBuffer = await voiceService.generateVoice(normalizedProvider, text);
+
+        // 2. Save locally (matches the path structure used by manual upload)
+        const localFilename = `reaction_${clipIndex}.mp3`;
+        const localPath = path.join(workDir, localFilename);
+        await fs.writeFile(localPath, audioBuffer);
+        console.log(`[Voiceover] ✓ Saved locally: ${localPath}`);
+
+        // 3. Upload to R2 as backup (so it survives Railway restarts)
+        let audioR2Url = null;
+        try {
+          if (r2Service.isConfigured()) {
+            const r2Key = `audio-reactions/${jobId}/${localFilename}`;
+            const uploadResult = await r2Service.uploadBuffer(audioBuffer, r2Key, 'audio/mpeg');
+            audioR2Url = uploadResult.downloadUrl || r2Service.getPublicUrl(r2Key);
+            console.log(`[Voiceover] ✓ Uploaded to R2: ${r2Key}`);
+          } else {
+            console.log(`[Voiceover] ⚠ R2 not configured, skipping cloud backup`);
+          }
+        } catch (r2Err) {
+          // R2 upload failure is non-fatal — local file is still good for immediate render
+          console.warn(`[Voiceover] ⚠ R2 upload failed (non-fatal): ${r2Err.message}`);
+        }
+
+        results.push({
+          clipIndex,
+          text,
+          timestamp: reaction.timestamp || null,
+          audioPath: localPath,
+          audioR2Url,
+          success: true
+        });
+
+      } catch (err) {
+        console.error(`[Voiceover] ❌ Failed for clip ${clipIndex}: ${err.message}`);
+        results.push({
+          clipIndex,
+          text,
+          timestamp: reaction.timestamp || null,
+          audioPath: null,
+          audioR2Url: null,
+          success: false,
+          error: err.message
+        });
+      }
+    }
+
+    const totalGenerated = results.filter(r => r.success).length;
+    const totalFailed = results.filter(r => !r.success).length;
+
+    const finalStatus = totalFailed === 0 ? 'complete' : (totalGenerated === 0 ? 'error' : 'complete_with_errors');
+    const finalMessage = totalFailed === 0
+      ? `All ${totalGenerated} voiceovers ready`
+      : `${totalGenerated} of ${total} voiceovers ready (${totalFailed} failed)`;
+
+    this.updateVoiceoverProgress(jobId, finalStatus, 100, finalMessage, {
+      reactions: results,
+      totalGenerated,
+      totalFailed,
+      provider: normalizedProvider
+    });
+
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`[Voiceover] 🎉 ${finalMessage}`);
+    console.log(`${'='.repeat(60)}\n`);
+
+    return {
+      success: totalGenerated > 0,
+      jobId,
+      provider: normalizedProvider,
+      reactions: results,
+      totalGenerated,
+      totalFailed
+    };
   }
 }
 

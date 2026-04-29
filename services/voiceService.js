@@ -2,6 +2,11 @@ const fetch = require('node-fetch');
 const path = require('path');
 const fs = require('fs-extra');
 const { v4: uuidv4 } = require('uuid');
+const OpenAI = require('openai');
+
+// Default voices per provider (hardcoded for v1 — picker can come later)
+const DEFAULT_OPENAI_VOICE = 'nova';   // clear, neutral
+const DEFAULT_ELEVENLABS_VOICE_ID = 'TxGEqnHWrfWFTfGW9XjX'; // Josh
 
 class VoiceService {
   constructor() {
@@ -9,6 +14,77 @@ class VoiceService {
     this.apiUrl = 'https://api.elevenlabs.io/v1';
     this.outputDir = process.env.OUTPUT_DIR || '/app/outputs';
     this.tempDir = process.env.TEMP_DIR || '/app/temp';
+
+    // OpenAI client (lazy init — only created when actually needed)
+    this._openai = null;
+  }
+
+  /**
+   * Get or create the OpenAI client
+   */
+  getOpenAIClient() {
+    if (!this._openai) {
+      if (!process.env.OPENAI_API_KEY) {
+        throw new Error('OPENAI_API_KEY not configured');
+      }
+      this._openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    }
+    return this._openai;
+  }
+
+  /**
+   * Generate a single voiceover using OpenAI TTS
+   * Returns: Buffer (mp3 audio)
+   */
+  async generateOpenAIVoice(text, voice = DEFAULT_OPENAI_VOICE) {
+    if (!text || !text.trim()) {
+      throw new Error('Text is required for voice generation');
+    }
+    if (text.length > 4096) {
+      throw new Error('Text exceeds OpenAI TTS limit of 4096 characters');
+    }
+
+    console.log(`[VoiceService] OpenAI TTS: voice=${voice}, chars=${text.length}`);
+
+    const openai = this.getOpenAIClient();
+
+    const mp3Response = await openai.audio.speech.create({
+      model: 'tts-1',
+      voice: voice,
+      input: text,
+      response_format: 'mp3'
+    });
+
+    // The OpenAI SDK returns a Response object — we need the buffer
+    const arrayBuffer = await mp3Response.arrayBuffer();
+    const audioBuffer = Buffer.from(arrayBuffer);
+
+    console.log(`[VoiceService] ✓ OpenAI voice generated: ${audioBuffer.length} bytes`);
+    return audioBuffer;
+  }
+
+  /**
+   * UNIFIED voice generation — dispatches to OpenAI or 11Labs
+   * Returns: Buffer (mp3 audio)
+   *
+   * @param {string} provider - 'openai' or 'elevenlabs'
+   * @param {string} text - the script to convert to speech
+   * @param {object} options - { voice (optional voice override) }
+   */
+  async generateVoice(provider, text, options = {}) {
+    const normalizedProvider = (provider || 'openai').toLowerCase();
+
+    if (normalizedProvider === 'openai') {
+      const voice = options.voice || DEFAULT_OPENAI_VOICE;
+      return await this.generateOpenAIVoice(text, voice);
+    }
+
+    if (normalizedProvider === 'elevenlabs' || normalizedProvider === '11labs') {
+      const voiceId = options.voiceId || DEFAULT_ELEVENLABS_VOICE_ID;
+      return await this.generateVoiceForReaction(text, voiceId);
+    }
+
+    throw new Error(`Unknown TTS provider: ${provider}. Supported: 'openai', 'elevenlabs'`);
   }
 
   /**
