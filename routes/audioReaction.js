@@ -220,20 +220,25 @@ router.get('/progress/:jobId', (req, res) => {
  * {
  *   "jobId": "abc123",                          // the split job ID
  *   "provider": "openai" | "elevenlabs",        // optional, default "openai"
+ *   "voice": "nova",                            // optional, see ALLOWED_VOICES
  *   "reactions": [
  *     { "clipIndex": 1, "text": "Hold on..." },
  *     { "clipIndex": 2, "text": "Quick teacher moment..." }
  *   ]
  * }
  *
+ * ALLOWED_VOICES per provider:
+ *   openai:     'nova' (default), 'onyx', 'echo', 'shimmer', 'alloy', 'fable'
+ *   elevenlabs: voice IDs from 11Labs (default 'TxGEqnHWrfWFTfGW9XjX' = Josh).
+ *               Frontend supplies a stable voiceId — we accept any string and
+ *               let 11Labs validate (returns clear error if invalid).
+ *
  * Returns immediately with the jobId; generation runs in the background.
- * Frontend should poll GET /voiceover-progress/:jobId to check status,
- * and read the final reactions array (with audioPath + audioR2Url) when
- * status becomes 'complete' or 'complete_with_errors'.
+ * Frontend should poll GET /voiceover-progress/:jobId to check status.
  */
 router.post('/generate-voiceovers', async (req, res) => {
   try {
-    const { jobId, provider, reactions } = req.body;
+    const { jobId, provider, voice, reactions } = req.body;
 
     // Validate
     if (!jobId) {
@@ -267,9 +272,24 @@ router.post('/generate-voiceovers', async (req, res) => {
       });
     }
 
+    // Validate voice (only enforced for OpenAI — 11Labs has hundreds of voice IDs)
+    const OPENAI_VOICES = ['nova', 'onyx', 'echo', 'shimmer', 'alloy', 'fable'];
+    let normalizedVoice = null;
+    if (voice && typeof voice === 'string' && voice.trim()) {
+      normalizedVoice = voice.trim();
+      if (normalizedProvider === 'openai' && !OPENAI_VOICES.includes(normalizedVoice.toLowerCase())) {
+        return res.status(400).json({
+          success: false,
+          error: `Unknown OpenAI voice: ${voice}. Supported: ${OPENAI_VOICES.join(', ')}.`
+        });
+      }
+      if (normalizedProvider === 'openai') normalizedVoice = normalizedVoice.toLowerCase();
+    }
+
     console.log(`\n[AudioReaction API] 🎙️ Starting voiceover generation`);
     console.log(`[AudioReaction API] Job: ${jobId}`);
     console.log(`[AudioReaction API] Provider: ${normalizedProvider}`);
+    console.log(`[AudioReaction API] Voice: ${normalizedVoice || '(default)'}`);
     console.log(`[AudioReaction API] Reactions: ${reactions.length}`);
 
     // Mark progress as starting BEFORE we respond, so the frontend's
@@ -287,11 +307,12 @@ router.post('/generate-voiceovers', async (req, res) => {
       message: 'Voiceover generation started',
       jobId,
       provider: normalizedProvider,
+      voice: normalizedVoice || '(default)',
       reactionCount: reactions.length
     });
 
     // Run in background — poll /voiceover-progress/:jobId for results
-    audioReactionService.generateVoiceoversForJob(jobId, normalizedProvider, reactions)
+    audioReactionService.generateVoiceoversForJob(jobId, normalizedProvider, reactions, normalizedVoice)
       .then(result => {
         console.log(`[AudioReaction API] ✅ Voiceover gen done: ${result.totalGenerated} ok, ${result.totalFailed} failed`);
       })
@@ -344,6 +365,45 @@ router.get('/voiceover-progress/:jobId', (req, res) => {
     success: true,
     jobId,
     ...progress
+  });
+});
+
+/**
+ * GET /api/audio-reaction/voices
+ *
+ * Returns the curated list of available voices per provider.
+ * Used by the frontend to populate the voice picker.
+ *
+ * Note: 11Labs voice IDs are stable identifiers from 11Labs' platform.
+ * If a voice ID changes (rare), update it here.
+ */
+router.get('/voices', (req, res) => {
+  res.json({
+    success: true,
+    providers: {
+      openai: {
+        defaultVoice: 'nova',
+        voices: [
+          { id: 'nova',    label: 'Nova',    description: 'Friendly female · warm',          isDefault: true  },
+          { id: 'onyx',    label: 'Onyx',    description: 'Deep male · authoritative',        isDefault: false },
+          { id: 'echo',    label: 'Echo',    description: 'Neutral male · calm',              isDefault: false },
+          { id: 'shimmer', label: 'Shimmer', description: 'Soft female · gentle',             isDefault: false },
+          { id: 'alloy',   label: 'Alloy',   description: 'Balanced neutral · versatile',     isDefault: false },
+          { id: 'fable',   label: 'Fable',   description: 'British male · warm narrator',     isDefault: false }
+        ]
+      },
+      elevenlabs: {
+        defaultVoice: 'TxGEqnHWrfWFTfGW9XjX',
+        voices: [
+          { id: 'TxGEqnHWrfWFTfGW9XjX', label: 'Josh',    description: 'Natural conversational male',  isDefault: true  },
+          { id: '21m00Tcm4TlvDq8ikWAM', label: 'Rachel',  description: 'Warm female narrator',          isDefault: false },
+          { id: 'pNInz6obpgDQGcFmaJgB', label: 'Adam',    description: 'Deep male · documentary',       isDefault: false },
+          { id: 'EXAVITQu4vr4xnSDxMaL', label: 'Bella',   description: 'Bright female · energetic',     isDefault: false },
+          { id: 'ErXwobaYiN019PkySvjV', label: 'Antoni',  description: 'Well-rounded male',             isDefault: false },
+          { id: 'AZnzlk1XvdvUeBnXmlld', label: 'Domi',    description: 'Confident female',              isDefault: false }
+        ]
+      }
+    }
   });
 });
 

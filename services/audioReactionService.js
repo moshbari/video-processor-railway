@@ -487,9 +487,10 @@ class AudioReactionService {
    * @param {string} jobId - the split job ID (same as the Audio RANT session)
    * @param {string} provider - 'openai' (default) or 'elevenlabs'
    * @param {Array} reactions - [{ clipIndex, text, timestamp? }]
-   * @returns {object} { success, jobId, provider, reactions: [...], totalGenerated, totalFailed }
+   * @param {string|null} voice - optional voice override (for OpenAI: 'nova', 'onyx', etc.; for 11Labs: a voice ID). Null = use provider default.
+   * @returns {object} { success, jobId, provider, voice, reactions: [...], totalGenerated, totalFailed }
    */
-  async generateVoiceoversForJob(jobId, provider, reactions) {
+  async generateVoiceoversForJob(jobId, provider, reactions, voice = null) {
     const workDir = path.join(this.tempDir, jobId, 'audio_reactions');
     await fs.ensureDir(workDir);
 
@@ -497,11 +498,23 @@ class AudioReactionService {
     const normalizedProvider = (provider || 'openai').toLowerCase();
 
     console.log(`\n${'='.repeat(60)}`);
-    console.log(`[Voiceover] 🎙️ Generating ${total} voiceovers (${normalizedProvider})`);
+    console.log(`[Voiceover] 🎙️ Generating ${total} voiceovers (${normalizedProvider}, voice=${voice || 'default'})`);
     console.log(`[Voiceover] Job: ${jobId}`);
     console.log(`${'='.repeat(60)}\n`);
 
     this.updateVoiceoverProgress(jobId, 'starting', 0, `Generating ${total} voiceovers with ${normalizedProvider}...`);
+
+    // Build options object passed to voiceService.generateVoice()
+    // - For OpenAI, the field name is `voice`
+    // - For 11Labs, the field name is `voiceId`
+    const ttsOptions = {};
+    if (voice) {
+      if (normalizedProvider === 'openai') {
+        ttsOptions.voice = voice;
+      } else if (normalizedProvider === 'elevenlabs' || normalizedProvider === '11labs') {
+        ttsOptions.voiceId = voice;
+      }
+    }
 
     const results = [];
 
@@ -527,8 +540,8 @@ class AudioReactionService {
           `Generating voiceover ${i + 1} of ${total}...`
         );
 
-        // 1. Call TTS
-        const audioBuffer = await voiceService.generateVoice(normalizedProvider, text);
+        // 1. Call TTS (with optional voice override)
+        const audioBuffer = await voiceService.generateVoice(normalizedProvider, text, ttsOptions);
 
         // 2. Save locally (matches the path structure used by manual upload)
         const localFilename = `reaction_${clipIndex}.mp3`;
@@ -587,7 +600,8 @@ class AudioReactionService {
       reactions: results,
       totalGenerated,
       totalFailed,
-      provider: normalizedProvider
+      provider: normalizedProvider,
+      voice: voice || null
     });
 
     console.log(`\n${'='.repeat(60)}`);
@@ -598,6 +612,7 @@ class AudioReactionService {
       success: totalGenerated > 0,
       jobId,
       provider: normalizedProvider,
+      voice: voice || null,
       reactions: results,
       totalGenerated,
       totalFailed
