@@ -213,8 +213,8 @@ class CaptionService {
     }
 
     // All other styles: group ~4-7 words per line
-    const maxWordsPerLine = styleName === 'subtleClean' ? 7 : 5;
-    const maxCharsPerLine = styleName === 'subtleClean' ? 40 : 30;
+    const maxWordsPerLine = styleName === 'subtleClean' ? 7 : 6;
+    const maxCharsPerLine = styleName === 'subtleClean' ? 50 : 42;
     const lines = [];
     let currentLine = [];
     let currentChars = 0;
@@ -358,63 +358,65 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     const marginV = Math.round(videoHeight * 0.15); // 15% from bottom for center styles
     const marginVBottom = Math.round(videoHeight * 0.06); // 6% from bottom for bottom styles
 
+    // Font sizes are PROPORTIONAL to video height so they look right
+    // on phone-vertical 1080x1920 (the only orientation we support).
+    // Reference: scale = 1.0 means 1920px tall video.
+    // Each style picks its own size in points; fs() converts to pixels.
+    const scale = videoHeight / 1920;
+    const fs = (size) => Math.round(size * scale);
+
     switch (styleName) {
       case 'boldPop':
         return {
-          // White with heavy black outline, bold
-          baseStyle: `Style: Base,Arial Black,60,&H50FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,2,0,1,4,2,2,30,30,${marginV},1`,
-          // Yellow highlight
-          activeStyle: `Style: Active,Arial Black,66,&H0000E5FF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,110,110,2,0,1,4,2,2,30,30,${marginV},1`,
-          spokenStyle: `Style: Spoken,Arial Black,60,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,2,0,1,4,2,2,30,30,${marginV},1`,
+          // White with heavy black outline, bold. Active word: yellow + slight bump.
+          baseStyle: `Style: Base,Arial Black,${fs(40)},&H50FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,2,0,1,3,2,2,30,30,${marginV},1`,
+          activeStyle: `Style: Active,Arial Black,${fs(42)},&H0000E5FF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,105,105,2,0,1,3,2,2,30,30,${marginV},1`,
+          spokenStyle: `Style: Spoken,Arial Black,${fs(40)},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,2,0,1,3,2,2,30,30,${marginV},1`,
         };
       case 'hormoziStack':
         return {
-          baseStyle: `Style: Base,Arial Black,90,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,3,0,1,5,3,5,30,30,${marginV},1`,
-          activeStyle: `Style: Active,Arial Black,90,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,3,0,1,5,3,5,30,30,${marginV},1`,
+          // One word at a time — still bold, but no longer screen-filling
+          baseStyle: `Style: Base,Arial Black,${fs(54)},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,3,0,1,4,3,5,30,30,${marginV},1`,
+          activeStyle: `Style: Active,Arial Black,${fs(54)},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,3,0,1,4,3,5,30,30,${marginV},1`,
         };
       case 'karaokeWipe':
         return {
-          // Base: dim white
-          baseStyle: `Style: Base,Arial Black,58,&H40FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,2,0,1,3,2,2,30,30,${marginV},1`,
-          // Active: red color fill (&H006B6BFF = #FF6B6B in BGR)
-          activeStyle: `Style: Active,Arial Black,58,&H006B6BFF,&H40FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,2,0,1,3,2,2,30,30,${marginV},1`,
+          // Base: dim white. Active: red color fill word-by-word.
+          baseStyle: `Style: Base,Arial Black,${fs(40)},&H40FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,2,0,1,2,2,2,30,30,${marginV},1`,
+          activeStyle: `Style: Active,Arial Black,${fs(40)},&H006B6BFF,&H40FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,2,0,1,2,2,2,30,30,${marginV},1`,
         };
       case 'neonGlow':
         return {
-          // Base: dim cyan
-          baseStyle: `Style: Base,Consolas,50,&H40FFD400,&H00FFD400,&H00000000,&H80000000,1,0,0,0,100,100,3,0,1,2,0,2,30,30,${marginV},1`,
-          // Active: bright white with glow (border = cyan)
-          activeStyle: `Style: Active,Consolas,54,&H00FFFFFF,&H00FFD400,&H00FFD400,&H80000000,1,0,0,0,105,105,3,0,1,3,0,2,30,30,${marginV},1`,
-          spokenStyle: `Style: Spoken,Consolas,50,&H00FFD400,&H00FFD400,&H00000000,&H80000000,1,0,0,0,100,100,3,0,1,2,0,2,30,30,${marginV},1`,
+          // Base: dim cyan. Active: bright white with cyan glow.
+          baseStyle: `Style: Base,Consolas,${fs(38)},&H40FFD400,&H00FFD400,&H00000000,&H80000000,1,0,0,0,100,100,3,0,1,2,0,2,30,30,${marginV},1`,
+          activeStyle: `Style: Active,Consolas,${fs(40)},&H00FFFFFF,&H00FFD400,&H00FFD400,&H80000000,1,0,0,0,103,103,3,0,1,2,0,2,30,30,${marginV},1`,
+          spokenStyle: `Style: Spoken,Consolas,${fs(38)},&H00FFD400,&H00FFD400,&H00000000,&H80000000,1,0,0,0,100,100,3,0,1,2,0,2,30,30,${marginV},1`,
         };
       case 'subtleClean':
         return {
           // White text on semi-transparent dark box (BorderStyle=3 for opaque box)
-          baseStyle: `Style: Base,Arial,40,&HDDFFFFFF,&H00FFFFFF,&H00000000,&HC0000000,0,0,0,0,100,100,1,0,3,1,0,2,30,30,${marginVBottom},1`,
-          activeStyle: `Style: Active,Arial,40,&H00FFFFFF,&H00FFFFFF,&H00000000,&HC0000000,1,0,0,0,100,100,1,0,3,1,0,2,30,30,${marginVBottom},1`,
+          baseStyle: `Style: Base,Arial,${fs(32)},&HDDFFFFFF,&H00FFFFFF,&H00000000,&HC0000000,0,0,0,0,100,100,1,0,3,1,0,2,30,30,${marginVBottom},1`,
+          activeStyle: `Style: Active,Arial,${fs(32)},&H00FFFFFF,&H00FFFFFF,&H00000000,&HC0000000,1,0,0,0,100,100,1,0,3,1,0,2,30,30,${marginVBottom},1`,
         };
       case 'boxHighlight':
         return {
-          // Base: white text, no box
-          baseStyle: `Style: Base,Arial,48,&H00FFFFFF,&H00FFFFFF,&H00000000,&H60000000,1,0,0,0,100,100,1,0,1,2,1,2,30,30,${marginVBottom + 60},1`,
-          // Active: white text with purple box (BorderStyle=3 for opaque box, BackColour = purple)
-          activeStyle: `Style: Active,Arial,48,&H00FFFFFF,&H00FFFFFF,&HFF8B5CF6,&HD08B5CF6,1,0,0,0,100,100,1,0,3,1,0,2,30,30,${marginVBottom + 60},1`,
-          spokenStyle: `Style: Spoken,Arial,48,&H30FFFFFF,&H00FFFFFF,&H00000000,&H60000000,1,0,0,0,100,100,1,0,1,2,1,2,30,30,${marginVBottom + 60},1`,
+          // Base: white text, no box. Active: white text with purple box.
+          baseStyle: `Style: Base,Arial,${fs(34)},&H00FFFFFF,&H00FFFFFF,&H00000000,&H60000000,1,0,0,0,100,100,1,0,1,2,1,2,30,30,${marginVBottom + Math.round(videoHeight * 0.03)},1`,
+          activeStyle: `Style: Active,Arial,${fs(34)},&H00FFFFFF,&H00FFFFFF,&HFF8B5CF6,&HD08B5CF6,1,0,0,0,100,100,1,0,3,1,0,2,30,30,${marginVBottom + Math.round(videoHeight * 0.03)},1`,
+          spokenStyle: `Style: Spoken,Arial,${fs(34)},&H30FFFFFF,&H00FFFFFF,&H00000000,&H60000000,1,0,0,0,100,100,1,0,1,2,1,2,30,30,${marginVBottom + Math.round(videoHeight * 0.03)},1`,
         };
       case 'aliAbdaal':
         return {
-          // Base: medium bright white
-          baseStyle: `Style: Base,Arial,48,&HA0FFFFFF,&H00FFFFFF,&H00000000,&H60000000,1,0,0,0,100,100,1,0,1,2,1,2,30,30,${marginV},1`,
-          // Active: bright white (words fade FROM bright to dark — karaoke secondary color is dark)
-          activeStyle: `Style: Active,Arial,48,&H00FFFFFF,&H30FFFFFF,&H00000000,&H60000000,1,0,0,0,100,100,1,0,1,2,1,2,30,30,${marginV},1`,
+          // Base: medium bright white. Active: bright white (spoken words fade dim).
+          baseStyle: `Style: Base,Arial,${fs(34)},&HA0FFFFFF,&H00FFFFFF,&H00000000,&H60000000,1,0,0,0,100,100,1,0,1,2,1,2,30,30,${marginV},1`,
+          activeStyle: `Style: Active,Arial,${fs(34)},&H00FFFFFF,&H30FFFFFF,&H00000000,&H60000000,1,0,0,0,100,100,1,0,1,2,1,2,30,30,${marginV},1`,
         };
       case 'emojiBurst':
         return {
-          // Base: dim white, bold
-          baseStyle: `Style: Base,Arial Black,55,&H50FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,2,0,1,3,2,2,30,30,${marginV},1`,
-          // Active: orange (&H00169FF9 = #F99F16 → actually &H00169FF9)
-          activeStyle: `Style: Active,Arial Black,60,&H00169FF9,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,110,110,2,0,1,3,2,2,30,30,${marginV},1`,
-          spokenStyle: `Style: Spoken,Arial Black,55,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,2,0,1,3,2,2,30,30,${marginV},1`,
+          // Base: dim white, bold. Active: orange + slight bump.
+          baseStyle: `Style: Base,Arial Black,${fs(40)},&H50FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,2,0,1,2,2,2,30,30,${marginV},1`,
+          activeStyle: `Style: Active,Arial Black,${fs(42)},&H00169FF9,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,105,105,2,0,1,2,2,2,30,30,${marginV},1`,
+          spokenStyle: `Style: Spoken,Arial Black,${fs(40)},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,2,0,1,2,2,2,30,30,${marginV},1`,
         };
       default:
         // Default to boldPop
