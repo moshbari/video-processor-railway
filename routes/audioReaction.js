@@ -136,7 +136,7 @@ router.post('/upload-audio', upload.single('audio'), async (req, res) => {
  */
 router.post('/render', async (req, res) => {
   try {
-    const { jobId, reactions } = req.body;
+    const { jobId, reactions, captions, captionStyle } = req.body;
     
     // Validate inputs
     if (!jobId) {
@@ -163,20 +163,30 @@ router.post('/render', async (req, res) => {
       }
     }
     
+    // Normalize caption flags (frontend may send true/false or 'true'/'false')
+    const captionsEnabled = captions === true || captions === 'true';
+    const styleName = (typeof captionStyle === 'string' && captionStyle.length > 0) ? captionStyle : 'boldPop';
+    
     console.log(`\n[AudioReaction API] 🎬 Starting render`);
     console.log(`[AudioReaction API] Job: ${jobId}`);
     console.log(`[AudioReaction API] Reactions: ${reactions.length}`);
+    console.log(`[AudioReaction API] Captions: ${captionsEnabled ? `ON (${styleName})` : 'OFF'}`);
     
     // Return immediately, render in background
     res.json({
       success: true,
       message: 'Render started',
       jobId,
-      reactionCount: reactions.length
+      reactionCount: reactions.length,
+      captionsEnabled,
+      captionStyle: captionsEnabled ? styleName : null
     });
     
     // Start render in background
-    audioReactionService.combineClipsWithAudioReactions(jobId, reactions)
+    audioReactionService.combineClipsWithAudioReactions(jobId, reactions, {
+      captions: captionsEnabled,
+      captionStyle: styleName
+    })
       .then(result => {
         console.log(`[AudioReaction API] ✅ Render complete: ${result.filename}`);
       })
@@ -415,7 +425,7 @@ router.get('/voices', (req, res) => {
  */
 router.post('/render-sync', async (req, res) => {
   try {
-    const { jobId, reactions } = req.body;
+    const { jobId, reactions, captions, captionStyle } = req.body;
     
     if (!jobId || !reactions || reactions.length === 0) {
       return res.status(400).json({
@@ -424,9 +434,16 @@ router.post('/render-sync', async (req, res) => {
       });
     }
     
-    console.log(`\n[AudioReaction API] 🎬 Starting SYNC render`);
+    const captionsEnabled = captions === true || captions === 'true';
+    const styleName = (typeof captionStyle === 'string' && captionStyle.length > 0) ? captionStyle : 'boldPop';
     
-    const result = await audioReactionService.combineClipsWithAudioReactions(jobId, reactions);
+    console.log(`\n[AudioReaction API] 🎬 Starting SYNC render`);
+    console.log(`[AudioReaction API] Captions: ${captionsEnabled ? `ON (${styleName})` : 'OFF'}`);
+    
+    const result = await audioReactionService.combineClipsWithAudioReactions(jobId, reactions, {
+      captions: captionsEnabled,
+      captionStyle: styleName
+    });
     
     res.json(result);
     

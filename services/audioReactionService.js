@@ -19,6 +19,7 @@ const fs = require('fs-extra');
 const { v4: uuidv4 } = require('uuid');
 const r2Service = require('./r2Service');
 const voiceService = require('./voiceService');
+const captionService = require('./captionService');
 
 // Store render progress for polling
 const renderProgress = {};
@@ -287,8 +288,17 @@ class AudioReactionService {
 
   /**
    * MAIN FUNCTION: Combine clips with audio reactions
+   * @param {string} jobId - Split job ID
+   * @param {Array} audioReactions - Array of { clipIndex, audioPath }
+   * @param {Object} options - Optional rendering options
+   * @param {boolean} options.captions - Burn captions onto rant sections (default false)
+   * @param {string} options.captionStyle - One of the 8 caption style names (default 'boldPop')
    */
-  async combineClipsWithAudioReactions(jobId, audioReactions) {
+  async combineClipsWithAudioReactions(jobId, audioReactions, options = {}) {
+    const captionsEnabled = options.captions === true;
+    const requestedStyle = options.captionStyle || 'boldPop';
+    const captionStyle = captionService.isValidStyle(requestedStyle) ? requestedStyle : 'boldPop';
+
     const workDir = path.join(this.tempDir, jobId, 'audio_render');
     await fs.ensureDir(workDir);
     
@@ -296,6 +306,7 @@ class AudioReactionService {
     console.log(`[AudioReaction] 🎙️ Starting Audio-Only RANT render`);
     console.log(`[AudioReaction] Job ID: ${jobId}`);
     console.log(`[AudioReaction] Audio reactions: ${audioReactions.length}`);
+    console.log(`[AudioReaction] Captions: ${captionsEnabled ? `✅ ON (${captionStyle})` : '❌ OFF'}`);
     console.log(`${'='.repeat(60)}\n`);
     
     this.updateProgress(jobId, 'starting', 0, 'Initializing...');
@@ -368,7 +379,30 @@ class AudioReactionService {
           const frozenWithAudioPath = path.join(workDir, `frozen_audio_${clipIndex}.mp4`);
           await this.createFrozenFrameWithAudio(framePath, audioPath, frozenWithAudioPath, targetWidth, targetHeight);
           
-          allSegments.push(frozenWithAudioPath);
+          // OPTIONAL: Burn captions onto this rant section ONLY (never on original clips)
+          let finalRantPath = frozenWithAudioPath;
+          if (captionsEnabled) {
+            const captionedRantPath = path.join(workDir, `frozen_audio_${clipIndex}_captioned.mp4`);
+            try {
+              this.updateProgress(jobId, 'processing', 25 + ((i + 0.5) / totalClips) * 45, `Adding captions to rant ${clipIndex}/${totalClips}...`);
+              await captionService.addCaptionsToVideo(
+                frozenWithAudioPath,
+                captionedRantPath,
+                captionStyle,
+                { width: targetWidth, height: targetHeight }
+              );
+              finalRantPath = captionedRantPath;
+              console.log(`[AudioReaction] ✓ Captions added to rant ${clipIndex}`);
+              // Cleanup uncaptioned version to save disk space
+              await fs.remove(frozenWithAudioPath).catch(() => {});
+            } catch (capErr) {
+              // Captions failed for this rant — keep going without captions for this one section
+              console.error(`[AudioReaction] ⚠ Caption burn failed for rant ${clipIndex}, using uncaptioned version:`, capErr.message);
+              finalRantPath = frozenWithAudioPath;
+            }
+          }
+          
+          allSegments.push(finalRantPath);
           
           // Clean up frame image
           await fs.remove(framePath).catch(() => {});
