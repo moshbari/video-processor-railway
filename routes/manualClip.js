@@ -240,6 +240,82 @@ router.post('/generate/:jobId', async (req, res) => {
 });
 
 // ============================================================
+// POST /api/manual-clip/render-sequence/:jobId
+// 🎙️ Podcast multi-hook: stitch selected hooks (in order) + the FULL
+// source video into ONE 16:9 file, no transitions.
+// Body: { hooks: [{ startTime, endTime, order }], title }
+// ============================================================
+router.post('/render-sequence/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const { hooks, title } = req.body;
+
+    if (!hooks || !Array.isArray(hooks) || hooks.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please select at least one hook section first.'
+      });
+    }
+
+    for (let i = 0; i < hooks.length; i++) {
+      const h = hooks[i];
+      if (h.startTime === undefined || h.endTime === undefined) {
+        return res.status(400).json({
+          success: false,
+          error: `Hook ${i + 1} is missing start or end time.`
+        });
+      }
+      if (parseFloat(h.endTime) <= parseFloat(h.startTime)) {
+        return res.status(400).json({
+          success: false,
+          error: `Hook ${i + 1}: end time must be after start time.`
+        });
+      }
+    }
+
+    const jobStatus = manualClipService.getJobStatus(jobId);
+    if (!jobStatus) {
+      return res.status(404).json({
+        success: false,
+        error: 'Video session not found. Please prepare the video again.'
+      });
+    }
+    if (jobStatus.status !== 'ready' && jobStatus.status !== 'complete') {
+      return res.status(400).json({
+        success: false,
+        error: 'Video is not ready yet. Please wait for preparation to complete.'
+      });
+    }
+
+    console.log(`\n[ManualClip] Podcast sequence request for job ${jobId}`);
+    console.log(`  Hooks: ${hooks.length} + full video at end -> single 16:9 file`);
+
+    // Return immediately, render in background (frontend polls /status/:jobId).
+    res.json({
+      success: true,
+      jobId,
+      message: `Building your podcast video! Use the status endpoint to track progress.`
+    });
+
+    manualClipService.renderPodcastSequence(jobId, hooks, { title })
+      .catch(error => {
+        console.error(`[ManualClip] Podcast sequence failed:`, error.message);
+        manualClipService.updateJob(jobId, {
+          status: 'error',
+          error: 'Building the podcast video failed. Please try again.'
+        });
+      });
+
+  } catch (error) {
+    console.error('[ManualClip] Render sequence error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Could not start building the podcast video. Please try again.'
+    });
+  }
+});
+
+// ============================================================
 // GET /api/manual-clip/status/:jobId
 // Check progress of preparation or generation
 // ============================================================

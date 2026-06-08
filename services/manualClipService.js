@@ -14,7 +14,7 @@ const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs-extra');
 const { v4: uuidv4 } = require('uuid');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const { promisify } = require('util');
 const execAsync = promisify(exec);
 
@@ -450,6 +450,193 @@ class ManualClipService {
       successCount,
       clips: generatedClips
     };
+  }
+
+  // ============================================================
+  // 🎙️ PODCAST MULTI-HOOK SEQUENCE
+  // ============================================================
+  /**
+   * Render selected "hook" sections (in the user-defined order) followed by
+   * the FULL source video, concatenated into ONE 16:9 video with no
+   * transitions. Reuses the same prepared job + status polling as generate.
+   *
+   * @param {string} jobId - Job ID from the prepare step
+   * @param {Array}  hooks - [{ startTime, endTime, order }]
+   * @param {Object} options - { title }
+   */
+  async renderPodcastSequence(jobId, hooks, options = {}) {
+    const job = this.jobs.get(jobId);
+    if (!job || !job.videoPath) {
+      throw new Error('Video not found. Please prepare the video first.');
+    }
+
+    const videoPath = job.videoPath;
+    const videoDuration = job.videoDuration;
+    const videoTitle = options.title || job.videoTitle || 'Podcast';
+
+    const workDir = path.join(this.tempDir, `manual-${jobId}`);
+    const seqDir = path.join(workDir, 'sequence');
+    await fs.ensureDir(seqDir);
+
+    // Sort hooks by their sequence number (stable; ties keep insertion order).
+    const ordered = hooks
+      .map((h, i) => ({ ...h, _i: i, order: Number(h.order) || (i + 1) }))
+      .sort((a, b) => (a.order - b.order) || (a._i - b._i));
+
+    const totalHooks = ordered.length;
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`[ManualClip ${jobId}] RENDERING PODCAST SEQUENCE`);
+    console.log(`  Hooks: ${totalHooks} (in order) + full video at end`);
+    console.log(`  Output: single 16:9 file, no transitions`);
+    console.log('='.repeat(60));
+
+    this.updateJob(jobId, {
+      status: 'generating',
+      step: 'starting_sequence',
+      progress: 0,
+      totalClips: totalHooks,
+      completedClips: 0,
+      currentClip: 'Preparing hooks...',
+      generatedClips: []
+    });
+
+    // Step 1: Extract each hook section at max quality, in order.
+    const segmentPaths = [];
+    let hooksTotalSeconds = 0;
+    for (let i = 0; i < totalHooks; i++) {
+      const hook = ordered[i];
+      const startTime = Math.max(0, parseFloat(hook.startTime));
+      const endTime = Math.min(parseFloat(hook.endTime), videoDuration);
+      if (isNaN(startTime) || isNaN(endTime) || endTime <= startTime) {
+        throw new Error(`Hook ${i + 1} has invalid timestamps.`);
+      }
+
+      this.updateJob(jobId, {
+        step: `extracting_hook_${i + 1}`,
+        progress: Math.round(5 + (i / totalHooks) * 55), // 5 -> 60
+        completedClips: i,
+        currentClip: `Cutting hook ${i + 1} of ${totalHooks}...`
+      });
+
+      const segPath = path.join(seqDir, `hook_${String(i + 1).padStart(2, '0')}.mp4`);
+      console.log(`  Hook ${i + 1}/${totalHooks} [order ${hook.order}]: ${this.formatTime(startTime)} → ${this.formatTime(endTime)}`);
+      await this.extractClipMaxQuality(videoPath, startTime, endTime, segPath);
+      segmentPaths.push(segPath);
+      hooksTotalSeconds += (endTime - startTime);
+    }
+
+    // Step 2: Append the FULL source video as the final segment.
+    segmentPaths.push(videoPath);
+    const totalSeconds = hooksTotalSeconds + (videoDuration || 0);
+
+    // Step 3: Concatenate everything into one 16:9 file.
+    this.updateJob(jobId, {
+      step: 'concatenating',
+      progress: 62,
+      currentClip: 'Stitching hooks + full video together...'
+    });
+
+    const outputPath = path.join(seqDir, 'podcast_sequence.mp4');
+    await this.concatenateSequence16x9(segmentPaths, outputPath, totalSeconds, (pct) => {
+      this.updateJob(jobId, { progress: Math.round(62 + (pct / 100) * 30) }); // 62 -> 92
+    });
+
+    // Step 4: Upload the single result to R2.
+    this.updateJob(jobId, { step: 'uploading', progress: 94, currentClip: 'Uploading final video...' });
+    const safeTitle = this.sanitizeFilename(videoTitle);
+    const r2FileName = `manual-clips/${jobId}/podcast_sequence_${safeTitle}.mp4`;
+    const uploadResult = await r2Service.uploadFile(outputPath, r2FileName);
+
+    const finalDuration = await this.getVideoDuration(outputPath).catch(() => 0);
+
+    // Single-item result so the existing download screen renders it unchanged.
+    const sequenceClip = {
+      clipNumber: 1,
+      title: `${videoTitle} — Hooks + Full Video`,
+      isSequence: true,
+      hookCount: totalHooks,
+      duration: finalDuration,
+      durationFormatted: this.formatTime(finalDuration),
+      downloadUrl: uploadResult.downloadUrl,
+      hasCaptions: false
+    };
+
+    this.updateJob(jobId, {
+      status: 'complete',
+      step: 'done',
+      progress: 100,
+      completedClips: totalHooks,
+      currentClip: '',
+      generatedClips: [sequenceClip],
+      completedAt: new Date().toISOString()
+    });
+
+    console.log(`[ManualClip ${jobId}] ✓ Podcast sequence complete: ${uploadResult.downloadUrl}`);
+
+    // Clean up local files (R2 holds the result). Never delete the source here.
+    for (const p of segmentPaths) {
+      if (p !== videoPath) await fs.remove(p).catch(() => {});
+    }
+    await fs.remove(outputPath).catch(() => {});
+
+    return { success: true, jobId, downloadUrl: uploadResult.downloadUrl, clips: [sequenceClip] };
+  }
+
+  /**
+   * Concatenate multiple video files into ONE 16:9 (1920x1080) video.
+   * No transitions. Every input is scaled+padded to 1920x1080@30fps and the
+   * audio is loudness-normalized so the joins are seamless even when the hook
+   * sections and the full video have slightly different specs.
+   */
+  concatenateSequence16x9(inputPaths, outputPath, totalSeconds, onProgress) {
+    return new Promise((resolve, reject) => {
+      const n = inputPaths.length;
+      const inputArgs = inputPaths.flatMap(p => ['-i', p]);
+
+      const filterParts = [];
+      let concatInputs = '';
+      for (let i = 0; i < n; i++) {
+        filterParts.push(`[${i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v${i}]`);
+        filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
+        concatInputs += `[v${i}][a${i}]`;
+      }
+      filterParts.push(`${concatInputs}concat=n=${n}:v=1:a=1[outv][preAudio]`);
+      filterParts.push(`[preAudio]loudnorm=I=-16:TP=-1.5:LRA=11[outa]`);
+
+      const args = [
+        '-y',
+        ...inputArgs,
+        '-filter_complex', filterParts.join(';'),
+        '-map', '[outv]',
+        '-map', '[outa]',
+        '-c:v', 'libx264',
+        '-preset', 'medium',
+        '-crf', '20',
+        '-c:a', 'aac',
+        '-b:a', '320k',
+        '-movflags', '+faststart',
+        outputPath
+      ];
+
+      console.log(`  [Concat 16:9] ${n} inputs -> 1920x1080@30fps + loudnorm`);
+      const proc = spawn('ffmpeg', args);
+      let stderr = '';
+      proc.stderr.on('data', (d) => {
+        const s = d.toString();
+        stderr += s;
+        if (stderr.length > 20000) stderr = stderr.slice(-10000);
+        const m = s.match(/time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})/);
+        if (m && onProgress && totalSeconds > 0) {
+          const cur = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 100;
+          onProgress(Math.min(100, (cur / totalSeconds) * 100));
+        }
+      });
+      proc.on('close', (code) => {
+        if (code === 0) { console.log('  [Concat 16:9] ✓ done'); resolve(outputPath); }
+        else { console.error(stderr.slice(-800)); reject(new Error('Could not stitch the final video. Please try again.')); }
+      });
+      proc.on('error', (err) => reject(err));
+    });
   }
 
   // ============================================================
