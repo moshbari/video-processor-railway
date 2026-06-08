@@ -83,7 +83,11 @@ router.post('/prepare', upload.single('video'), async (req, res) => {
 
     let friendlyMessage = 'Something went wrong while preparing your video. Please try again.';
 
-    if (error.message.includes('Unsupported')) {
+    if (error.message.includes('Tella')) {
+      // Tella's own messages are already user-friendly — surface them directly,
+      // minus the internal "Tella download failed:" wrapper.
+      friendlyMessage = error.message.replace(/^Tella download failed:\s*/i, '');
+    } else if (error.message.includes('Unsupported')) {
       friendlyMessage = 'This URL is not supported. Please try a YouTube, TikTok, Instagram, Tella, or other supported platform link.';
     } else if (error.message.includes('too long')) {
       friendlyMessage = error.message;
