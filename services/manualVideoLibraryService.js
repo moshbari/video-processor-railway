@@ -61,6 +61,23 @@ class ManualVideoLibraryService {
     console.log(`[VideoLibrary] Saved "${record.title}" for ${userId} (${data.videos.length} total)`);
   }
 
+  /**
+   * Save the user's marked hooks for one video (auto-save from the editor).
+   * Stored as a lean array: { title, startTime, endTime, order }.
+   */
+  async updateHooks(userId, jobId, hooks) {
+    const data = await this.load(userId);
+    const v = data.videos.find(x => x.jobId === jobId);
+    if (!v) return; // video not in library (e.g. prepared before this feature)
+    v.hooks = (Array.isArray(hooks) ? hooks : []).map(h => ({
+      title: h.title || '',
+      startTime: Number(h.startTime) || 0,
+      endTime: Number(h.endTime) || 0,
+      order: Number(h.order) || 0,
+    }));
+    await this.save(userId, data);
+  }
+
   async list(userId) {
     const data = await this.load(userId);
     return data.videos;

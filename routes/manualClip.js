@@ -437,10 +437,29 @@ router.post('/restore/:jobId', async (req, res) => {
       videoDurationFormatted: record.durationFormatted,
       playbackUrl: record.playbackUrl,
       waveform: { peaks: record.waveformPeaks || [] },
+      hooks: record.hooks || [],
     });
   } catch (error) {
     console.error('[ManualClip] Restore error:', error);
     res.status(500).json({ success: false, error: 'Could not reopen that video.' });
+  }
+});
+
+// ============================================================
+// PUT /api/manual-clip/library/:jobId/hooks
+// Auto-save the user's marked hooks for a saved video
+// Body: { hooks: [{ title, startTime, endTime, order }] }
+// ============================================================
+router.put('/library/:jobId/hooks', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const { hooks } = req.body;
+    await manualVideoLibraryService.updateHooks(userId, jobId, hooks || []);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[ManualClip] Save hooks error:', error);
+    res.status(500).json({ success: false, error: 'Could not save your hooks.' });
   }
 });
 
