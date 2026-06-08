@@ -15,6 +15,7 @@ const path = require('path');
 const fs = require('fs-extra');
 
 const manualClipService = require('../services/manualClipService');
+const manualVideoLibraryService = require('../services/manualVideoLibraryService');
 
 // Upload directory for manual clip videos
 const uploadDir = path.join(process.env.TEMP_DIR || '/app/temp', 'manual-uploads');
@@ -66,6 +67,7 @@ router.post('/prepare', upload.single('video'), async (req, res) => {
 
     // Build input
     const input = {};
+    input.userId = req.headers['x-user-id'] || null;
     if (url) {
       input.url = url;
     } else if (req.file) {
@@ -225,7 +227,8 @@ router.post('/generate/:jobId', async (req, res) => {
     manualClipService.generateManualClips(jobId, clips, {
       format: format || 'vertical',
       captionStyle: captionStyle || 'bold_white',
-      addCaptions: addCaptions !== false
+      addCaptions: addCaptions !== false,
+      userId: req.headers['x-user-id'] || null
     }).catch(error => {
       console.error(`[ManualClip] Generation failed:`, error.message);
       manualClipService.updateJob(jobId, {
@@ -301,7 +304,7 @@ router.post('/render-sequence/:jobId', async (req, res) => {
       message: `Building your podcast video! Use the status endpoint to track progress.`
     });
 
-    manualClipService.renderPodcastSequence(jobId, hooks, { title })
+    manualClipService.renderPodcastSequence(jobId, hooks, { title, userId: req.headers['x-user-id'] || null })
       .catch(error => {
         console.error(`[ManualClip] Podcast sequence failed:`, error.message);
         manualClipService.updateJob(jobId, {
@@ -370,6 +373,90 @@ router.get('/status/:jobId', async (req, res) => {
       success: false,
       error: 'Could not check job status.'
     });
+  }
+});
+
+// ============================================================
+// GET /api/manual-clip/library
+// List the user's saved videos (reopen without re-uploading)
+// ============================================================
+router.get('/library', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    const videos = await manualVideoLibraryService.list(userId);
+    // Keep the list light — don't ship the full waveform arrays here.
+    const slim = videos.map(v => ({
+      jobId: v.jobId,
+      title: v.title,
+      duration: v.duration,
+      durationFormatted: v.durationFormatted,
+      fileSize: v.fileSize,
+      createdAt: v.createdAt,
+    }));
+    res.json({ success: true, videos: slim });
+  } catch (error) {
+    console.error('[ManualClip] Library list error:', error);
+    res.status(500).json({ success: false, error: 'Could not load your videos.' });
+  }
+});
+
+// ============================================================
+// POST /api/manual-clip/restore/:jobId
+// Reopen a saved video in the editor without re-uploading. Lightweight —
+// returns playback URL + waveform; the source MP4 is re-fetched from R2
+// lazily only when the user actually renders.
+// ============================================================
+router.post('/restore/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const record = (await manualVideoLibraryService.get(userId, jobId))
+      || (await manualVideoLibraryService.get(null, jobId));
+    if (!record) {
+      return res.status(404).json({ success: false, error: 'That video is no longer available.' });
+    }
+
+    // Seed a lightweight in-memory job so status/generate/render recognise it.
+    manualClipService.updateJob(jobId, {
+      status: 'ready',
+      step: 'ready',
+      progress: 100,
+      videoTitle: record.title,
+      videoDuration: record.duration,
+      userId,
+      sourceKey: record.sourceKey,
+      playbackUrl: record.playbackUrl,
+      waveform: { peaks: record.waveformPeaks || [] },
+    });
+
+    res.json({
+      success: true,
+      jobId,
+      videoTitle: record.title,
+      videoDuration: record.duration,
+      videoDurationFormatted: record.durationFormatted,
+      playbackUrl: record.playbackUrl,
+      waveform: { peaks: record.waveformPeaks || [] },
+    });
+  } catch (error) {
+    console.error('[ManualClip] Restore error:', error);
+    res.status(500).json({ success: false, error: 'Could not reopen that video.' });
+  }
+});
+
+// ============================================================
+// DELETE /api/manual-clip/library/:jobId
+// Remove a saved video from the library (also deletes the R2 source)
+// ============================================================
+router.delete('/library/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    await manualVideoLibraryService.remove(userId, jobId, { deleteSource: true });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[ManualClip] Library delete error:', error);
+    res.status(500).json({ success: false, error: 'Could not remove that video.' });
   }
 });
 

@@ -21,6 +21,7 @@ const execAsync = promisify(exec);
 const r2Service = require('./r2Service');
 const downloadService = require('./downloadService');
 const transcriptionService = require('./transcriptionService');
+const manualVideoLibraryService = require('./manualVideoLibraryService');
 
 class ManualClipService {
   constructor() {
@@ -101,6 +102,8 @@ class ManualClipService {
         videoPath,
         videoTitle,
         videoDuration,
+        userId: input.userId || null,
+        sourceKey: `manual-clip/${jobId}/source.mp4`,
         progress: 25
       });
 
@@ -146,6 +149,25 @@ class ManualClipService {
         playbackUrl
       });
 
+      // --- Remember this video so the user can reopen it without re-uploading ---
+      try {
+        let fileSize = 0;
+        try { fileSize = (await fs.stat(videoPath)).size; } catch { /* best-effort */ }
+        await manualVideoLibraryService.add(input.userId, {
+          jobId,
+          title: videoTitle,
+          duration: videoDuration,
+          durationFormatted: this.formatTime(videoDuration),
+          sourceKey: `manual-clip/${jobId}/source.mp4`,
+          playbackUrl,
+          waveformPeaks: waveform.peaks,
+          fileSize,
+          createdAt: new Date().toISOString(),
+        });
+      } catch (libErr) {
+        console.error(`[ManualClip ${jobId}] Could not save to video library:`, libErr.message);
+      }
+
       console.log(`[ManualClip ${jobId}] ✓ Video ready for manual clipping`);
 
       return result;
@@ -159,6 +181,52 @@ class ManualClipService {
       });
       throw error;
     }
+  }
+
+  /**
+   * Make sure the source video is present locally for this job. If the
+   * in-memory job or its temp file is gone (server restart or 24h cleanup),
+   * rebuild it from the user's saved library by streaming the source back down
+   * from R2. Returns the (possibly rebuilt) job. Throws if it can't be found.
+   */
+  async ensureSourceAvailable(jobId, userId) {
+    let job = this.jobs.get(jobId);
+    if (job && job.videoPath && await fs.pathExists(job.videoPath)) {
+      return job;
+    }
+
+    const record = (await manualVideoLibraryService.get(userId, jobId))
+      || (await manualVideoLibraryService.get(null, jobId));
+    if (!record) {
+      throw new Error('Video not found. Please prepare the video first.');
+    }
+
+    const sourceKey = record.sourceKey || `manual-clip/${jobId}/source.mp4`;
+    const sourceUrl = record.playbackUrl || r2Service.getPublicUrl(sourceKey);
+    const workDir = path.join(this.tempDir, `manual-${jobId}`);
+    const videoPath = path.join(workDir, 'source.mp4');
+    await fs.ensureDir(workDir);
+
+    if (!await fs.pathExists(videoPath)) {
+      console.log(`[ManualClip ${jobId}] Restoring source from R2 (${sourceKey})...`);
+      await r2Service.downloadFile(sourceUrl, videoPath);
+      console.log(`[ManualClip ${jobId}] ✓ Source restored to ${videoPath}`);
+    }
+
+    job = {
+      ...(job || {}),
+      status: job?.status || 'ready',
+      step: 'ready',
+      videoPath,
+      videoTitle: record.title,
+      videoDuration: record.duration,
+      userId: userId || null,
+      sourceKey,
+      playbackUrl: record.playbackUrl,
+      waveform: { peaks: record.waveformPeaks || [] },
+    };
+    this.jobs.set(jobId, job);
+    return job;
   }
 
   // ============================================================
@@ -263,10 +331,7 @@ class ManualClipService {
    * @param {Object} options - { format, captionStyle, addCaptions }
    */
   async generateManualClips(jobId, clips, options = {}) {
-    const job = this.jobs.get(jobId);
-    if (!job || !job.videoPath) {
-      throw new Error('Video not found. Please prepare the video first.');
-    }
+    const job = await this.ensureSourceAvailable(jobId, options.userId);
 
     const {
       format = 'vertical',
@@ -465,10 +530,7 @@ class ManualClipService {
    * @param {Object} options - { title }
    */
   async renderPodcastSequence(jobId, hooks, options = {}) {
-    const job = this.jobs.get(jobId);
-    if (!job || !job.videoPath) {
-      throw new Error('Video not found. Please prepare the video first.');
-    }
+    const job = await this.ensureSourceAvailable(jobId, options.userId);
 
     const videoPath = job.videoPath;
     const videoDuration = job.videoDuration;
