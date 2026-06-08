@@ -84,7 +84,7 @@ router.post('/prepare', upload.single('video'), async (req, res) => {
     let friendlyMessage = 'Something went wrong while preparing your video. Please try again.';
 
     if (error.message.includes('Unsupported')) {
-      friendlyMessage = 'This URL is not supported. Please try a YouTube, TikTok, Instagram, or other supported platform link.';
+      friendlyMessage = 'This URL is not supported. Please try a YouTube, TikTok, Instagram, Tella, or other supported platform link.';
     } else if (error.message.includes('too long')) {
       friendlyMessage = error.message;
     } else if (error.message.includes('too large')) {

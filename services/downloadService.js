@@ -6,6 +6,8 @@ const { v4: uuidv4 } = require('uuid');
 
 const execAsync = promisify(exec);
 
+const tellaService = require('./tellaService');
+
 class DownloadService {
   constructor() {
     this.tempDir = process.env.TEMP_DIR || '/app/temp';
@@ -21,6 +23,32 @@ class DownloadService {
     const id = jobId || uuidv4();
     const outputPath = path.join(this.tempDir, id);
     await fs.ensureDir(outputPath);
+
+    // --- Tella account videos: use the official Tella API (yt-dlp can't) ---
+    if (tellaService.isTellaUrl(url)) {
+      try {
+        console.log(`Fetching from Tella: ${url}`);
+        const { videoPath, title } = await tellaService.downloadTellaVideo(url, outputPath);
+        const stats = await fs.stat(videoPath);
+        return {
+          jobId: id,
+          videoPath,
+          filename: path.basename(videoPath),
+          title: title || 'Tella video',
+          duration: 0, // filled in downstream via ffprobe
+          fileSize: stats.size,
+          thumbnail: null,
+          platform: 'tella',
+          uploadDate: null,
+          uploader: null,
+          description: null,
+          url
+        };
+      } catch (error) {
+        await fs.remove(outputPath).catch(() => {});
+        throw new Error(`Tella download failed: ${error.message}`);
+      }
+    }
 
     const outputFile = path.join(outputPath, 'video.%(ext)s');
 
