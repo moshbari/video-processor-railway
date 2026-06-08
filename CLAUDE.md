@@ -6,6 +6,14 @@
 > Never suggest coordinating with other developers — Mosh does everything himself.
 > All explanations must be at a 5th-grade level. No jargon.
 
+> ## ⚠️ BRANCH RULE — READ FIRST (do not ask Mosh about this)
+> **"devrant" = the `develop` branch.** When Mosh says "devrant" he means the live
+> site **devrant.99dfy.com**, which is the STAGING environment deployed from the
+> **`develop`** branch. **All devrant work — every commit, edit, and push — MUST go
+> to `develop`, never `main`.** `main` is the separate production site (rantsquad.99dfy.com).
+> Always `git checkout develop` before working. Do NOT ask Mosh which branch to use —
+> it is always `develop` for devrant.
+
 ---
 
 ## PROJECT OVERVIEW

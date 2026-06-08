@@ -60,6 +60,23 @@ router.post('/', async (req, res) => {
         }
       }
 
+      // Upload the tail clip too (original video after the last reaction).
+      // It is NOT part of result.clips, so it must be added explicitly. The
+      // render service finds it on disk/R2 by filename and appends it.
+      if (result.tailClip) {
+        const tailPath = splitService.getClipPath(result.jobId, result.tailClip.number);
+        if (await fs.pathExists(tailPath)) {
+          clipFiles.push({
+            localPath: tailPath,
+            fileName: `splits/${result.jobId}/clip_${result.tailClip.number}.mp4`,
+            mimeType: 'video/mp4',
+            clipNumber: result.tailClip.number
+          });
+        } else {
+          console.error(`Tail clip file not found: ${tailPath}`);
+        }
+      }
+
       // Upload guide too
       const guidePath = splitService.getGuidePath(result.jobId);
       
@@ -85,14 +102,23 @@ router.post('/', async (req, res) => {
         }
       }
 
-      // Create and upload manifest for later retrieval
+      // Create and upload manifest for later retrieval.
+      // Include the tail clip so the render service restores it from R2 and
+      // appends the original footage after the last reaction.
+      const manifestClips = result.clips.map(clip => ({
+        number: clip.number,
+        r2Link: clipR2Links[clip.number] || null
+      }));
+      if (result.tailClip) {
+        manifestClips.push({
+          number: result.tailClip.number,
+          r2Link: clipR2Links[result.tailClip.number] || null
+        });
+      }
       const manifest = {
         jobId: result.jobId,
-        totalClips: result.totalClips,
-        clips: result.clips.map(clip => ({
-          number: clip.number,
-          r2Link: clipR2Links[clip.number] || null
-        })),
+        totalClips: manifestClips.length,
+        clips: manifestClips,
         createdAt: new Date().toISOString()
       };
 

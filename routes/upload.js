@@ -169,6 +169,20 @@ router.post('/with-reactions', upload.single('video'), async (req, res) => {
         }
       }
 
+      // Upload the tail clip too (original video after the last reaction).
+      // It is not part of result.clips; the render service appends it as plain
+      // video. It also stays on local disk, so render finds it there too.
+      if (result.tailClip) {
+        const tailPath = splitService.getClipPath(result.jobId, result.tailClip.number);
+        if (await fs.pathExists(tailPath)) {
+          clipFiles.push({
+            localPath: tailPath,
+            fileName: `${result.jobId}/clip_${result.tailClip.number}.mp4`,
+            mimeType: 'video/mp4'
+          });
+        }
+      }
+
       // Upload guide too
       const guidePath = splitService.getGuidePath(result.jobId);
       if (await fs.pathExists(guidePath)) {

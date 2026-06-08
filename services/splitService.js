@@ -19,8 +19,12 @@ class SplitService {
    * - Clip 1: 0s → 1s (watch this, then react at 1s)
    * - Clip 2: 1s → 5s (watch this, then react at 5s)
    * - Clip 3: 5s → 10s (watch this, then react at 10s)
-   * 
-   * NO extra clip after last reaction!
+   *
+   * Plus a TAIL clip from the last reaction (10s) to the end of the video,
+   * so the original footage after the last reaction is preserved. The tail
+   * clip has NO reaction attached — the render service appends it as plain
+   * video. It is intentionally kept OUT of the returned `clips` array so the
+   * frontend still only collects one audio reaction per reaction clip.
    */
   async splitVideoForReactions(videoPath, reactions) {
     const jobId = uuidv4();
@@ -39,6 +43,16 @@ class SplitService {
       console.log(`Output: ${clipsDir}`);
       console.log('Using PRECISE CUTS (re-encode mode)');
       console.log('='.repeat(50));
+
+      // Probe the full video duration so we can preserve footage after the
+      // last reaction (the "tail" clip).
+      let videoDuration = 0;
+      try {
+        videoDuration = await this.getVideoDuration(videoPath);
+        console.log(`Video duration: ${videoDuration.toFixed(2)}s`);
+      } catch (durErr) {
+        console.warn(`Could not probe video duration (tail clip disabled): ${durErr.message}`);
+      }
 
       // Sort reactions by timestamp
       const sortedReactions = reactions.sort((a, b) => a.timestamp - b.timestamp);
@@ -99,10 +113,38 @@ class SplitService {
         currentTime = clipEndTime;
       }
 
-      // NO FINAL CLIP - we stop at the last reaction timestamp
-      // The user's last reaction IS the end of the video
+      // TAIL CLIP — preserve the original video AFTER the last reaction.
+      // The last reaction is inserted at its timestamp, then the original video
+      // CONTINUES to the end. This clip is given the next clip number so the
+      // render service finds it on disk and appends it; it has NO reaction in
+      // the guide and is NOT added to `clips`, so the frontend keeps collecting
+      // exactly one audio reaction per reaction clip.
+      let tailClip = null;
+      const TAIL_MIN_DURATION = 0.5; // ignore a sliver of leftover footage
+      if (videoDuration > 0 && (videoDuration - currentTime) > TAIL_MIN_DURATION) {
+        const tailNumber = clipNumber + 1;
+        const tailDuration = videoDuration - currentTime;
+        const tailFilename = `clip_${tailNumber}.mp4`;
+        const tailPath = path.join(clipsDir, tailFilename);
 
-      console.log(`\n✓ Created ${clips.length} clips in ${clipsDir}`);
+        console.log(`Creating TAIL clip ${tailNumber}: ${currentTime}s to ${videoDuration.toFixed(2)}s (${tailDuration.toFixed(2)}s) - original video after last reaction`);
+
+        await this.extractClipPrecise(videoPath, currentTime, tailDuration, tailPath);
+
+        tailClip = {
+          number: tailNumber,
+          path: tailPath,
+          filename: tailFilename,
+          startTime: currentTime,
+          endTime: videoDuration,
+          duration: tailDuration,
+          isTail: true
+        };
+      } else {
+        console.log('No tail clip needed (last reaction is at/near the end of the video).');
+      }
+
+      console.log(`\n✓ Created ${clips.length} clips${tailClip ? ' + 1 tail clip' : ''} in ${clipsDir}`);
 
       // Create reactions guide text file
       const guideText = this.createReactionsGuide(reactionGuide);
@@ -126,6 +168,7 @@ class SplitService {
         jobId,
         totalClips: clips.length,
         clips: outputClips,
+        tailClip, // null, or the original-video remainder after the last reaction
         reactionGuide,
         guideDownloadUrl: `/api/split/${jobId}/guide`,
         success: true
@@ -136,6 +179,18 @@ class SplitService {
       await fs.remove(workDir).catch(() => {});
       throw error;
     }
+  }
+
+  /**
+   * Get the duration (in seconds) of a video using ffprobe
+   */
+  getVideoDuration(videoPath) {
+    return new Promise((resolve, reject) => {
+      ffmpeg.ffprobe(videoPath, (err, metadata) => {
+        if (err) return reject(err);
+        resolve(metadata?.format?.duration || 0);
+      });
+    });
   }
 
   /**
