@@ -1,4 +1,5 @@
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { Upload } = require('@aws-sdk/lib-storage');
 const fs = require('fs-extra');
 const path = require('path');
 const https = require('https');
@@ -52,16 +53,24 @@ class R2Service {
 
     console.log(`Uploading to R2: ${fileName}`);
 
-    const fileContent = await fs.readFile(filePath);
-    
-    const command = new PutObjectCommand({
-      Bucket: this.bucketName,
-      Key: fileName,
-      Body: fileContent,
-      ContentType: mimeType
+    // Stream the file via multipart upload. Reading the whole file into a
+    // Buffer (fs.readFile) fails for anything over ~2 GB with
+    // ERR_FS_FILE_TOO_LARGE — long podcasts blow past that. Streaming has no
+    // such limit and keeps memory flat.
+    const fileStream = fs.createReadStream(filePath);
+    const upload = new Upload({
+      client: this.client,
+      params: {
+        Bucket: this.bucketName,
+        Key: fileName,
+        Body: fileStream,
+        ContentType: mimeType
+      },
+      queueSize: 4,                  // up to 4 parts in flight
+      partSize: 16 * 1024 * 1024,    // 16 MB parts (well under R2's 10k-part cap for big files)
     });
 
-    await this.client.send(command);
+    await upload.done();
 
     // Generate public URL
     const downloadUrl = this.publicUrl 
