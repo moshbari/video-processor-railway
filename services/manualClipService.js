@@ -659,6 +659,29 @@ class ManualClipService {
 
     console.log(`[ManualClip ${jobId}] ✓ Podcast sequence complete: ${sequenceClip.downloadUrl}`);
 
+    // Save the finished render to the user's library as its own downloadable
+    // project, so it's never lost once the download screen is closed. Only
+    // when it actually made it to R2 (a server-only URL would die on restart).
+    if (r2Url) {
+      try {
+        let renderSize = 0;
+        try { renderSize = (await fs.stat(outputPath)).size; } catch { /* best-effort */ }
+        await manualVideoLibraryService.addRender(options.userId, {
+          title: videoTitle,
+          downloadUrl: r2Url,
+          r2Key: r2FileName,
+          fileSize: renderSize,
+          duration: finalDuration,
+          durationFormatted: this.formatTime(finalDuration),
+          sourceJobId: jobId,
+          hookCount: totalHooks,
+          createdAt: new Date().toISOString(),
+        });
+      } catch (libErr) {
+        console.error(`[ManualClip ${jobId}] Could not save render to library:`, libErr.message);
+      }
+    }
+
     // Clean up the hook segments now (not the final file). Keep the final
     // render on disk for a grace window so any in-flight server download
     // finishes, then remove it — R2 holds the durable copy. If R2 failed,

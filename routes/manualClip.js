@@ -551,6 +551,37 @@ router.post('/combo', async (req, res) => {
 });
 
 // ============================================================
+// GET /api/manual-clip/renders
+// List the user's finished renders (each its own downloadable project)
+// ============================================================
+router.get('/renders', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    const renders = await manualVideoLibraryService.listRenders(userId);
+    res.json({ success: true, renders });
+  } catch (error) {
+    console.error('[ManualClip] Renders list error:', error);
+    res.status(500).json({ success: false, error: 'Could not load your rendered videos.' });
+  }
+});
+
+// ============================================================
+// DELETE /api/manual-clip/renders/:renderId
+// Remove a finished render from the library (also deletes the R2 file)
+// ============================================================
+router.delete('/renders/:renderId', async (req, res) => {
+  try {
+    const { renderId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    await manualVideoLibraryService.removeRender(userId, renderId, { deleteFile: true });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[ManualClip] Render delete error:', error);
+    res.status(500).json({ success: false, error: 'Could not remove that rendered video.' });
+  }
+});
+
+// ============================================================
 // GET /api/manual-clip/download/:jobId
 // 🎙️ Stream the finished podcast render straight from this server.
 // Available the moment rendering finishes — before/while the R2 cloud copy

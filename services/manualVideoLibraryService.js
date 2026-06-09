@@ -8,13 +8,21 @@
  * R2 so it survives server restarts and page refreshes.
  *
  * R2 layout: manual-clip-library/{userId}.json
- *   { videos: [ { jobId, title, duration, durationFormatted, sourceKey,
- *                 playbackUrl, waveformPeaks, fileSize, createdAt } ] }
+ *   { videos:  [ { jobId, title, duration, durationFormatted, sourceKey,
+ *                  playbackUrl, waveformPeaks, fileSize, createdAt } ],
+ *     renders: [ { renderId, title, downloadUrl, r2Key, fileSize, duration,
+ *                  durationFormatted, sourceJobId, hookCount, createdAt } ] }
+ *
+ * `videos` are editable source uploads (reopen to re-clip). `renders` are
+ * finished output videos — each its own "project" with a permanent download
+ * link, so past renders are never lost once the download screen is closed.
  */
 
 const r2Service = require('./r2Service');
+const { v4: uuidv4 } = require('uuid');
 
-const MAX_VIDEOS = 50; // keep the most recent N per user
+const MAX_VIDEOS = 50;   // keep the most recent N source videos per user
+const MAX_RENDERS = 100; // keep the most recent N finished renders per user
 
 class ManualVideoLibraryService {
   _key(userId) {
@@ -24,12 +32,15 @@ class ManualVideoLibraryService {
   async load(userId) {
     try {
       const buf = await r2Service.getFile(this._key(userId));
-      if (!buf) return { videos: [] };
+      if (!buf) return { videos: [], renders: [] };
       const data = JSON.parse(buf.toString('utf-8'));
-      return { videos: Array.isArray(data.videos) ? data.videos : [] };
+      return {
+        videos: Array.isArray(data.videos) ? data.videos : [],
+        renders: Array.isArray(data.renders) ? data.renders : [],
+      };
     } catch (err) {
       console.error(`[VideoLibrary] Load failed for ${userId}:`, err.message);
-      return { videos: [] };
+      return { videos: [], renders: [] };
     }
   }
 
@@ -99,6 +110,61 @@ class ManualVideoLibraryService {
       );
     }
     console.log(`[VideoLibrary] Removed ${jobId} for ${userId}`);
+  }
+
+  // ============================================================
+  // RENDERS — finished output videos, each its own downloadable "project"
+  // ============================================================
+
+  /**
+   * Save a finished render. De-duped by r2Key so re-saving the same file just
+   * refreshes it. Returns the stored record (with its renderId).
+   */
+  async addRender(userId, record) {
+    if (!record || !record.downloadUrl) return null;
+    const data = await this.load(userId);
+    const renders = (data.renders || []).filter(r => r.r2Key !== record.r2Key);
+    const entry = {
+      renderId: record.renderId || uuidv4(),
+      title: record.title || 'Untitled render',
+      downloadUrl: record.downloadUrl,
+      r2Key: record.r2Key || null,
+      fileSize: record.fileSize || 0,
+      duration: record.duration || 0,
+      durationFormatted: record.durationFormatted || '',
+      sourceJobId: record.sourceJobId || null,
+      hookCount: record.hookCount || 0,
+      createdAt: record.createdAt || new Date().toISOString(),
+    };
+    renders.unshift(entry);
+    renders.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    data.renders = renders.slice(0, MAX_RENDERS);
+    await this.save(userId, data);
+    console.log(`[VideoLibrary] Saved render "${entry.title}" for ${userId} (${data.renders.length} total)`);
+    return entry;
+  }
+
+  async listRenders(userId) {
+    const data = await this.load(userId);
+    return data.renders || [];
+  }
+
+  async getRender(userId, renderId) {
+    const data = await this.load(userId);
+    return (data.renders || []).find(r => r.renderId === renderId) || null;
+  }
+
+  async removeRender(userId, renderId, { deleteFile = false } = {}) {
+    const data = await this.load(userId);
+    const target = (data.renders || []).find(r => r.renderId === renderId);
+    data.renders = (data.renders || []).filter(r => r.renderId !== renderId);
+    await this.save(userId, data);
+    if (deleteFile && target?.r2Key) {
+      await r2Service.deleteFile(target.r2Key).catch(err =>
+        console.error(`[VideoLibrary] Could not delete render ${target.r2Key}:`, err.message)
+      );
+    }
+    console.log(`[VideoLibrary] Removed render ${renderId} for ${userId}`);
   }
 }
 
