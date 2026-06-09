@@ -352,6 +352,10 @@ router.get('/status/:jobId', async (req, res) => {
     if (status.videoDuration) response.videoDuration = status.videoDuration;
     if (status.playbackUrl) response.playbackUrl = status.playbackUrl;
 
+    // Direct-from-server download for the finished render, available before the
+    // R2 cloud copy is ready (see GET /download/:jobId below).
+    if (status.serverDownloadUrl) response.serverDownloadUrl = status.serverDownloadUrl;
+
     // Include waveform if ready
     if (status.waveform) response.waveform = status.waveform;
 
@@ -543,6 +547,49 @@ router.post('/combo', async (req, res) => {
       success: false,
       error: 'Something went wrong while combining your clips. Please try again.'
     });
+  }
+});
+
+// ============================================================
+// GET /api/manual-clip/download/:jobId
+// 🎙️ Stream the finished podcast render straight from this server.
+// Available the moment rendering finishes — before/while the R2 cloud copy
+// uploads — so the user never waits on the cloud. Once the local copy has been
+// cleaned up, transparently redirects to the durable R2 URL.
+// ============================================================
+router.get('/download/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const job = manualClipService.getJobStatus(jobId);
+    const local = job && job.serverDownload;
+
+    // Serve the local copy while it exists.
+    if (local && local.path && await fs.pathExists(local.path)) {
+      const stat = await fs.stat(local.path);
+      const safeName = (local.filename || 'podcast.mp4').replace(/"/g, '');
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Content-Length', stat.size);
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+      const stream = fs.createReadStream(local.path);
+      stream.on('error', () => { if (!res.headersSent) res.status(500).end(); });
+      return stream.pipe(res);
+    }
+
+    // Local copy is gone — hand off to the durable R2 URL if we have one
+    // (guard against redirecting to this same endpoint, which would loop).
+    const clip = job && job.generatedClips && job.generatedClips[0];
+    const r2 = clip && clip.downloadUrl;
+    if (r2 && /^https?:\/\//.test(r2) && !r2.includes('/api/manual-clip/download/')) {
+      return res.redirect(302, r2);
+    }
+
+    return res.status(404).json({
+      success: false,
+      error: 'This download is no longer available here. Please check your video library or re-render.'
+    });
+  } catch (error) {
+    console.error('[ManualClip] Download error:', error);
+    res.status(500).json({ success: false, error: 'Could not download the video.' });
   }
 });
 

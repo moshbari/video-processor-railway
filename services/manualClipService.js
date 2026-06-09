@@ -603,13 +603,35 @@ class ManualClipService {
       this.updateJob(jobId, { progress: Math.round(62 + (pct / 100) * 30) }); // 62 -> 92
     });
 
-    // Step 4: Upload the single result to R2.
-    this.updateJob(jobId, { step: 'uploading', progress: 94, currentClip: 'Uploading final video...' });
+    // Step 4: The finished render is on local disk now. Make it downloadable
+    // straight from THIS server immediately — so the user can grab it without
+    // waiting for the (sometimes slow) cloud upload. R2 is still the durable
+    // home; we hand off to it once the upload completes.
     const safeTitle = this.sanitizeFilename(videoTitle);
-    const r2FileName = `manual-clips/${jobId}/podcast_sequence_${safeTitle}.mp4`;
-    const uploadResult = await r2Service.uploadFile(outputPath, r2FileName);
-
+    const downloadName = `${safeTitle || 'podcast'}.mp4`;
     const finalDuration = await this.getVideoDuration(outputPath).catch(() => 0);
+    const serverDownloadUrl = `${this.publicBaseUrl()}/api/manual-clip/download/${jobId}`;
+
+    this.updateJob(jobId, {
+      step: 'uploading',
+      progress: 94,
+      currentClip: 'Your video is ready — saving a cloud copy...',
+      // The local file the /download/:jobId route streams until R2 has the copy.
+      serverDownload: { path: outputPath, filename: downloadName },
+      serverDownloadUrl
+    });
+
+    // Upload the single result to R2 (durable storage).
+    const r2FileName = `manual-clips/${jobId}/podcast_sequence_${safeTitle}.mp4`;
+    let r2Url = null;
+    try {
+      const uploadResult = await r2Service.uploadFile(outputPath, r2FileName);
+      r2Url = uploadResult.downloadUrl;
+    } catch (err) {
+      // Cloud upload failed — the local server copy is still downloadable, so
+      // the user isn't blocked. We keep that copy around longer below.
+      console.error(`[ManualClip ${jobId}] R2 upload failed, serving local copy:`, err.message);
+    }
 
     // Single-item result so the existing download screen renders it unchanged.
     const sequenceClip = {
@@ -619,7 +641,9 @@ class ManualClipService {
       hookCount: totalHooks,
       duration: finalDuration,
       durationFormatted: this.formatTime(finalDuration),
-      downloadUrl: uploadResult.downloadUrl,
+      // Prefer the durable R2 URL once it exists; otherwise serve the local copy.
+      downloadUrl: r2Url || serverDownloadUrl,
+      serverDownloadUrl,
       hasCaptions: false
     };
 
@@ -633,15 +657,24 @@ class ManualClipService {
       completedAt: new Date().toISOString()
     });
 
-    console.log(`[ManualClip ${jobId}] ✓ Podcast sequence complete: ${uploadResult.downloadUrl}`);
+    console.log(`[ManualClip ${jobId}] ✓ Podcast sequence complete: ${sequenceClip.downloadUrl}`);
 
-    // Clean up local files (R2 holds the result). Never delete the source here.
+    // Clean up the hook segments now (not the final file). Keep the final
+    // render on disk for a grace window so any in-flight server download
+    // finishes, then remove it — R2 holds the durable copy. If R2 failed,
+    // keep the local copy much longer so the user can still download it.
     for (const p of segmentPaths) {
       if (p !== videoPath) await fs.remove(p).catch(() => {});
     }
-    await fs.remove(outputPath).catch(() => {});
+    this.scheduleServerCopyCleanup(jobId, outputPath, r2Url ? 15 * 60 * 1000 : 6 * 60 * 60 * 1000);
 
-    return { success: true, jobId, downloadUrl: uploadResult.downloadUrl, clips: [sequenceClip] };
+    return {
+      success: true,
+      jobId,
+      downloadUrl: sequenceClip.downloadUrl,
+      serverDownloadUrl,
+      clips: [sequenceClip]
+    };
   }
 
   /**
@@ -1066,6 +1099,29 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
   getJobStatus(jobId) {
     return this.jobs.get(jobId) || null;
+  }
+
+  // Where THIS server is reachable for direct file downloads. Lets the frontend
+  // grab a finished render from us before the R2 cloud copy is ready.
+  publicBaseUrl() {
+    const base = process.env.PUBLIC_BASE_URL
+      || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null)
+      || 'https://video-processor-staging.up.railway.app';
+    return base.replace(/\/$/, '');
+  }
+
+  // Remove a finished render from local disk after a grace window, so the server
+  // copy stays downloadable "until it's in R2" plus a safety buffer for any
+  // in-flight download. Never touches the source video.
+  scheduleServerCopyCleanup(jobId, filePath, delayMs = 15 * 60 * 1000) {
+    const timer = setTimeout(async () => {
+      await fs.remove(filePath).catch(() => {});
+      const job = this.jobs.get(jobId);
+      if (job && job.serverDownload && job.serverDownload.path === filePath) {
+        this.updateJob(jobId, { serverDownload: null });
+      }
+    }, delayMs);
+    if (timer && typeof timer.unref === 'function') timer.unref();
   }
 
   /**
