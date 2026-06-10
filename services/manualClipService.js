@@ -857,12 +857,22 @@ class ManualClipService {
       console.error(`[ManualClip ${jobId}] R2 upload failed, serving local copy:`, err.message);
     }
 
+    const removedPercent = videoDuration > 0
+      ? Math.round((removedSeconds / videoDuration) * 100)
+      : 0;
+
     const resultClip = {
       clipNumber: 1,
       title: `${videoTitle} — Silence Removed`,
       isSilenceRemoval: true,
+      // --- Silence-removal report ---
+      originalDuration: videoDuration,
+      originalFormatted: this.formatTime(videoDuration),
       removedSeconds,
       removedFormatted: this.formatTime(removedSeconds),
+      removedPercent,
+      newDuration: finalDuration,
+      newFormatted: this.formatTime(finalDuration),
       duration: finalDuration,
       durationFormatted: this.formatTime(finalDuration),
       downloadUrl: r2Url || serverDownloadUrl,
