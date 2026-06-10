@@ -323,6 +323,60 @@ router.post('/render-sequence/:jobId', async (req, res) => {
 });
 
 // ============================================================
+// POST /api/manual-clip/remove-silence/:jobId
+// 🔇 One-click silence remover: cut every quiet gap out of the WHOLE prepared
+// video and stitch the loud parts back into one continuous file.
+// Body (all optional): { thresholdDb, minSilenceSec, paddingSec, title }
+// ============================================================
+router.post('/remove-silence/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const { thresholdDb, minSilenceSec, paddingSec, title } = req.body || {};
+
+    const jobStatus = manualClipService.getJobStatus(jobId);
+    // Allow when the in-memory job is gone (restored later from the library
+    // inside removeSilence -> ensureSourceAvailable), but if it IS present it
+    // must be ready/complete, not mid-process.
+    if (jobStatus && jobStatus.status !== 'ready' && jobStatus.status !== 'complete') {
+      return res.status(400).json({
+        success: false,
+        error: 'Video is not ready yet. Please wait for preparation to complete.'
+      });
+    }
+
+    console.log(`\n[ManualClip] Remove-silence request for job ${jobId}`);
+
+    // Return immediately, process in background (frontend polls /status/:jobId).
+    res.json({
+      success: true,
+      jobId,
+      message: 'Removing silences! Use the status endpoint to track progress.'
+    });
+
+    manualClipService.removeSilence(jobId, {
+      userId: req.headers['x-user-id'] || null,
+      thresholdDb: thresholdDb !== undefined ? parseFloat(thresholdDb) : undefined,
+      minSilenceSec: minSilenceSec !== undefined ? parseFloat(minSilenceSec) : undefined,
+      paddingSec: paddingSec !== undefined ? parseFloat(paddingSec) : undefined,
+      title
+    }).catch(error => {
+      console.error(`[ManualClip] Silence removal failed:`, error.message);
+      manualClipService.updateJob(jobId, {
+        status: 'error',
+        error: 'Removing the silences failed. Please try again.'
+      });
+    });
+
+  } catch (error) {
+    console.error('[ManualClip] Remove-silence error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Could not start removing silences. Please try again.'
+    });
+  }
+});
+
+// ============================================================
 // GET /api/manual-clip/status/:jobId
 // Check progress of preparation or generation
 // ============================================================

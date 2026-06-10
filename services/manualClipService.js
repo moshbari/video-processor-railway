@@ -758,6 +758,282 @@ class ManualClipService {
   }
 
   // ============================================================
+  // 🔇 ONE-CLICK SILENCE REMOVER
+  // ============================================================
+  /**
+   * Remove the quiet gaps from the WHOLE prepared video in one click.
+   * - Finds silent stretches with ffmpeg's silencedetect
+   * - Keeps every "loud" segment (leaving a little padding so speech isn't clipped)
+   * - Re-encodes them back into ONE continuous file (audio + video stay in sync)
+   * Result is saved to the user's renders library, same as a podcast render.
+   *
+   * @param {string} jobId  - Job ID from the prepare step
+   * @param {Object} options - { userId, thresholdDb, minSilenceSec, paddingSec, title }
+   */
+  async removeSilence(jobId, options = {}) {
+    this.updateJob(jobId, {
+      status: 'generating',
+      step: 'starting_silence_removal',
+      progress: 2,
+      totalClips: 1,
+      completedClips: 0,
+      currentClip: 'Getting your video ready...',
+      generatedClips: []
+    });
+
+    const job = await this.ensureSourceAvailable(jobId, options.userId);
+
+    const videoPath = job.videoPath;
+    const videoDuration = job.videoDuration || await this.getVideoDuration(videoPath).catch(() => 0);
+    const videoTitle = options.title || job.videoTitle || 'Video';
+
+    // Tuning (sensible defaults; -30dB & 0.6s is a good "remove dead air" baseline).
+    const thresholdDb = Number.isFinite(options.thresholdDb) ? options.thresholdDb : -30;
+    const minSilenceSec = Number.isFinite(options.minSilenceSec) ? options.minSilenceSec : 0.6;
+    const paddingSec = Number.isFinite(options.paddingSec) ? options.paddingSec : 0.1;
+
+    const workDir = path.join(this.tempDir, `manual-${jobId}`);
+    const desilenceDir = path.join(workDir, 'desilence');
+    await fs.ensureDir(desilenceDir);
+
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`[ManualClip ${jobId}] REMOVING SILENCES`);
+    console.log(`  Threshold: ${thresholdDb}dB | Min gap: ${minSilenceSec}s | Padding: ${paddingSec}s`);
+    console.log('='.repeat(60));
+
+    // Step 1: Detect the silent stretches.
+    this.updateJob(jobId, { step: 'detecting_silence', progress: 8, currentClip: 'Finding silent gaps...' });
+    const silences = await this.detectSilences(videoPath, { thresholdDb, minSilenceSec });
+    console.log(`[ManualClip ${jobId}] Found ${silences.length} silent stretch(es)`);
+
+    // Step 2: Work out which "loud" parts to keep.
+    const keeps = this.keepSegmentsFromSilences(silences, videoDuration, paddingSec);
+    const keptSeconds = keeps.reduce((sum, k) => sum + (k.end - k.start), 0);
+    const removedSeconds = Math.max(0, videoDuration - keptSeconds);
+    console.log(`[ManualClip ${jobId}] Keeping ${keeps.length} segment(s), removing ${removedSeconds.toFixed(1)}s of silence`);
+
+    // Nothing meaningful to cut — tell the user kindly instead of re-encoding the whole thing.
+    if (keeps.length === 0 || removedSeconds < 0.5) {
+      this.updateJob(jobId, {
+        status: 'error',
+        error: "Good news — there were no long silent gaps to remove in this video."
+      });
+      return { success: false, jobId, removedSeconds };
+    }
+
+    // Step 3: Re-encode the kept parts into one continuous file.
+    this.updateJob(jobId, {
+      step: 'removing_silence',
+      progress: 15,
+      currentClip: `Cutting out ${this.formatTime(removedSeconds)} of dead air...`
+    });
+
+    const outputPath = path.join(desilenceDir, 'desilenced.mp4');
+    await this.renderKeptSegments(videoPath, keeps, keptSeconds, outputPath, (pct) => {
+      this.updateJob(jobId, { progress: Math.round(15 + (pct / 100) * 78) }); // 15 -> 93
+    });
+
+    // Step 4: Make it downloadable straight from this server immediately, then
+    // push the durable copy to R2 — same pattern as the podcast render.
+    const safeTitle = this.sanitizeFilename(videoTitle);
+    const downloadName = `${safeTitle || 'video'}_no_silence.mp4`;
+    const finalDuration = await this.getVideoDuration(outputPath).catch(() => keptSeconds);
+    const serverDownloadUrl = `${this.publicBaseUrl()}/api/manual-clip/download/${jobId}`;
+
+    this.updateJob(jobId, {
+      step: 'uploading',
+      progress: 95,
+      currentClip: 'Your video is ready — saving a cloud copy...',
+      serverDownload: { path: outputPath, filename: downloadName },
+      serverDownloadUrl
+    });
+
+    const r2FileName = `manual-clips/${jobId}/desilenced_${safeTitle}.mp4`;
+    let r2Url = null;
+    try {
+      const uploadResult = await r2Service.uploadFile(outputPath, r2FileName);
+      r2Url = uploadResult.downloadUrl;
+    } catch (err) {
+      console.error(`[ManualClip ${jobId}] R2 upload failed, serving local copy:`, err.message);
+    }
+
+    const resultClip = {
+      clipNumber: 1,
+      title: `${videoTitle} — Silence Removed`,
+      isSilenceRemoval: true,
+      removedSeconds,
+      removedFormatted: this.formatTime(removedSeconds),
+      duration: finalDuration,
+      durationFormatted: this.formatTime(finalDuration),
+      downloadUrl: r2Url || serverDownloadUrl,
+      serverDownloadUrl,
+      hasCaptions: false
+    };
+
+    this.updateJob(jobId, {
+      status: 'complete',
+      step: 'done',
+      progress: 100,
+      completedClips: 1,
+      currentClip: '',
+      generatedClips: [resultClip],
+      completedAt: new Date().toISOString()
+    });
+
+    console.log(`[ManualClip ${jobId}] ✓ Silence removal complete: ${resultClip.downloadUrl}`);
+
+    // Save the finished render to the user's library (only once it's safely on R2).
+    if (r2Url) {
+      try {
+        let renderSize = 0;
+        try { renderSize = (await fs.stat(outputPath)).size; } catch { /* best-effort */ }
+        await manualVideoLibraryService.addRender(options.userId, {
+          title: `${videoTitle} — Silence Removed`,
+          downloadUrl: r2Url,
+          r2Key: r2FileName,
+          fileSize: renderSize,
+          duration: finalDuration,
+          durationFormatted: this.formatTime(finalDuration),
+          sourceJobId: jobId,
+          hookCount: 0,
+          createdAt: new Date().toISOString(),
+        });
+      } catch (libErr) {
+        console.error(`[ManualClip ${jobId}] Could not save render to library:`, libErr.message);
+      }
+    }
+
+    // Keep the local copy around for a grace window (longer if R2 failed) so the
+    // direct download stays alive; the source video is never touched.
+    this.scheduleServerCopyCleanup(jobId, outputPath, r2Url ? 15 * 60 * 1000 : 6 * 60 * 60 * 1000);
+
+    return {
+      success: true,
+      jobId,
+      removedSeconds,
+      downloadUrl: resultClip.downloadUrl,
+      serverDownloadUrl,
+      clips: [resultClip]
+    };
+  }
+
+  /**
+   * Run ffmpeg silencedetect and return an array of { start, end } silent ranges.
+   */
+  detectSilences(videoPath, { thresholdDb = -30, minSilenceSec = 0.6 } = {}) {
+    return new Promise((resolve, reject) => {
+      const args = [
+        '-i', videoPath,
+        '-af', `silencedetect=noise=${thresholdDb}dB:d=${minSilenceSec}`,
+        '-f', 'null', '-'
+      ];
+      const proc = spawn('ffmpeg', args);
+      let stderr = '';
+      proc.stderr.on('data', (d) => {
+        stderr += d.toString();
+        // silencedetect can be chatty on long files — keep memory bounded.
+        if (stderr.length > 2_000_000) stderr = stderr.slice(-1_000_000);
+      });
+      proc.on('error', (err) => reject(err));
+      proc.on('close', () => {
+        const silences = [];
+        let curStart = null;
+        const lines = stderr.split('\n');
+        for (const line of lines) {
+          const startMatch = line.match(/silence_start:\s*(-?\d+(?:\.\d+)?)/);
+          if (startMatch) { curStart = parseFloat(startMatch[1]); continue; }
+          const endMatch = line.match(/silence_end:\s*(-?\d+(?:\.\d+)?)/);
+          if (endMatch && curStart !== null) {
+            const end = parseFloat(endMatch[1]);
+            if (end > curStart) silences.push({ start: Math.max(0, curStart), end });
+            curStart = null;
+          }
+        }
+        resolve(silences);
+      });
+    });
+  }
+
+  /**
+   * Turn a list of silent ranges into the "loud" segments to keep, leaving a
+   * little padding of silence around speech so cuts don't sound abrupt.
+   * Returns [{ start, end }] covering the non-silent parts of [0, duration].
+   */
+  keepSegmentsFromSilences(silences, duration, paddingSec = 0.1) {
+    // Shrink each silence inward by the padding; drop any that become too short
+    // to bother cutting (this also enforces a minimum real cut length).
+    const cuts = [];
+    for (const s of silences) {
+      const start = s.start + paddingSec;
+      const end = s.end - paddingSec;
+      if (end - start > 0.05) cuts.push({ start, end });
+    }
+    cuts.sort((a, b) => a.start - b.start);
+
+    // Keep = complement of the cuts over the whole timeline.
+    const keeps = [];
+    let cursor = 0;
+    for (const c of cuts) {
+      if (c.start > cursor) keeps.push({ start: cursor, end: Math.min(c.start, duration) });
+      cursor = Math.max(cursor, c.end);
+    }
+    if (cursor < duration) keeps.push({ start: cursor, end: duration });
+
+    // Drop any sliver segments left behind.
+    return keeps.filter(k => k.end - k.start > 0.05);
+  }
+
+  /**
+   * Re-encode only the kept segments into one continuous file using a single
+   * select/aselect pass, so audio and video are cut at exactly the same points
+   * and stay perfectly in sync. Quality matches the rest of Clip Maker.
+   */
+  renderKeptSegments(videoPath, keeps, totalSeconds, outputPath, onProgress) {
+    return new Promise((resolve, reject) => {
+      // between(t,a,b) summed with '+' — exactly one term is 1 inside a kept range.
+      // Wrapped in expr='...' single quotes so the commas stay literal in the graph.
+      const expr = keeps
+        .map(k => `between(t,${k.start.toFixed(3)},${k.end.toFixed(3)})`)
+        .join('+');
+
+      const args = [
+        '-y',
+        '-i', videoPath,
+        '-vf', `select=expr='${expr}',setpts=N/FRAME_RATE/TB`,
+        '-af', `aselect=expr='${expr}',asetpts=N/SR/TB`,
+        '-c:v', 'libx264',
+        '-preset', 'medium',
+        '-crf', '20',
+        '-c:a', 'aac',
+        '-ar', '48000',
+        '-ac', '2',
+        '-b:a', '320k',
+        '-movflags', '+faststart',
+        outputPath
+      ];
+
+      console.log(`  [Desilence] ${keeps.length} kept segments -> one continuous file`);
+      const proc = spawn('ffmpeg', args);
+      let stderr = '';
+      proc.stderr.on('data', (d) => {
+        const s = d.toString();
+        stderr += s;
+        if (stderr.length > 20000) stderr = stderr.slice(-10000);
+        const m = s.match(/time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})/);
+        if (m && onProgress && totalSeconds > 0) {
+          const cur = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 100;
+          onProgress(Math.min(100, (cur / totalSeconds) * 100));
+        }
+      });
+      proc.on('close', (code) => {
+        if (code === 0) { console.log('  [Desilence] ✓ done'); resolve(outputPath); }
+        else { console.error(stderr.slice(-800)); reject(new Error('Could not remove the silences. Please try again.')); }
+      });
+      proc.on('error', (err) => reject(err));
+    });
+  }
+
+  // ============================================================
   // VIDEO PROCESSING — MAXIMUM QUALITY
   // ============================================================
 
