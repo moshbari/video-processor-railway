@@ -558,7 +558,7 @@ class ManualClipService {
       progress: 0,
       totalClips: totalHooks,
       completedClips: 0,
-      currentClip: 'Preparing hooks...',
+      currentClip: 'Preparing your video...',
       generatedClips: []
     });
 
@@ -575,7 +575,7 @@ class ManualClipService {
 
       this.updateJob(jobId, {
         step: `extracting_hook_${i + 1}`,
-        progress: Math.round(5 + (i / totalHooks) * 55), // 5 -> 60
+        progress: Math.round(5 + (i / totalHooks) * 50), // 5 -> 55
         completedClips: i,
         currentClip: `Cutting hook ${i + 1} of ${totalHooks}...`
       });
@@ -587,15 +587,48 @@ class ManualClipService {
       hooksTotalSeconds += (endTime - startTime);
     }
 
-    // Step 2: Append the FULL source video as the final segment.
-    segmentPaths.push(videoPath);
-    const totalSeconds = hooksTotalSeconds + (videoDuration || 0);
+    // Step 2: Build the FINAL segment from the FULL source video. If the user
+    // marked any "remove" sections (Danger Zone), cut those out first so the
+    // full video at the end has them deleted; otherwise use the whole video.
+    const cuts = Array.isArray(options.cuts) ? options.cuts : [];
+    let fullSeconds = videoDuration || 0;
+    let cutsApplied = false;
+    let removedSeconds = 0;
+
+    if (cuts.length > 0) {
+      const keeps = this.keepSegmentsFromRemovals(cuts, videoDuration);
+      const keptSeconds = keeps.reduce((s, k) => s + (k.end - k.start), 0);
+      removedSeconds = Math.max(0, videoDuration - keptSeconds);
+
+      if (keeps.length > 0 && removedSeconds > 0.1) {
+        console.log(`  Removing ${removedSeconds.toFixed(1)}s of marked sections from the full video (${keeps.length} kept segment(s))`);
+        this.updateJob(jobId, {
+          step: 'removing_sections',
+          progress: 56,
+          currentClip: `Cutting out ${this.formatTime(removedSeconds)} of removed sections...`
+        });
+        const trimmedPath = path.join(seqDir, 'full_trimmed.mp4');
+        await this.renderKeptSegments(videoPath, keeps, keptSeconds, trimmedPath, (pct) => {
+          this.updateJob(jobId, { progress: Math.round(56 + (pct / 100) * 6) }); // 56 -> 62
+        });
+        segmentPaths.push(trimmedPath);
+        fullSeconds = keptSeconds;
+        cutsApplied = true;
+      } else {
+        // Nothing meaningful to cut — append the whole video.
+        segmentPaths.push(videoPath);
+      }
+    } else {
+      segmentPaths.push(videoPath);
+    }
+
+    const totalSeconds = hooksTotalSeconds + fullSeconds;
 
     // Step 3: Concatenate everything into one 16:9 file.
     this.updateJob(jobId, {
       step: 'concatenating',
       progress: 62,
-      currentClip: 'Stitching hooks + full video together...'
+      currentClip: 'Stitching everything together...'
     });
 
     const outputPath = path.join(seqDir, 'podcast_sequence.mp4');
@@ -633,12 +666,22 @@ class ManualClipService {
       console.error(`[ManualClip ${jobId}] R2 upload failed, serving local copy:`, err.message);
     }
 
+    // Friendly title describing what's in the file.
+    const titleParts = [];
+    if (totalHooks > 0) titleParts.push(`${totalHooks} Hook${totalHooks !== 1 ? 's' : ''}`);
+    titleParts.push('Full Video');
+    let sequenceTitle = `${videoTitle} — ${titleParts.join(' + ')}`;
+    if (cutsApplied) sequenceTitle += ` (−${this.formatTime(removedSeconds)} removed)`;
+
     // Single-item result so the existing download screen renders it unchanged.
     const sequenceClip = {
       clipNumber: 1,
-      title: `${videoTitle} — Hooks + Full Video`,
+      title: sequenceTitle,
       isSequence: true,
       hookCount: totalHooks,
+      sectionsRemoved: cutsApplied ? cuts.length : 0,
+      removedSeconds: cutsApplied ? removedSeconds : 0,
+      removedFormatted: cutsApplied ? this.formatTime(removedSeconds) : null,
       duration: finalDuration,
       durationFormatted: this.formatTime(finalDuration),
       // Prefer the durable R2 URL once it exists; otherwise serve the local copy.
@@ -899,176 +942,6 @@ class ManualClipService {
         try { renderSize = (await fs.stat(outputPath)).size; } catch { /* best-effort */ }
         await manualVideoLibraryService.addRender(options.userId, {
           title: `${videoTitle} — Silence Removed`,
-          downloadUrl: r2Url,
-          r2Key: r2FileName,
-          fileSize: renderSize,
-          duration: finalDuration,
-          durationFormatted: this.formatTime(finalDuration),
-          sourceJobId: jobId,
-          hookCount: 0,
-          createdAt: new Date().toISOString(),
-        });
-      } catch (libErr) {
-        console.error(`[ManualClip ${jobId}] Could not save render to library:`, libErr.message);
-      }
-    }
-
-    // Keep the local copy around for a grace window (longer if R2 failed) so the
-    // direct download stays alive; the source video is never touched.
-    this.scheduleServerCopyCleanup(jobId, outputPath, r2Url ? 15 * 60 * 1000 : 6 * 60 * 60 * 1000);
-
-    return {
-      success: true,
-      jobId,
-      removedSeconds,
-      downloadUrl: resultClip.downloadUrl,
-      serverDownloadUrl,
-      clips: [resultClip]
-    };
-  }
-
-  // ============================================================
-  // ⛔ DANGER ZONE — REMOVE SECTIONS
-  // ============================================================
-  /**
-   * Cut the user-chosen time ranges OUT of the prepared video and stitch the
-   * parts that remain back into ONE continuous file (audio + video stay in
-   * sync). Mirrors removeSilence, but the cuts are the exact ranges the user
-   * marked instead of auto-detected silences. The original is never touched.
-   *
-   * @param {string} jobId   - Job ID from the prepare step
-   * @param {Array}  sections - [{ startTime, endTime }] ranges to DELETE
-   * @param {Object} options  - { userId, title }
-   */
-  async removeSections(jobId, sections, options = {}) {
-    this.updateJob(jobId, {
-      status: 'generating',
-      step: 'starting_section_removal',
-      progress: 2,
-      totalClips: 1,
-      completedClips: 0,
-      currentClip: 'Getting your video ready...',
-      generatedClips: []
-    });
-
-    const job = await this.ensureSourceAvailable(jobId, options.userId);
-
-    const videoPath = job.videoPath;
-    const videoDuration = job.videoDuration || await this.getVideoDuration(videoPath).catch(() => 0);
-    const videoTitle = options.title || job.videoTitle || 'Video';
-
-    const workDir = path.join(this.tempDir, `manual-${jobId}`);
-    const cutDir = path.join(workDir, 'sections');
-    await fs.ensureDir(cutDir);
-
-    // Work out which parts to KEEP (everything that isn't being removed).
-    const keeps = this.keepSegmentsFromRemovals(sections, videoDuration);
-    const keptSeconds = keeps.reduce((sum, k) => sum + (k.end - k.start), 0);
-    const removedSeconds = Math.max(0, videoDuration - keptSeconds);
-
-    console.log(`\n${'='.repeat(60)}`);
-    console.log(`[ManualClip ${jobId}] REMOVING SECTIONS`);
-    console.log(`  Sections to remove: ${sections.length} | Removing ${removedSeconds.toFixed(1)}s | Keeping ${keeps.length} segment(s)`);
-    console.log('='.repeat(60));
-
-    // Nothing left to render — the user marked the whole video for removal.
-    if (keeps.length === 0 || keptSeconds < 0.5) {
-      this.updateJob(jobId, {
-        status: 'error',
-        error: "That would remove the whole video. Leave at least a little to keep."
-      });
-      return { success: false, jobId, removedSeconds };
-    }
-
-    // Nothing meaningful was actually cut.
-    if (removedSeconds < 0.1) {
-      this.updateJob(jobId, {
-        status: 'error',
-        error: "No sections were removed — please mark the parts you want to delete first."
-      });
-      return { success: false, jobId, removedSeconds };
-    }
-
-    // Re-encode the kept parts into one continuous file (same proven path the
-    // silence remover uses, so the joins stay perfectly in sync).
-    this.updateJob(jobId, {
-      step: 'removing_sections',
-      progress: 15,
-      currentClip: `Cutting out ${this.formatTime(removedSeconds)} from your video...`
-    });
-
-    const outputPath = path.join(cutDir, 'trimmed.mp4');
-    await this.renderKeptSegments(videoPath, keeps, keptSeconds, outputPath, (pct) => {
-      this.updateJob(jobId, { progress: Math.round(15 + (pct / 100) * 78) }); // 15 -> 93
-    });
-
-    // Make it downloadable straight from this server immediately, then push the
-    // durable copy to R2 — same pattern as the podcast / silence renders.
-    const safeTitle = this.sanitizeFilename(videoTitle);
-    const downloadName = `${safeTitle || 'video'}_trimmed.mp4`;
-    const finalDuration = await this.getVideoDuration(outputPath).catch(() => keptSeconds);
-    const serverDownloadUrl = `${this.publicBaseUrl()}/api/manual-clip/download/${jobId}`;
-
-    this.updateJob(jobId, {
-      step: 'uploading',
-      progress: 95,
-      currentClip: 'Your video is ready — saving a cloud copy...',
-      serverDownload: { path: outputPath, filename: downloadName },
-      serverDownloadUrl
-    });
-
-    const r2FileName = `manual-clips/${jobId}/trimmed_${safeTitle}.mp4`;
-    let r2Url = null;
-    try {
-      const uploadResult = await r2Service.uploadFile(outputPath, r2FileName);
-      r2Url = uploadResult.downloadUrl;
-    } catch (err) {
-      console.error(`[ManualClip ${jobId}] R2 upload failed, serving local copy:`, err.message);
-    }
-
-    const removedPercent = videoDuration > 0
-      ? Math.round((removedSeconds / videoDuration) * 100)
-      : 0;
-
-    const resultClip = {
-      clipNumber: 1,
-      title: `${videoTitle} — Sections Removed`,
-      isSectionRemoval: true,
-      // --- Section-removal report ---
-      sectionsRemoved: sections.length,
-      originalDuration: videoDuration,
-      originalFormatted: this.formatTime(videoDuration),
-      removedSeconds,
-      removedFormatted: this.formatTime(removedSeconds),
-      removedPercent,
-      newDuration: finalDuration,
-      newFormatted: this.formatTime(finalDuration),
-      duration: finalDuration,
-      durationFormatted: this.formatTime(finalDuration),
-      downloadUrl: r2Url || serverDownloadUrl,
-      serverDownloadUrl,
-      hasCaptions: false
-    };
-
-    this.updateJob(jobId, {
-      status: 'complete',
-      step: 'done',
-      progress: 100,
-      completedClips: 1,
-      currentClip: '',
-      generatedClips: [resultClip],
-      completedAt: new Date().toISOString()
-    });
-
-    console.log(`[ManualClip ${jobId}] ✓ Section removal complete: ${resultClip.downloadUrl}`);
-
-    // Save the finished render to the user's library (only once it's safely on R2).
-    if (r2Url) {
-      try {
-        let renderSize = 0;
-        try { renderSize = (await fs.stat(outputPath)).size; } catch { /* best-effort */ }
-        await manualVideoLibraryService.addRender(options.userId, {
-          title: `${videoTitle} — Sections Removed`,
           downloadUrl: r2Url,
           r2Key: r2FileName,
           fileSize: renderSize,

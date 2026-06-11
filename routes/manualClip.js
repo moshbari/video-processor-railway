@@ -249,23 +249,27 @@ router.post('/generate/:jobId', async (req, res) => {
 // ============================================================
 // POST /api/manual-clip/render-sequence/:jobId
 // 🎙️ Podcast multi-hook: stitch selected hooks (in order) + the FULL
-// source video into ONE 16:9 file, no transitions.
-// Body: { hooks: [{ startTime, endTime, order }], title }
+// source video into ONE 16:9 file, no transitions. Any Danger Zone "cuts"
+// are removed from the full video at the end before stitching.
+// Body: { hooks: [{ startTime, endTime, order }], cuts: [{ startTime, endTime }], title }
 // ============================================================
 router.post('/render-sequence/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
-    const { hooks, title } = req.body;
+    const { hooks, cuts, title } = req.body;
 
-    if (!hooks || !Array.isArray(hooks) || hooks.length === 0) {
+    const hookList = Array.isArray(hooks) ? hooks : [];
+    const cutList = Array.isArray(cuts) ? cuts : [];
+
+    if (hookList.length === 0 && cutList.length === 0) {
       return res.status(400).json({
         success: false,
-        error: 'Please select at least one hook section first.'
+        error: 'Add at least one hook, or mark a section to remove, first.'
       });
     }
 
-    for (let i = 0; i < hooks.length; i++) {
-      const h = hooks[i];
+    for (let i = 0; i < hookList.length; i++) {
+      const h = hookList[i];
       if (h.startTime === undefined || h.endTime === undefined) {
         return res.status(400).json({
           success: false,
@@ -276,6 +280,22 @@ router.post('/render-sequence/:jobId', async (req, res) => {
         return res.status(400).json({
           success: false,
           error: `Hook ${i + 1}: end time must be after start time.`
+        });
+      }
+    }
+
+    for (let i = 0; i < cutList.length; i++) {
+      const c = cutList[i];
+      if (c.startTime === undefined || c.endTime === undefined) {
+        return res.status(400).json({
+          success: false,
+          error: `Section ${i + 1} to remove is missing a start or end time.`
+        });
+      }
+      if (parseFloat(c.endTime) <= parseFloat(c.startTime)) {
+        return res.status(400).json({
+          success: false,
+          error: `Section ${i + 1} to remove: end time must be after start time.`
         });
       }
     }
@@ -295,16 +315,16 @@ router.post('/render-sequence/:jobId', async (req, res) => {
     }
 
     console.log(`\n[ManualClip] Podcast sequence request for job ${jobId}`);
-    console.log(`  Hooks: ${hooks.length} + full video at end -> single 16:9 file`);
+    console.log(`  Hooks: ${hookList.length} + full video at end (${cutList.length} section(s) removed) -> single 16:9 file`);
 
     // Return immediately, render in background (frontend polls /status/:jobId).
     res.json({
       success: true,
       jobId,
-      message: `Building your podcast video! Use the status endpoint to track progress.`
+      message: `Building your video! Use the status endpoint to track progress.`
     });
 
-    manualClipService.renderPodcastSequence(jobId, hooks, { title, userId: req.headers['x-user-id'] || null })
+    manualClipService.renderPodcastSequence(jobId, hookList, { title, cuts: cutList, userId: req.headers['x-user-id'] || null })
       .catch(error => {
         console.error(`[ManualClip] Podcast sequence failed:`, error.message);
         manualClipService.updateJob(jobId, {
@@ -372,81 +392,6 @@ router.post('/remove-silence/:jobId', async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Could not start removing silences. Please try again.'
-    });
-  }
-});
-
-// ============================================================
-// POST /api/manual-clip/remove-sections/:jobId
-// ⛔ Danger Zone: cut the user-marked time ranges OUT of the prepared video
-// and stitch the remaining parts back into one continuous file.
-// Body: { sections: [{ startTime, endTime }], title }
-// ============================================================
-router.post('/remove-sections/:jobId', async (req, res) => {
-  try {
-    const { jobId } = req.params;
-    const { sections, title } = req.body || {};
-
-    if (!sections || !Array.isArray(sections) || sections.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please mark at least one section to remove first.'
-      });
-    }
-
-    for (let i = 0; i < sections.length; i++) {
-      const s = sections[i];
-      if (s.startTime === undefined || s.endTime === undefined) {
-        return res.status(400).json({
-          success: false,
-          error: `Section ${i + 1} is missing a start or end time.`
-        });
-      }
-      if (parseFloat(s.endTime) <= parseFloat(s.startTime)) {
-        return res.status(400).json({
-          success: false,
-          error: `Section ${i + 1}: end time must be after start time.`
-        });
-      }
-    }
-
-    const jobStatus = manualClipService.getJobStatus(jobId);
-    // Allow when the in-memory job is gone (restored later from the library
-    // inside removeSections -> ensureSourceAvailable), but if it IS present it
-    // must be ready/complete, not mid-process.
-    if (jobStatus && jobStatus.status !== 'ready' && jobStatus.status !== 'complete') {
-      return res.status(400).json({
-        success: false,
-        error: 'Video is not ready yet. Please wait for preparation to complete.'
-      });
-    }
-
-    console.log(`\n[ManualClip] Remove-sections request for job ${jobId}`);
-    console.log(`  Sections to remove: ${sections.length}`);
-
-    // Return immediately, process in background (frontend polls /status/:jobId).
-    res.json({
-      success: true,
-      jobId,
-      message: 'Removing your sections! Use the status endpoint to track progress.'
-    });
-
-    manualClipService.removeSections(jobId, sections, {
-      userId: req.headers['x-user-id'] || null,
-      title
-    }).catch(error => {
-      console.error(`[ManualClip] Section removal failed:`, error.message);
-      manualClipService.updateJob(jobId, {
-        status: 'error',
-        error: 'Removing the sections failed. Please try again.'
-      });
-    });
-
-  } catch (error) {
-    console.error('[ManualClip] Remove-sections error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Could not start removing sections. Please try again.'
     });
   }
 });
