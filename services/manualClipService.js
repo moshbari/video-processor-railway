@@ -1716,25 +1716,41 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     // Large filtergraphs are passed via a script file (avoids any arg-length limit).
     const filterPath = `${outputPath}.filter.txt`;
     await fs.writeFile(filterPath, parts.join(';'));
+    const audioPath = `${outputPath}.audio.m4a`;
 
     const disguiseCount = intervals.filter(iv => iv.preset).length;
-    return new Promise((resolve, reject) => {
-      const args = [
-        '-y',
-        '-i', videoPath,
-        '-filter_complex_script', filterPath,
-        '-map', '0:v:0',
-        '-map', '[outa]',
-        '-c:v', 'copy',
-        '-c:a', 'aac',
-        '-ar', String(DISGUISE_SR),
-        '-ac', '2',
-        '-b:a', '320k',
-        '-movflags', '+faststart',
-        outputPath,
-      ];
+    console.log(`  [Disguise] ${disguiseCount} window(s) over ${n} interval(s) — audio-first then copy-mux (sync-safe, low memory)`);
 
-      console.log(`  [Disguise] ${disguiseCount} window(s) over ${n} interval(s) — concat with exact-length pieces (sync-safe, low memory)`);
+    // STEP 1 — build the disguised AUDIO only. We do NOT mux the video in this
+    // pass: copying the big video while the audio filter lags makes ffmpeg
+    // buffer the whole video in memory (OOM-kills the container on long files).
+    await this._runFfmpeg([
+      '-y', '-i', videoPath,
+      '-filter_complex_script', filterPath,
+      '-map', '[outa]',
+      '-c:a', 'aac', '-ar', String(DISGUISE_SR), '-ac', '2', '-b:a', '320k',
+      audioPath,
+    ], { duration, onProgress, label: 'Disguise audio' });
+
+    // STEP 2 — mux the original video (copy) with the disguised audio (copy).
+    // Both streams are copied, so it's fast and buffers nothing.
+    await this._runFfmpeg([
+      '-y', '-i', videoPath, '-i', audioPath,
+      '-map', '0:v:0', '-map', '1:a:0',
+      '-c:v', 'copy', '-c:a', 'copy',
+      '-movflags', '+faststart',
+      outputPath,
+    ], { label: 'Disguise mux' });
+
+    await fs.remove(audioPath).catch(() => {});
+    await fs.remove(filterPath).catch(() => {});
+    console.log('  [Disguise] ✓ done');
+    return outputPath;
+  }
+
+  // Run one ffmpeg invocation as a promise, with optional progress reporting.
+  _runFfmpeg(args, { duration, onProgress, label = 'ffmpeg' } = {}) {
+    return new Promise((resolve, reject) => {
       const proc = spawn('ffmpeg', args);
       let stderr = '';
       proc.stderr.on('data', (d) => {
@@ -1748,8 +1764,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         }
       });
       proc.on('close', (code) => {
-        if (code === 0) { console.log('  [Disguise] ✓ done'); resolve(outputPath); }
-        else { console.error(stderr.slice(-800)); reject(new Error('Could not disguise the voices. Please try again.')); }
+        if (code === 0) resolve();
+        else { console.error(`  [${label}] ${stderr.slice(-700)}`); reject(new Error(`${label} failed`)); }
       });
       proc.on('error', (err) => reject(err));
     });
