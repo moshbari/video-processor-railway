@@ -11,8 +11,11 @@ const tellaService = require('./tellaService');
 class DownloadService {
   constructor() {
     this.tempDir = process.env.TEMP_DIR || '/app/temp';
-    this.maxSizeMB = parseInt(process.env.MAX_VIDEO_SIZE_MB) || 1024;
-    this.maxDuration = parseInt(process.env.MAX_DURATION_SECONDS) || 1800;
+    this.maxSizeMB = parseInt(process.env.MAX_VIDEO_SIZE_MB) || 4096;
+    // Allow long-form videos (up to ~4h). Importing a YouTube link downloads
+    // YouTube's own copy, so transcript timestamps line up exactly — that's the
+    // reliable way to match YouTube, so we don't want a short cap blocking it.
+    this.maxDuration = parseInt(process.env.MAX_DURATION_SECONDS) || 14400;
     this.allowedPlatforms = (process.env.ALLOWED_PLATFORMS || '').split(',');
   }
 

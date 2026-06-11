@@ -83,24 +83,6 @@ class ManualClipService {
         throw new Error('Please provide a video URL or upload a video file.');
       }
 
-      // --- Optional: normalize to a clean constant frame rate so this video's
-      // timeline matches YouTube's. Fixes the #1 cause of "my timestamps don't
-      // line up with YouTube" — variable frame rate + container edit-lists in
-      // phone/drive/screen-recorder files. From here on, the normalized copy IS
-      // the source used for playback, marking, waveform and cutting, so the
-      // whole app shares one timeline that agrees with YouTube. ---
-      if (input.normalize) {
-        this.updateJob(jobId, { step: 'normalizing', progress: 10 });
-        console.log(`[ManualClip ${jobId}] Normalizing to constant frame rate (matching YouTube timestamps)...`);
-        const normalizedPath = path.join(workDir, 'normalized.mp4');
-        await this.normalizeToConstantFps(videoPath, normalizedPath, (pct) => {
-          this.updateJob(jobId, { step: 'normalizing', progress: Math.round(5 + (pct / 100) * 18) }); // 5 -> 23
-        });
-        videoPath = normalizedPath;
-        videoDuration = 0; // force a fresh read from the normalized file below
-        console.log(`[ManualClip ${jobId}] ✓ Normalized copy ready: ${normalizedPath}`);
-      }
-
       // Get duration if not known
       if (!videoDuration) {
         console.log(`[ManualClip ${jobId}] Getting duration for: ${videoPath}`);

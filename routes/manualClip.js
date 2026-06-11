@@ -68,9 +68,6 @@ router.post('/prepare', upload.single('video'), async (req, res) => {
     // Build input
     const input = {};
     input.userId = req.headers['x-user-id'] || null;
-    // Match-YouTube-timestamps option (re-encode to constant frame rate on import).
-    // Comes through as the string 'true' from multipart form data, or a real bool from JSON.
-    input.normalize = req.body.normalize === true || req.body.normalize === 'true';
     if (url) {
       input.url = url;
     } else if (req.file) {
@@ -78,9 +75,11 @@ router.post('/prepare', upload.single('video'), async (req, res) => {
       input.originalFilename = req.file.originalname;
     }
 
-    if (input.normalize) console.log('  Match YouTube timestamps: ON (will normalize to constant frame rate)');
-
-    // Start preparation (synchronous — returns when ready)
+    // Start preparation (synchronous — returns when ready). Note: YouTube-
+    // timestamp matching is NOT done here anymore — for uploaded files the
+    // frontend triggers the background normalize after import (so the request
+    // never times out on a long re-encode), and URL imports already use
+    // YouTube's own copy so they need no matching.
     const result = await manualClipService.prepareVideo(input);
 
     res.json(result);
