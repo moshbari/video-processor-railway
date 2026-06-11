@@ -1659,25 +1659,49 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   /**
    * Build a copy of the video whose AUDIO is pitch-disguised during the chosen
    * segments (each with its own preset), and untouched everywhere else. The
-   * video stream is copied (fast) — only the audio is rebuilt. Used to make the
-   * "disguised source" that the whole render is then cut from.
+   * video stream is copied (fast) — only the audio is rebuilt.
+   *
+   * IMPORTANT (A/V sync): we do NOT cut-and-stitch the audio (that accumulates
+   * tiny timing errors at every joint and drifts the soundtrack out of sync on
+   * long videos). Instead we keep CONTINUOUS, full-length tracks and just gate
+   * the volume by time: the untouched track plays everywhere except the
+   * disguise windows; one pitched track per preset plays only inside its
+   * windows. They're summed back together — so the timeline never moves and the
+   * lips stay in sync.
    */
   buildDisguisedSource(videoPath, segments, duration, outputPath, onProgress) {
     const intervals = this.disguiseIntervals(segments, duration);
+    const disguiseRanges = intervals.filter(iv => iv.preset);
     // Nothing to disguise — signal the caller to use the original.
-    if (!intervals.some(iv => iv.preset)) return Promise.resolve(null);
+    if (disguiseRanges.length === 0) return Promise.resolve(null);
+
+    // Group disguise windows by preset (each preset = one pitched track).
+    const byPreset = new Map();
+    for (const iv of disguiseRanges) {
+      if (!byPreset.has(iv.preset)) byPreset.set(iv.preset, []);
+      byPreset.get(iv.preset).push({ start: iv.start, end: iv.end });
+    }
+    const presets = [...byPreset.keys()];
+
+    // A timeline expression that is 1 inside the given ranges, 0 outside.
+    // Wrapped so commas survive the filtergraph parser (single-quoted at use).
+    const betweenExpr = (ranges) =>
+      ranges.map(r => `between(t,${r.start.toFixed(3)},${r.end.toFixed(3)})`).join('+');
 
     return new Promise((resolve, reject) => {
-      const n = intervals.length;
-      const parts = [`[0:a]asplit=${n}${intervals.map((_, i) => `[a${i}]`).join('')}`];
-      intervals.forEach((iv, i) => {
-        const trim = `atrim=${iv.start.toFixed(3)}:${iv.end.toFixed(3)},asetpts=PTS-STARTPTS`;
-        const chain = iv.preset
-          ? `${trim},${pitchFilterChain(DISGUISE_PRESETS[iv.preset].ratio)}`
-          : trim;
-        parts.push(`[a${i}]${chain}[s${i}]`);
+      const K = presets.length + 1; // untouched track + one per preset
+      const parts = [];
+      parts.push(`[0:a]asplit=${K}[base0]${presets.map((_, i) => `[base${i + 1}]`).join('')}`);
+      // Untouched track: muted during ANY disguise window.
+      parts.push(`[base0]volume=0:enable='${betweenExpr(disguiseRanges)}'[anorm]`);
+      // One pitched track per preset: muted everywhere EXCEPT its own windows.
+      presets.forEach((p, i) => {
+        const ratio = DISGUISE_PRESETS[p].ratio;
+        const inside = betweenExpr(byPreset.get(p));
+        parts.push(`[base${i + 1}]${pitchFilterChain(ratio)},volume=0:enable='lt(${inside},1)'[ap${i}]`);
       });
-      parts.push(`${intervals.map((_, i) => `[s${i}]`).join('')}concat=n=${n}:v=0:a=1[outa]`);
+      // Sum them (exactly one track is audible at any instant).
+      parts.push(`[anorm]${presets.map((_, i) => `[ap${i}]`).join('')}amix=inputs=${K}:normalize=0:dropout_transition=0[outa]`);
 
       const args = [
         '-y',
@@ -1694,8 +1718,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         outputPath,
       ];
 
-      const presetList = intervals.filter(iv => iv.preset).map(iv => iv.preset).join(', ');
-      console.log(`  [Disguise] ${intervals.filter(iv => iv.preset).length} segment(s) [${presetList}] over ${n} interval(s)`);
+      console.log(`  [Disguise] ${disguiseRanges.length} window(s) across ${presets.length} voice(s) — volume-gated mix (sync-safe)`);
       const proc = spawn('ffmpeg', args);
       let stderr = '';
       proc.stderr.on('data', (d) => {
