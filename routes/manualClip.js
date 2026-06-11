@@ -266,10 +266,10 @@ router.post('/render-sequence/:jobId', async (req, res) => {
     const cutList = Array.isArray(cuts) ? cuts : [];
     const disguiseList = Array.isArray(disguise) ? disguise : [];
 
-    if (hookList.length === 0 && cutList.length === 0) {
+    if (hookList.length === 0 && cutList.length === 0 && disguiseList.length === 0) {
       return res.status(400).json({
         success: false,
-        error: 'Add at least one hook, or mark a section to remove, first.'
+        error: 'Add at least one hook, a section to remove, or a voice to disguise, first.'
       });
     }
 
