@@ -877,6 +877,14 @@ class ManualClipService {
     for (const p of segmentPaths) {
       if (p !== videoPath) await fs.remove(p).catch(() => {});
     }
+    // Free the LARGE intermediates right away — the container's temp disk is
+    // small/ephemeral, and on a long video these are ~1GB+ each. Without this
+    // they linger for 24h and pile up across renders until the disk fills and
+    // the next render's final write fails ("Conversion failed!").
+    await fs.remove(path.join(seqDir, 'disguised_source.mp4')).catch(() => {});
+    await fs.remove(path.join(seqDir, 'disguised_source.mp4.filter.txt')).catch(() => {});
+    await fs.remove(path.join(seqDir, 'full_trimmed.mp4')).catch(() => {});
+    await fs.remove(path.join(workDir, 'source.mp4')).catch(() => {});
     this.scheduleServerCopyCleanup(jobId, outputPath, r2Url ? 15 * 60 * 1000 : 6 * 60 * 60 * 1000);
 
     return {
@@ -1980,6 +1988,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       }
     }, delayMs);
     if (timer && typeof timer.unref === 'function') timer.unref();
+  }
+
+  /**
+   * Free a job's heavy render intermediates after a FAILED render, so a crashed
+   * render doesn't leave ~GBs of temp files behind to fill the ephemeral disk.
+   */
+  async cleanupRenderTemp(jobId) {
+    const workDir = path.join(this.tempDir, `manual-${jobId}`);
+    await fs.remove(path.join(workDir, 'sequence')).catch(() => {});
+    await fs.remove(path.join(workDir, 'source.mp4')).catch(() => {});
+    await fs.remove(path.join(workDir, 'sections')).catch(() => {});
+    await fs.remove(path.join(workDir, 'desilence')).catch(() => {});
+    console.log(`[ManualClip ${jobId}] Cleaned up render temp after failure`);
   }
 
   /**

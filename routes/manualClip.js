@@ -331,6 +331,8 @@ router.post('/render-sequence/:jobId', async (req, res) => {
 
     manualClipService.renderPodcastSequence(jobId, hookList, { title, cuts: cutList, disguise: disguiseList, userId: req.headers['x-user-id'] || null })
       .catch(error => {
+        // Free the heavy intermediates a failed render left behind (don't fill the disk).
+        manualClipService.cleanupRenderTemp(jobId).catch(() => {});
         console.error(`[ManualClip] Podcast sequence failed:`, error.message);
         manualClipService.updateJob(jobId, {
           status: 'error',
