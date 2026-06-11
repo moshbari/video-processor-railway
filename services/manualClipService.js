@@ -83,6 +83,24 @@ class ManualClipService {
         throw new Error('Please provide a video URL or upload a video file.');
       }
 
+      // --- Optional: normalize to a clean constant frame rate so this video's
+      // timeline matches YouTube's. Fixes the #1 cause of "my timestamps don't
+      // line up with YouTube" — variable frame rate + container edit-lists in
+      // phone/drive/screen-recorder files. From here on, the normalized copy IS
+      // the source used for playback, marking, waveform and cutting, so the
+      // whole app shares one timeline that agrees with YouTube. ---
+      if (input.normalize) {
+        this.updateJob(jobId, { step: 'normalizing', progress: 10 });
+        console.log(`[ManualClip ${jobId}] Normalizing to constant frame rate (matching YouTube timestamps)...`);
+        const normalizedPath = path.join(workDir, 'normalized.mp4');
+        await this.normalizeToConstantFps(videoPath, normalizedPath, (pct) => {
+          this.updateJob(jobId, { step: 'normalizing', progress: Math.round(5 + (pct / 100) * 18) }); // 5 -> 23
+        });
+        videoPath = normalizedPath;
+        videoDuration = 0; // force a fresh read from the normalized file below
+        console.log(`[ManualClip ${jobId}] ✓ Normalized copy ready: ${normalizedPath}`);
+      }
+
       // Get duration if not known
       if (!videoDuration) {
         console.log(`[ManualClip ${jobId}] Getting duration for: ${videoPath}`);
@@ -1420,6 +1438,81 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         }
         resolve(metadata.format.duration || 0);
       });
+    });
+  }
+
+  /**
+   * Read the video's frame rate and snap it to the nearest standard rate
+   * (24/25/30/50/60). Used as the target for constant-frame-rate normalization
+   * so the result looks like a normal YouTube-style encode. Defaults to 30.
+   */
+  detectStandardFps(videoPath) {
+    return new Promise((resolve) => {
+      ffmpeg.ffprobe(videoPath, (err, metadata) => {
+        if (err) { resolve(30); return; }
+        const v = (metadata.streams || []).find(s => s.codec_type === 'video');
+        const raw = (v && (v.avg_frame_rate || v.r_frame_rate)) || '30/1';
+        const [n, d] = String(raw).split('/').map(Number);
+        let fps = d ? n / d : Number(raw);
+        if (!Number.isFinite(fps) || fps <= 0) fps = 30;
+        const standard = [24, 25, 30, 50, 60];
+        const nearest = standard.reduce((best, s) =>
+          Math.abs(s - fps) < Math.abs(best - fps) ? s : best, 30);
+        resolve(nearest);
+      });
+    });
+  }
+
+  /**
+   * Re-encode a video into a clean, CONSTANT-frame-rate copy whose timeline
+   * matches what YouTube produces. The original resolution is kept; only the
+   * frame timing is regularised and the presentation timestamps are reset to
+   * start at 0 (which also bakes in any container edit-list / start offset).
+   * This is what makes pasted YouTube timestamps land on the right moment.
+   */
+  async normalizeToConstantFps(inputPath, outputPath, onProgress) {
+    const duration = await this.getVideoDuration(inputPath).catch(() => 0);
+    const fps = await this.detectStandardFps(inputPath);
+    console.log(`  [Normalize] target ${fps}fps CFR, keeping source resolution`);
+
+    return new Promise((resolve, reject) => {
+      const args = [
+        '-y',
+        '-fflags', '+genpts',
+        '-i', inputPath,
+        '-map', '0:v:0',
+        '-map', '0:a:0?',
+        '-vsync', 'cfr',
+        '-r', String(fps),
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '18',
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-ar', '48000',
+        '-ac', '2',
+        '-b:a', '192k',
+        '-movflags', '+faststart',
+        outputPath
+      ];
+
+      const proc = spawn('ffmpeg', args);
+      let stderr = '';
+      proc.stderr.on('data', (d) => {
+        const s = d.toString();
+        stderr += s;
+        if (stderr.length > 20000) stderr = stderr.slice(-10000);
+        const m = s.match(/time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})/);
+        if (m && onProgress && duration > 0) {
+          const cur = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 100;
+          onProgress(Math.min(100, (cur / duration) * 100));
+        }
+      });
+      proc.on('close', (code) => {
+        if (code === 0) { console.log('  [Normalize] ✓ done'); resolve(outputPath); }
+        else { console.error(stderr.slice(-800)); reject(new Error('Could not prepare the video for YouTube timestamp matching. Please try again.')); }
+      });
+      proc.on('error', (err) => reject(err));
     });
   }
 
