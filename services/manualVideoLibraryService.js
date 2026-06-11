@@ -90,6 +90,29 @@ class ManualVideoLibraryService {
   }
 
   /**
+   * Save the user's Danger Zone removal sections for one video (auto-save from
+   * the editor), so reopening the project brings them back. Stored lean:
+   * { title, startTime, endTime }. Checks the user's library then the public
+   * one (a video may have been saved under either).
+   */
+  async updateCuts(userId, jobId, cuts) {
+    const lean = (Array.isArray(cuts) ? cuts : []).map(c => ({
+      title: c.title || '',
+      startTime: Number(c.startTime) || 0,
+      endTime: Number(c.endTime) || 0,
+    }));
+    for (const owner of [userId, null]) {
+      const data = await this.load(owner);
+      const v = data.videos.find(x => x.jobId === jobId);
+      if (v) {
+        v.cuts = lean;
+        await this.save(owner, data);
+        return;
+      }
+    }
+  }
+
+  /**
    * Merge a patch into one saved video record (e.g. after re-encoding it to
    * match YouTube timestamps: new sourceKey/playbackUrl/duration/waveform +
    * a `normalized` flag). Looks in the user's library first, then the public

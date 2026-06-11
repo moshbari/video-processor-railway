@@ -521,6 +521,7 @@ router.post('/restore/:jobId', async (req, res) => {
       playbackUrl: record.playbackUrl,
       waveform: { peaks: record.waveformPeaks || [] },
       hooks: record.hooks || [],
+      cuts: record.cuts || [],
     });
   } catch (error) {
     console.error('[ManualClip] Restore error:', error);
@@ -543,6 +544,24 @@ router.put('/library/:jobId/hooks', async (req, res) => {
   } catch (error) {
     console.error('[ManualClip] Save hooks error:', error);
     res.status(500).json({ success: false, error: 'Could not save your hooks.' });
+  }
+});
+
+// ============================================================
+// PUT /api/manual-clip/library/:jobId/cuts
+// Auto-save the user's Danger Zone removal sections for a saved video
+// Body: { cuts: [{ title, startTime, endTime }] }
+// ============================================================
+router.put('/library/:jobId/cuts', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const { cuts } = req.body;
+    await manualVideoLibraryService.updateCuts(userId, jobId, cuts || []);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[ManualClip] Save cuts error:', error);
+    res.status(500).json({ success: false, error: 'Could not save your removal sections.' });
   }
 });
 
