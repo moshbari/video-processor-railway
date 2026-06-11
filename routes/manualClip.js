@@ -444,7 +444,7 @@ router.post('/detect-speakers/:jobId', async (req, res) => {
       console.error('[ManualClip] Speaker detection failed:', error.message);
       manualClipService.updateJob(jobId, {
         status: 'error',
-        error: error.message && error.message.includes('AssemblyAI')
+        error: error.message && /assemblyai/i.test(error.message)
           ? "Speaker detection isn't set up yet. Please add the AssemblyAI key."
           : 'Could not detect speakers for this video. Please try again.',
       });
