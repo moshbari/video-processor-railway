@@ -475,6 +475,7 @@ router.get('/library', async (req, res) => {
       durationFormatted: v.durationFormatted,
       fileSize: v.fileSize,
       createdAt: v.createdAt,
+      normalized: !!v.normalized,
     }));
     res.json({ success: true, videos: slim });
   } catch (error) {
@@ -543,6 +544,45 @@ router.put('/library/:jobId/hooks', async (req, res) => {
   } catch (error) {
     console.error('[ManualClip] Save hooks error:', error);
     res.status(500).json({ success: false, error: 'Could not save your hooks.' });
+  }
+});
+
+// ============================================================
+// POST /api/manual-clip/library/:jobId/normalize
+// ⏱️ Match YouTube timestamps for an ALREADY-saved video, in place (no
+// re-upload). Re-encodes the stored source to constant frame rate and points
+// the library record at the matched copy. Runs in the background; the frontend
+// polls GET /status/:jobId (done when step === 'normalized', error on failure).
+// ============================================================
+router.post('/library/:jobId/normalize', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+
+    // Seed an initial status so polling doesn't 404 in the gap before work starts.
+    manualClipService.updateJob(jobId, {
+      status: 'generating', step: 'normalizing_saved', progress: 1,
+      currentClip: 'Starting…', generatedClips: [], error: null,
+    });
+
+    // Return immediately; convert in the background.
+    res.json({
+      success: true,
+      jobId,
+      message: 'Matching YouTube timestamps! Track progress via the status endpoint.'
+    });
+
+    manualClipService.normalizeSavedVideo(jobId, { userId }).catch(error => {
+      console.error('[ManualClip] Normalize saved video failed:', error.message);
+      manualClipService.updateJob(jobId, {
+        status: 'error',
+        error: 'Could not match YouTube timestamps for this video. Please try again.'
+      });
+    });
+
+  } catch (error) {
+    console.error('[ManualClip] Normalize route error:', error);
+    res.status(500).json({ success: false, error: 'Could not start matching. Please try again.' });
   }
 });
 

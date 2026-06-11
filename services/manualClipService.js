@@ -247,6 +247,99 @@ class ManualClipService {
     return job;
   }
 
+  /**
+   * Convert an ALREADY-SAVED library video to match YouTube timestamps, in
+   * place — without the user re-uploading. Pulls the stored source down from
+   * R2, re-encodes it to a clean constant-frame-rate copy, uploads that as the
+   * new source, regenerates the duration + waveform, and points the saved
+   * record at the matched copy. Progress is reported on the normal /status
+   * channel so the frontend can poll it. Idempotent: a video already marked
+   * normalized is returned untouched.
+   */
+  async normalizeSavedVideo(jobId, options = {}) {
+    const userId = options.userId || null;
+
+    this.updateJob(jobId, {
+      status: 'generating',
+      step: 'normalizing_saved',
+      progress: 2,
+      currentClip: 'Getting your video ready…',
+      generatedClips: [],
+      error: null,
+    });
+
+    const record = (await manualVideoLibraryService.get(userId, jobId))
+      || (await manualVideoLibraryService.get(null, jobId));
+    if (!record) throw new Error('That video is no longer available.');
+
+    // Already matched — nothing to do.
+    if (record.normalized) {
+      this.updateJob(jobId, { status: 'ready', step: 'normalized', progress: 100, currentClip: '' });
+      return { success: true, jobId, alreadyNormalized: true };
+    }
+
+    const workDir = path.join(this.tempDir, `manual-${jobId}`);
+    await fs.ensureDir(workDir);
+
+    // 1. Bring the current (un-matched) source down from R2.
+    const srcKey = record.sourceKey || `manual-clip/${jobId}/source.mp4`;
+    const srcUrl = record.playbackUrl || r2Service.getPublicUrl(srcKey);
+    const originalPath = path.join(workDir, 'orig_for_norm.mp4');
+    this.updateJob(jobId, { step: 'normalizing_saved', progress: 6, currentClip: 'Fetching your video…' });
+    console.log(`[ManualClip ${jobId}] Normalizing saved video — downloading source (${srcKey})...`);
+    await r2Service.downloadFile(srcUrl, originalPath);
+
+    // 2. Re-encode to constant frame rate (the YouTube-matching step).
+    this.updateJob(jobId, { step: 'normalizing_saved', progress: 12, currentClip: 'Matching YouTube timestamps…' });
+    const normalizedPath = path.join(workDir, 'normalized.mp4');
+    await this.normalizeToConstantFps(originalPath, normalizedPath, (pct) => {
+      this.updateJob(jobId, { progress: Math.round(12 + (pct / 100) * 70) }); // 12 -> 82
+    });
+
+    // 3. Upload the matched copy to a NEW key (so the old public URL can't serve
+    //    a stale cached copy), then refresh duration + waveform from it.
+    this.updateJob(jobId, { step: 'normalizing_saved', progress: 85, currentClip: 'Saving the matched copy…' });
+    const newKey = `manual-clip/${jobId}/source_yt.mp4`;
+    const up = await r2Service.uploadFile(normalizedPath, newKey, 'video/mp4');
+    const newPlaybackUrl = up.downloadUrl;
+
+    this.updateJob(jobId, { step: 'normalizing_saved', progress: 90, currentClip: 'Refreshing the waveform…' });
+    const newDuration = await this.getVideoDuration(normalizedPath).catch(() => record.duration || 0);
+    const waveform = await this.generateWaveform(normalizedPath, workDir, newDuration)
+      .catch(() => ({ peaks: record.waveformPeaks || [] }));
+
+    // 4. Point the saved record at the matched copy from now on.
+    await manualVideoLibraryService.updateVideo(userId, jobId, {
+      sourceKey: newKey,
+      playbackUrl: newPlaybackUrl,
+      duration: newDuration,
+      durationFormatted: this.formatTime(newDuration),
+      waveformPeaks: waveform.peaks || [],
+      normalized: true,
+    });
+
+    // Best-effort: remove the old un-matched source to save space.
+    if (record.sourceKey && record.sourceKey !== newKey) {
+      r2Service.deleteFile(record.sourceKey).catch(() => {});
+    }
+
+    // 5. Reflect on the in-memory job and signal completion (step === 'normalized').
+    this.updateJob(jobId, {
+      status: 'ready',
+      step: 'normalized',
+      progress: 100,
+      currentClip: '',
+      videoPath: normalizedPath,
+      videoDuration: newDuration,
+      playbackUrl: newPlaybackUrl,
+      sourceKey: newKey,
+      waveform: { peaks: waveform.peaks || [] },
+    });
+
+    console.log(`[ManualClip ${jobId}] ✓ Saved video matched to YouTube: ${newPlaybackUrl}`);
+    return { success: true, jobId, playbackUrl: newPlaybackUrl, duration: newDuration };
+  }
+
   // ============================================================
   // WAVEFORM GENERATION
   // ============================================================

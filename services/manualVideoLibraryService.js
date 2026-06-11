@@ -89,6 +89,27 @@ class ManualVideoLibraryService {
     await this.save(userId, data);
   }
 
+  /**
+   * Merge a patch into one saved video record (e.g. after re-encoding it to
+   * match YouTube timestamps: new sourceKey/playbackUrl/duration/waveform +
+   * a `normalized` flag). Looks in the user's library first, then the public
+   * one, so it works regardless of which file the video was saved under.
+   * Returns true if a record was found and updated.
+   */
+  async updateVideo(userId, jobId, patch) {
+    for (const owner of [userId, null]) {
+      const data = await this.load(owner);
+      const v = data.videos.find(x => x.jobId === jobId);
+      if (v) {
+        Object.assign(v, patch || {});
+        await this.save(owner, data);
+        console.log(`[VideoLibrary] Updated ${jobId} for ${owner || 'public'}`);
+        return true;
+      }
+    }
+    return false;
+  }
+
   async list(userId) {
     const data = await this.load(userId);
     return data.videos;
