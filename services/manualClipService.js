@@ -37,10 +37,14 @@ const DISGUISE_PRESETS = {
 };
 const DISGUISE_SR = 48000;
 // FFmpeg audio-filter chain that pitch-shifts by `ratio` while keeping duration.
+// IMPORTANT: resample to a known rate FIRST — `asetrate` reinterprets the sample
+// rate, so if the source is (say) 44100 and we asetrate against 48000 the timing
+// comes out wrong and the audio drifts. Normalizing to DISGUISE_SR up front keeps
+// the duration exact for any source rate.
 function pitchFilterChain(ratio) {
   const r = Math.max(0.5, Math.min(2, Number(ratio) || 1));
   const tempo = (1 / r).toFixed(6);
-  return `asetrate=${DISGUISE_SR}*${r},aresample=${DISGUISE_SR},atempo=${tempo}`;
+  return `aresample=${DISGUISE_SR},asetrate=${DISGUISE_SR}*${r},aresample=${DISGUISE_SR},atempo=${tempo}`;
 }
 
 class ManualClipService {
@@ -1691,7 +1695,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return new Promise((resolve, reject) => {
       const K = presets.length + 1; // untouched track + one per preset
       const parts = [];
-      parts.push(`[0:a]asplit=${K}[base0]${presets.map((_, i) => `[base${i + 1}]`).join('')}`);
+      // Normalize the source rate up front so every branch (incl. the untouched
+      // one) is at DISGUISE_SR — keeps the pitch math exact and lets amix mix
+      // them without a sample-rate mismatch.
+      parts.push(`[0:a]aresample=${DISGUISE_SR},asplit=${K}[base0]${presets.map((_, i) => `[base${i + 1}]`).join('')}`);
       // Untouched track: muted during ANY disguise window.
       parts.push(`[base0]volume=0:enable='${betweenExpr(disguiseRanges)}'[anorm]`);
       // One pitched track per preset: muted everywhere EXCEPT its own windows.
