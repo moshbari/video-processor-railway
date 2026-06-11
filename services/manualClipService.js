@@ -927,6 +927,211 @@ class ManualClipService {
     };
   }
 
+  // ============================================================
+  // ⛔ DANGER ZONE — REMOVE SECTIONS
+  // ============================================================
+  /**
+   * Cut the user-chosen time ranges OUT of the prepared video and stitch the
+   * parts that remain back into ONE continuous file (audio + video stay in
+   * sync). Mirrors removeSilence, but the cuts are the exact ranges the user
+   * marked instead of auto-detected silences. The original is never touched.
+   *
+   * @param {string} jobId   - Job ID from the prepare step
+   * @param {Array}  sections - [{ startTime, endTime }] ranges to DELETE
+   * @param {Object} options  - { userId, title }
+   */
+  async removeSections(jobId, sections, options = {}) {
+    this.updateJob(jobId, {
+      status: 'generating',
+      step: 'starting_section_removal',
+      progress: 2,
+      totalClips: 1,
+      completedClips: 0,
+      currentClip: 'Getting your video ready...',
+      generatedClips: []
+    });
+
+    const job = await this.ensureSourceAvailable(jobId, options.userId);
+
+    const videoPath = job.videoPath;
+    const videoDuration = job.videoDuration || await this.getVideoDuration(videoPath).catch(() => 0);
+    const videoTitle = options.title || job.videoTitle || 'Video';
+
+    const workDir = path.join(this.tempDir, `manual-${jobId}`);
+    const cutDir = path.join(workDir, 'sections');
+    await fs.ensureDir(cutDir);
+
+    // Work out which parts to KEEP (everything that isn't being removed).
+    const keeps = this.keepSegmentsFromRemovals(sections, videoDuration);
+    const keptSeconds = keeps.reduce((sum, k) => sum + (k.end - k.start), 0);
+    const removedSeconds = Math.max(0, videoDuration - keptSeconds);
+
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`[ManualClip ${jobId}] REMOVING SECTIONS`);
+    console.log(`  Sections to remove: ${sections.length} | Removing ${removedSeconds.toFixed(1)}s | Keeping ${keeps.length} segment(s)`);
+    console.log('='.repeat(60));
+
+    // Nothing left to render — the user marked the whole video for removal.
+    if (keeps.length === 0 || keptSeconds < 0.5) {
+      this.updateJob(jobId, {
+        status: 'error',
+        error: "That would remove the whole video. Leave at least a little to keep."
+      });
+      return { success: false, jobId, removedSeconds };
+    }
+
+    // Nothing meaningful was actually cut.
+    if (removedSeconds < 0.1) {
+      this.updateJob(jobId, {
+        status: 'error',
+        error: "No sections were removed — please mark the parts you want to delete first."
+      });
+      return { success: false, jobId, removedSeconds };
+    }
+
+    // Re-encode the kept parts into one continuous file (same proven path the
+    // silence remover uses, so the joins stay perfectly in sync).
+    this.updateJob(jobId, {
+      step: 'removing_sections',
+      progress: 15,
+      currentClip: `Cutting out ${this.formatTime(removedSeconds)} from your video...`
+    });
+
+    const outputPath = path.join(cutDir, 'trimmed.mp4');
+    await this.renderKeptSegments(videoPath, keeps, keptSeconds, outputPath, (pct) => {
+      this.updateJob(jobId, { progress: Math.round(15 + (pct / 100) * 78) }); // 15 -> 93
+    });
+
+    // Make it downloadable straight from this server immediately, then push the
+    // durable copy to R2 — same pattern as the podcast / silence renders.
+    const safeTitle = this.sanitizeFilename(videoTitle);
+    const downloadName = `${safeTitle || 'video'}_trimmed.mp4`;
+    const finalDuration = await this.getVideoDuration(outputPath).catch(() => keptSeconds);
+    const serverDownloadUrl = `${this.publicBaseUrl()}/api/manual-clip/download/${jobId}`;
+
+    this.updateJob(jobId, {
+      step: 'uploading',
+      progress: 95,
+      currentClip: 'Your video is ready — saving a cloud copy...',
+      serverDownload: { path: outputPath, filename: downloadName },
+      serverDownloadUrl
+    });
+
+    const r2FileName = `manual-clips/${jobId}/trimmed_${safeTitle}.mp4`;
+    let r2Url = null;
+    try {
+      const uploadResult = await r2Service.uploadFile(outputPath, r2FileName);
+      r2Url = uploadResult.downloadUrl;
+    } catch (err) {
+      console.error(`[ManualClip ${jobId}] R2 upload failed, serving local copy:`, err.message);
+    }
+
+    const removedPercent = videoDuration > 0
+      ? Math.round((removedSeconds / videoDuration) * 100)
+      : 0;
+
+    const resultClip = {
+      clipNumber: 1,
+      title: `${videoTitle} — Sections Removed`,
+      isSectionRemoval: true,
+      // --- Section-removal report ---
+      sectionsRemoved: sections.length,
+      originalDuration: videoDuration,
+      originalFormatted: this.formatTime(videoDuration),
+      removedSeconds,
+      removedFormatted: this.formatTime(removedSeconds),
+      removedPercent,
+      newDuration: finalDuration,
+      newFormatted: this.formatTime(finalDuration),
+      duration: finalDuration,
+      durationFormatted: this.formatTime(finalDuration),
+      downloadUrl: r2Url || serverDownloadUrl,
+      serverDownloadUrl,
+      hasCaptions: false
+    };
+
+    this.updateJob(jobId, {
+      status: 'complete',
+      step: 'done',
+      progress: 100,
+      completedClips: 1,
+      currentClip: '',
+      generatedClips: [resultClip],
+      completedAt: new Date().toISOString()
+    });
+
+    console.log(`[ManualClip ${jobId}] ✓ Section removal complete: ${resultClip.downloadUrl}`);
+
+    // Save the finished render to the user's library (only once it's safely on R2).
+    if (r2Url) {
+      try {
+        let renderSize = 0;
+        try { renderSize = (await fs.stat(outputPath)).size; } catch { /* best-effort */ }
+        await manualVideoLibraryService.addRender(options.userId, {
+          title: `${videoTitle} — Sections Removed`,
+          downloadUrl: r2Url,
+          r2Key: r2FileName,
+          fileSize: renderSize,
+          duration: finalDuration,
+          durationFormatted: this.formatTime(finalDuration),
+          sourceJobId: jobId,
+          hookCount: 0,
+          createdAt: new Date().toISOString(),
+        });
+      } catch (libErr) {
+        console.error(`[ManualClip ${jobId}] Could not save render to library:`, libErr.message);
+      }
+    }
+
+    // Keep the local copy around for a grace window (longer if R2 failed) so the
+    // direct download stays alive; the source video is never touched.
+    this.scheduleServerCopyCleanup(jobId, outputPath, r2Url ? 15 * 60 * 1000 : 6 * 60 * 60 * 1000);
+
+    return {
+      success: true,
+      jobId,
+      removedSeconds,
+      downloadUrl: resultClip.downloadUrl,
+      serverDownloadUrl,
+      clips: [resultClip]
+    };
+  }
+
+  /**
+   * Turn the user's "remove these ranges" list into the segments to KEEP.
+   * Clamps each range to the video, merges overlapping/adjacent removals, then
+   * returns the complement over [0, duration]. Result is [{ start, end }]
+   * covering everything that was NOT marked for removal.
+   */
+  keepSegmentsFromRemovals(removals, duration) {
+    const cuts = (removals || [])
+      .map(r => ({
+        start: Math.max(0, Math.min(parseFloat(r.startTime), duration)),
+        end: Math.max(0, Math.min(parseFloat(r.endTime), duration)),
+      }))
+      .filter(r => Number.isFinite(r.start) && Number.isFinite(r.end) && r.end - r.start > 0.05)
+      .sort((a, b) => a.start - b.start);
+
+    // Merge overlapping/touching cuts so the complement is clean.
+    const merged = [];
+    for (const c of cuts) {
+      const last = merged[merged.length - 1];
+      if (last && c.start <= last.end) last.end = Math.max(last.end, c.end);
+      else merged.push({ ...c });
+    }
+
+    // Keep = complement of the merged cuts over the whole timeline.
+    const keeps = [];
+    let cursor = 0;
+    for (const c of merged) {
+      if (c.start > cursor) keeps.push({ start: cursor, end: c.start });
+      cursor = Math.max(cursor, c.end);
+    }
+    if (cursor < duration) keeps.push({ start: cursor, end: duration });
+
+    return keeps.filter(k => k.end - k.start > 0.05);
+  }
+
   /**
    * Run ffmpeg silencedetect and return an array of { start, end } silent ranges.
    */
