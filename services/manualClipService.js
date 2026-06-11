@@ -687,9 +687,17 @@ class ManualClipService {
       this.updateJob(jobId, { step: 'disguising_voices', currentClip: 'Disguising the marked voices…', progress: 2 });
       console.log(`  Disguising ${disguise.length} voice segment(s) before render`);
       const disguisedPath = path.join(seqDir, 'disguised_source.mp4');
-      const built = await this.buildDisguisedSource(videoPath, disguise, videoDuration, disguisedPath, (pct) => {
-        this.updateJob(jobId, { progress: Math.round(2 + (pct / 100) * 3) }); // 2 -> 5
-      }).catch(err => { console.error(`[ManualClip ${jobId}] Disguise failed:`, err.message); return null; });
+      let built = null;
+      try {
+        built = await this.buildDisguisedSource(videoPath, disguise, videoDuration, disguisedPath, (pct) => {
+          this.updateJob(jobId, { progress: Math.round(2 + (pct / 100) * 3) }); // 2 -> 5
+        });
+      } catch (err) {
+        // Disguise was requested — if it fails we must NOT fall through to a
+        // render that exposes the guest's real voice. Fail the whole render.
+        console.error(`[ManualClip ${jobId}] Disguise failed:`, err.message);
+        throw new Error('Could not disguise the marked voices. Please try again.');
+      }
       if (built) videoPath = built;
     }
 
@@ -766,6 +774,12 @@ class ManualClipService {
     await this.concatenateSequence16x9(segmentPaths, outputPath, totalSeconds, (pct) => {
       this.updateJob(jobId, { progress: Math.round(62 + (pct / 100) * 30) }); // 62 -> 92
     });
+
+    // Guard: never report "complete" if the stitch produced no file (e.g. ffmpeg
+    // ran out of memory). Fail loudly instead of handing back a dead link.
+    if (!await fs.pathExists(outputPath)) {
+      throw new Error('The final video could not be created. Please try again.');
+    }
 
     // Step 4: The finished render is on local disk now. Make it downloadable
     // straight from THIS server immediately — so the user can grab it without
@@ -1665,55 +1679,42 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
    * segments (each with its own preset), and untouched everywhere else. The
    * video stream is copied (fast) — only the audio is rebuilt.
    *
-   * IMPORTANT (A/V sync): we do NOT cut-and-stitch the audio (that accumulates
-   * tiny timing errors at every joint and drifts the soundtrack out of sync on
-   * long videos). Instead we keep CONTINUOUS, full-length tracks and just gate
-   * the volume by time: the untouched track plays everywhere except the
-   * disguise windows; one pitched track per preset plays only inside its
-   * windows. They're summed back together — so the timeline never moves and the
-   * lips stay in sync.
+   * Approach: split the audio at the window boundaries, pitch-shift the disguise
+   * pieces, and concat back in order. To keep A/V sync EXACT we (a) resample to a
+   * known rate before any asetrate (so the pitch math is right for any source
+   * rate) and (b) force each pitched piece to its precise target length with
+   * apad+atrim — so the joined timeline can't drift. This stays light on memory
+   * even with hundreds of windows (a volume-gated mix blew up the filtergraph and
+   * OOM'd at ~130 windows; this peaks ~120 MB).
    */
-  buildDisguisedSource(videoPath, segments, duration, outputPath, onProgress) {
+  async buildDisguisedSource(videoPath, segments, duration, outputPath, onProgress) {
     const intervals = this.disguiseIntervals(segments, duration);
-    const disguiseRanges = intervals.filter(iv => iv.preset);
     // Nothing to disguise — signal the caller to use the original.
-    if (disguiseRanges.length === 0) return Promise.resolve(null);
+    if (!intervals.some(iv => iv.preset)) return null;
 
-    // Group disguise windows by preset (each preset = one pitched track).
-    const byPreset = new Map();
-    for (const iv of disguiseRanges) {
-      if (!byPreset.has(iv.preset)) byPreset.set(iv.preset, []);
-      byPreset.get(iv.preset).push({ start: iv.start, end: iv.end });
-    }
-    const presets = [...byPreset.keys()];
+    const n = intervals.length;
+    const parts = [`[0:a]aresample=${DISGUISE_SR},asplit=${n}${intervals.map((_, i) => `[a${i}]`).join('')}`];
+    intervals.forEach((iv, i) => {
+      const d = (iv.end - iv.start).toFixed(3);
+      let chain = `atrim=${iv.start.toFixed(3)}:${iv.end.toFixed(3)},asetpts=PTS-STARTPTS`;
+      if (iv.preset) {
+        // Pitch-shift, then nail the piece to its exact length so concat never drifts.
+        chain += `,${pitchFilterChain(DISGUISE_PRESETS[iv.preset].ratio)},apad=whole_dur=${d},atrim=0:${d}`;
+      }
+      parts.push(`[a${i}]${chain}[s${i}]`);
+    });
+    parts.push(`${intervals.map((_, i) => `[s${i}]`).join('')}concat=n=${n}:v=0:a=1[outa]`);
 
-    // A timeline expression that is 1 inside the given ranges, 0 outside.
-    // Wrapped so commas survive the filtergraph parser (single-quoted at use).
-    const betweenExpr = (ranges) =>
-      ranges.map(r => `between(t,${r.start.toFixed(3)},${r.end.toFixed(3)})`).join('+');
+    // Large filtergraphs are passed via a script file (avoids any arg-length limit).
+    const filterPath = `${outputPath}.filter.txt`;
+    await fs.writeFile(filterPath, parts.join(';'));
 
+    const disguiseCount = intervals.filter(iv => iv.preset).length;
     return new Promise((resolve, reject) => {
-      const K = presets.length + 1; // untouched track + one per preset
-      const parts = [];
-      // Normalize the source rate up front so every branch (incl. the untouched
-      // one) is at DISGUISE_SR — keeps the pitch math exact and lets amix mix
-      // them without a sample-rate mismatch.
-      parts.push(`[0:a]aresample=${DISGUISE_SR},asplit=${K}[base0]${presets.map((_, i) => `[base${i + 1}]`).join('')}`);
-      // Untouched track: muted during ANY disguise window.
-      parts.push(`[base0]volume=0:enable='${betweenExpr(disguiseRanges)}'[anorm]`);
-      // One pitched track per preset: muted everywhere EXCEPT its own windows.
-      presets.forEach((p, i) => {
-        const ratio = DISGUISE_PRESETS[p].ratio;
-        const inside = betweenExpr(byPreset.get(p));
-        parts.push(`[base${i + 1}]${pitchFilterChain(ratio)},volume=0:enable='lt(${inside},1)'[ap${i}]`);
-      });
-      // Sum them (exactly one track is audible at any instant).
-      parts.push(`[anorm]${presets.map((_, i) => `[ap${i}]`).join('')}amix=inputs=${K}:normalize=0:dropout_transition=0[outa]`);
-
       const args = [
         '-y',
         '-i', videoPath,
-        '-filter_complex', parts.join(';'),
+        '-filter_complex_script', filterPath,
         '-map', '0:v:0',
         '-map', '[outa]',
         '-c:v', 'copy',
@@ -1725,7 +1726,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         outputPath,
       ];
 
-      console.log(`  [Disguise] ${disguiseRanges.length} window(s) across ${presets.length} voice(s) — volume-gated mix (sync-safe)`);
+      console.log(`  [Disguise] ${disguiseCount} window(s) over ${n} interval(s) — concat with exact-length pieces (sync-safe, low memory)`);
       const proc = spawn('ffmpeg', args);
       let stderr = '';
       proc.stderr.on('data', (d) => {
