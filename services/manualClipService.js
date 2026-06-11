@@ -1721,8 +1721,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
    * a public MP3 URL (kept briefly on R2). Capped to a few seconds.
    */
   async voicePreview(jobId, { startTime, endTime, preset, userId } = {}) {
-    const job = await this.ensureSourceAvailable(jobId, userId);
-    const videoPath = job.videoPath;
+    // Stream just the needed seconds straight from R2 (no full download). Prefer
+    // a local copy if the job already has one, else the public playback URL.
+    const memJob = this.jobs.get(jobId);
+    let srcInput = (memJob && memJob.videoPath && await fs.pathExists(memJob.videoPath)) ? memJob.videoPath : null;
+    if (!srcInput) {
+      const rec = (await manualVideoLibraryService.get(userId, jobId))
+        || (await manualVideoLibraryService.get(null, jobId));
+      srcInput = rec?.playbackUrl || (rec?.sourceKey ? r2Service.getPublicUrl(rec.sourceKey) : null)
+        || memJob?.playbackUrl;
+    }
+    if (!srcInput) throw new Error('That video is no longer available for preview.');
+    const videoPath = srcInput;
     const start = Math.max(0, parseFloat(startTime) || 0);
     const rawDur = Math.max(0, (parseFloat(endTime) || 0) - start);
     const dur = Math.min(8, rawDur > 0 ? rawDur : 6); // preview at most 8s
