@@ -260,10 +260,11 @@ router.post('/generate/:jobId', async (req, res) => {
 router.post('/render-sequence/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
-    const { hooks, cuts, title } = req.body;
+    const { hooks, cuts, disguise, title } = req.body;
 
     const hookList = Array.isArray(hooks) ? hooks : [];
     const cutList = Array.isArray(cuts) ? cuts : [];
+    const disguiseList = Array.isArray(disguise) ? disguise : [];
 
     if (hookList.length === 0 && cutList.length === 0) {
       return res.status(400).json({
@@ -328,7 +329,7 @@ router.post('/render-sequence/:jobId', async (req, res) => {
       message: `Building your video! Use the status endpoint to track progress.`
     });
 
-    manualClipService.renderPodcastSequence(jobId, hookList, { title, cuts: cutList, userId: req.headers['x-user-id'] || null })
+    manualClipService.renderPodcastSequence(jobId, hookList, { title, cuts: cutList, disguise: disguiseList, userId: req.headers['x-user-id'] || null })
       .catch(error => {
         console.error(`[ManualClip] Podcast sequence failed:`, error.message);
         manualClipService.updateJob(jobId, {
@@ -397,6 +398,27 @@ router.post('/remove-silence/:jobId', async (req, res) => {
       success: false,
       error: 'Could not start removing silences. Please try again.'
     });
+  }
+});
+
+// ============================================================
+// POST /api/manual-clip/voice-preview/:jobId
+// 🎭 Render a short audio preview of one segment with a disguise preset applied,
+// so the user can hear it and choose a voice before rendering.
+// Body: { startTime, endTime, preset }
+// ============================================================
+router.post('/voice-preview/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const { startTime, endTime, preset } = req.body || {};
+    const result = await manualClipService.voicePreview(jobId, {
+      startTime, endTime, preset,
+      userId: req.headers['x-user-id'] || null,
+    });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('[ManualClip] Voice preview error:', error.message);
+    res.status(500).json({ success: false, error: 'Could not build that voice preview. Please try again.' });
   }
 });
 
@@ -522,6 +544,7 @@ router.post('/restore/:jobId', async (req, res) => {
       waveform: { peaks: record.waveformPeaks || [] },
       hooks: record.hooks || [],
       cuts: record.cuts || [],
+      disguise: record.disguise || [],
     });
   } catch (error) {
     console.error('[ManualClip] Restore error:', error);
@@ -562,6 +585,24 @@ router.put('/library/:jobId/cuts', async (req, res) => {
   } catch (error) {
     console.error('[ManualClip] Save cuts error:', error);
     res.status(500).json({ success: false, error: 'Could not save your removal sections.' });
+  }
+});
+
+// ============================================================
+// PUT /api/manual-clip/library/:jobId/disguise
+// Auto-save the user's voice-disguise segments for a saved video
+// Body: { disguise: [{ title, startTime, endTime, preset }] }
+// ============================================================
+router.put('/library/:jobId/disguise', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const { disguise } = req.body;
+    await manualVideoLibraryService.updateDisguise(userId, jobId, disguise || []);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[ManualClip] Save disguise error:', error);
+    res.status(500).json({ success: false, error: 'Could not save your voice-disguise settings.' });
   }
 });
 

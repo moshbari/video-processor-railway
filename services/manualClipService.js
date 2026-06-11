@@ -23,6 +23,25 @@ const downloadService = require('./downloadService');
 const transcriptionService = require('./transcriptionService');
 const manualVideoLibraryService = require('./manualVideoLibraryService');
 
+// 🎭 Voice-disguise presets. `ratio` is the pitch multiplier: <1 lowers the
+// voice (deeper), >1 raises it. We shift sample rate then restore tempo, so the
+// timbre changes too — which makes a speaker harder to recognise while staying
+// understandable. Keep these IDs in sync with the frontend.
+const DISGUISE_PRESETS = {
+  slight_deep: { label: 'Slightly Deeper', ratio: 0.92 },
+  deep:        { label: 'Deeper',          ratio: 0.82 },
+  masked:      { label: 'Masked (deep)',   ratio: 0.72 },
+  slight_high: { label: 'Slightly Higher', ratio: 1.10 },
+  high:        { label: 'Higher',          ratio: 1.22 },
+};
+const DISGUISE_SR = 48000;
+// FFmpeg audio-filter chain that pitch-shifts by `ratio` while keeping duration.
+function pitchFilterChain(ratio) {
+  const r = Math.max(0.5, Math.min(2, Number(ratio) || 1));
+  const tempo = (1 / r).toFixed(6);
+  return `asetrate=${DISGUISE_SR}*${r},aresample=${DISGUISE_SR},atempo=${tempo}`;
+}
+
 class ManualClipService {
   constructor() {
     this.tempDir = process.env.TEMP_DIR || '/app/temp';
@@ -625,7 +644,7 @@ class ManualClipService {
   async renderPodcastSequence(jobId, hooks, options = {}) {
     const job = await this.ensureSourceAvailable(jobId, options.userId);
 
-    const videoPath = job.videoPath;
+    let videoPath = job.videoPath;
     const videoDuration = job.videoDuration;
     const videoTitle = options.title || job.videoTitle || 'Podcast';
 
@@ -654,6 +673,20 @@ class ManualClipService {
       currentClip: 'Preparing your video...',
       generatedClips: []
     });
+
+    // Step 0: If any voices are being disguised, build a disguised copy of the
+    // source first and use it for EVERYTHING below (hooks + full video), so the
+    // disguise is consistent throughout the final render.
+    const disguise = Array.isArray(options.disguise) ? options.disguise : [];
+    if (disguise.length > 0) {
+      this.updateJob(jobId, { step: 'disguising_voices', currentClip: 'Disguising the marked voices…', progress: 2 });
+      console.log(`  Disguising ${disguise.length} voice segment(s) before render`);
+      const disguisedPath = path.join(seqDir, 'disguised_source.mp4');
+      const built = await this.buildDisguisedSource(videoPath, disguise, videoDuration, disguisedPath, (pct) => {
+        this.updateJob(jobId, { progress: Math.round(2 + (pct / 100) * 3) }); // 2 -> 5
+      }).catch(err => { console.error(`[ManualClip ${jobId}] Disguise failed:`, err.message); return null; });
+      if (built) videoPath = built;
+    }
 
     // Step 1: Extract each hook section at max quality, in order.
     const segmentPaths = [];
@@ -1589,6 +1622,140 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       });
       proc.on('error', (err) => reject(err));
     });
+  }
+
+  // ============================================================
+  // 🎭 VOICE DISGUISE
+  // ============================================================
+  /**
+   * Order a list of disguise segments [{startTime,endTime,preset}] into a clean,
+   * non-overlapping timeline of intervals that tile [0, duration]. Each interval
+   * is either { start, end, preset: null } (untouched) or { start, end, preset }.
+   */
+  disguiseIntervals(segments, duration) {
+    const segs = (segments || [])
+      .map(s => ({
+        start: Math.max(0, Math.min(parseFloat(s.startTime), duration)),
+        end: Math.max(0, Math.min(parseFloat(s.endTime), duration)),
+        preset: DISGUISE_PRESETS[s.preset] ? s.preset : 'deep',
+      }))
+      .filter(s => Number.isFinite(s.start) && Number.isFinite(s.end) && s.end - s.start > 0.05)
+      .sort((a, b) => a.start - b.start);
+
+    const intervals = [];
+    let cursor = 0;
+    for (const s of segs) {
+      const start = Math.max(s.start, cursor); // clip away any overlap with the previous one
+      if (start >= s.end) continue;
+      if (start > cursor) intervals.push({ start: cursor, end: start, preset: null });
+      intervals.push({ start, end: s.end, preset: s.preset });
+      cursor = s.end;
+    }
+    if (cursor < duration) intervals.push({ start: cursor, end: duration, preset: null });
+    return intervals;
+  }
+
+  /**
+   * Build a copy of the video whose AUDIO is pitch-disguised during the chosen
+   * segments (each with its own preset), and untouched everywhere else. The
+   * video stream is copied (fast) — only the audio is rebuilt. Used to make the
+   * "disguised source" that the whole render is then cut from.
+   */
+  buildDisguisedSource(videoPath, segments, duration, outputPath, onProgress) {
+    const intervals = this.disguiseIntervals(segments, duration);
+    // Nothing to disguise — signal the caller to use the original.
+    if (!intervals.some(iv => iv.preset)) return Promise.resolve(null);
+
+    return new Promise((resolve, reject) => {
+      const n = intervals.length;
+      const parts = [`[0:a]asplit=${n}${intervals.map((_, i) => `[a${i}]`).join('')}`];
+      intervals.forEach((iv, i) => {
+        const trim = `atrim=${iv.start.toFixed(3)}:${iv.end.toFixed(3)},asetpts=PTS-STARTPTS`;
+        const chain = iv.preset
+          ? `${trim},${pitchFilterChain(DISGUISE_PRESETS[iv.preset].ratio)}`
+          : trim;
+        parts.push(`[a${i}]${chain}[s${i}]`);
+      });
+      parts.push(`${intervals.map((_, i) => `[s${i}]`).join('')}concat=n=${n}:v=0:a=1[outa]`);
+
+      const args = [
+        '-y',
+        '-i', videoPath,
+        '-filter_complex', parts.join(';'),
+        '-map', '0:v:0',
+        '-map', '[outa]',
+        '-c:v', 'copy',
+        '-c:a', 'aac',
+        '-ar', String(DISGUISE_SR),
+        '-ac', '2',
+        '-b:a', '320k',
+        '-movflags', '+faststart',
+        outputPath,
+      ];
+
+      const presetList = intervals.filter(iv => iv.preset).map(iv => iv.preset).join(', ');
+      console.log(`  [Disguise] ${intervals.filter(iv => iv.preset).length} segment(s) [${presetList}] over ${n} interval(s)`);
+      const proc = spawn('ffmpeg', args);
+      let stderr = '';
+      proc.stderr.on('data', (d) => {
+        const s = d.toString();
+        stderr += s;
+        if (stderr.length > 20000) stderr = stderr.slice(-10000);
+        const m = s.match(/time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})/);
+        if (m && onProgress && duration > 0) {
+          const cur = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 100;
+          onProgress(Math.min(100, (cur / duration) * 100));
+        }
+      });
+      proc.on('close', (code) => {
+        if (code === 0) { console.log('  [Disguise] ✓ done'); resolve(outputPath); }
+        else { console.error(stderr.slice(-800)); reject(new Error('Could not disguise the voices. Please try again.')); }
+      });
+      proc.on('error', (err) => reject(err));
+    });
+  }
+
+  /**
+   * Render a short audio-only preview of one segment with a disguise preset
+   * applied, so the user can hear it and pick a voice before rendering. Returns
+   * a public MP3 URL (kept briefly on R2). Capped to a few seconds.
+   */
+  async voicePreview(jobId, { startTime, endTime, preset, userId } = {}) {
+    const job = await this.ensureSourceAvailable(jobId, userId);
+    const videoPath = job.videoPath;
+    const start = Math.max(0, parseFloat(startTime) || 0);
+    const rawDur = Math.max(0, (parseFloat(endTime) || 0) - start);
+    const dur = Math.min(8, rawDur > 0 ? rawDur : 6); // preview at most 8s
+
+    const ratio = DISGUISE_PRESETS[preset]?.ratio;
+    const workDir = path.join(this.tempDir, `manual-${jobId}`, 'preview');
+    await fs.ensureDir(workDir);
+    const outPath = path.join(workDir, `prev_${preset || 'orig'}_${Math.round(start)}.mp3`);
+
+    await new Promise((resolve, reject) => {
+      const args = [
+        '-y',
+        '-ss', String(start),
+        '-t', String(dur),
+        '-i', videoPath,
+        '-vn',
+        ...(ratio ? ['-af', pitchFilterChain(ratio)] : []),
+        '-c:a', 'libmp3lame',
+        '-q:a', '4',
+        outPath,
+      ];
+      const proc = spawn('ffmpeg', args);
+      let stderr = '';
+      proc.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 8000) stderr = stderr.slice(-4000); });
+      proc.on('close', (code) => code === 0 ? resolve() : reject(new Error('preview failed: ' + stderr.slice(-300))));
+      proc.on('error', reject);
+    });
+
+    const key = `manual-clip/${jobId}/preview/${preset || 'orig'}_${Math.round(start)}_${Math.round(dur)}.mp3`;
+    const up = await r2Service.uploadFile(outPath, key, 'audio/mpeg');
+    // Clean the local copy soon; R2 keeps the short-lived preview.
+    this.scheduleServerCopyCleanup(`${jobId}-prev`, outPath, 10 * 60 * 1000);
+    return { url: up.downloadUrl, preset: preset || null, durationPreviewed: dur };
   }
 
   getAudioDuration(audioPath) {

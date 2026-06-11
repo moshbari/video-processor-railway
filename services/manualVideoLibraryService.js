@@ -113,6 +113,28 @@ class ManualVideoLibraryService {
   }
 
   /**
+   * Save the user's voice-disguise segments for one video (auto-save). Stored
+   * lean: { title, startTime, endTime, preset }.
+   */
+  async updateDisguise(userId, jobId, disguise) {
+    const lean = (Array.isArray(disguise) ? disguise : []).map(d => ({
+      title: d.title || '',
+      startTime: Number(d.startTime) || 0,
+      endTime: Number(d.endTime) || 0,
+      preset: String(d.preset || 'deep'),
+    }));
+    for (const owner of [userId, null]) {
+      const data = await this.load(owner);
+      const v = data.videos.find(x => x.jobId === jobId);
+      if (v) {
+        v.disguise = lean;
+        await this.save(owner, data);
+        return;
+      }
+    }
+  }
+
+  /**
    * Merge a patch into one saved video record (e.g. after re-encoding it to
    * match YouTube timestamps: new sourceKey/playbackUrl/duration/waveform +
    * a `normalized` flag). Looks in the user's library first, then the public
