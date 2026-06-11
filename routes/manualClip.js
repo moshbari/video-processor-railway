@@ -423,6 +423,39 @@ router.post('/voice-preview/:jobId', async (req, res) => {
 });
 
 // ============================================================
+// POST /api/manual-clip/detect-speakers/:jobId
+// 🗣️ Auto-detect "who spoke when" (AssemblyAI). Runs in the background; the
+// frontend polls /status (done when step === 'speakers_ready', speakers on the
+// status payload).
+// ============================================================
+router.post('/detect-speakers/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+
+    manualClipService.updateJob(jobId, {
+      status: 'generating', step: 'detecting_speakers', progress: 1,
+      currentClip: 'Starting…', speakers: null, error: null,
+    });
+
+    res.json({ success: true, jobId, message: 'Detecting speakers! Track progress via the status endpoint.' });
+
+    manualClipService.detectSpeakers(jobId, { userId }).catch(error => {
+      console.error('[ManualClip] Speaker detection failed:', error.message);
+      manualClipService.updateJob(jobId, {
+        status: 'error',
+        error: error.message && error.message.includes('AssemblyAI')
+          ? "Speaker detection isn't set up yet. Please add the AssemblyAI key."
+          : 'Could not detect speakers for this video. Please try again.',
+      });
+    });
+  } catch (error) {
+    console.error('[ManualClip] Detect-speakers route error:', error);
+    res.status(500).json({ success: false, error: 'Could not start speaker detection. Please try again.' });
+  }
+});
+
+// ============================================================
 // GET /api/manual-clip/status/:jobId
 // Check progress of preparation or generation
 // ============================================================
@@ -466,6 +499,9 @@ router.get('/status/:jobId', async (req, res) => {
 
     // Include generated clips when complete
     if (status.generatedClips) response.generatedClips = status.generatedClips;
+
+    // Include detected speakers when ready
+    if (status.speakers) response.speakers = status.speakers;
 
     // Include error
     if (status.error) response.error = status.error;

@@ -18,6 +18,7 @@ const { exec, spawn } = require('child_process');
 const { promisify } = require('util');
 const execAsync = promisify(exec);
 
+const axios = require('axios');
 const r2Service = require('./r2Service');
 const downloadService = require('./downloadService');
 const transcriptionService = require('./transcriptionService');
@@ -1766,6 +1767,100 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     // Clean the local copy soon; R2 keeps the short-lived preview.
     this.scheduleServerCopyCleanup(`${jobId}-prev`, outPath, 10 * 60 * 1000);
     return { url: up.downloadUrl, preset: preset || null, durationPreviewed: dur };
+  }
+
+  // ============================================================
+  // 🗣️ AUTO SPEAKER DETECTION (AssemblyAI diarization)
+  // ============================================================
+  /**
+   * Ask AssemblyAI to label "who spoke when", then group the result by speaker
+   * so the user can pick which speaker(s) to disguise. Runs in the background;
+   * the frontend polls /status (done when step === 'speakers_ready', and the
+   * grouped speakers are returned on the status payload).
+   */
+  async detectSpeakers(jobId, { userId } = {}) {
+    const apiKey = process.env.ASSEMBLYAI_API_KEY;
+    this.updateJob(jobId, {
+      status: 'generating', step: 'detecting_speakers', progress: 3,
+      currentClip: 'Listening for different speakers…', speakers: null, error: null,
+    });
+    if (!apiKey) {
+      this.updateJob(jobId, { status: 'error', error: "Speaker detection isn't set up yet — an AssemblyAI key is needed." });
+      throw new Error('Missing ASSEMBLYAI_API_KEY');
+    }
+
+    // A public URL AssemblyAI can fetch (the R2 source).
+    const memJob = this.jobs.get(jobId);
+    let srcUrl = memJob?.playbackUrl;
+    if (!srcUrl) {
+      const rec = (await manualVideoLibraryService.get(userId, jobId))
+        || (await manualVideoLibraryService.get(null, jobId));
+      srcUrl = rec?.playbackUrl || (rec?.sourceKey ? r2Service.getPublicUrl(rec.sourceKey) : null);
+    }
+    if (!srcUrl) throw new Error('That video is no longer available.');
+
+    const headers = { authorization: apiKey, 'content-type': 'application/json' };
+
+    // 1. Submit the job (auto-detect language so Bengali etc. works).
+    this.updateJob(jobId, { progress: 8, currentClip: 'Sending the audio for analysis…' });
+    const submit = await axios.post(
+      'https://api.assemblyai.com/v2/transcript',
+      { audio_url: srcUrl, speaker_labels: true, language_detection: true },
+      { headers, timeout: 60000 }
+    );
+    const id = submit.data.id;
+    console.log(`[ManualClip ${jobId}] AssemblyAI transcript ${id} submitted`);
+
+    // 2. Poll until done (~up to 25 min for very long files).
+    let data = null;
+    for (let i = 0; i < 300; i++) {
+      await new Promise(r => setTimeout(r, 5000));
+      const poll = await axios.get(`https://api.assemblyai.com/v2/transcript/${id}`, { headers, timeout: 60000 });
+      data = poll.data;
+      if (data.status === 'completed') break;
+      if (data.status === 'error') throw new Error(data.error || 'Speaker detection failed.');
+      this.updateJob(jobId, { progress: Math.min(92, 12 + i), currentClip: 'Working out who spoke when…' });
+    }
+    if (!data || data.status !== 'completed') throw new Error('Speaker detection timed out. Please try again.');
+
+    // 3. Group utterances by speaker; merge near-adjacent turns into clean ranges.
+    const merge = (segs, gap = 0.8) => {
+      const s = [...segs].sort((a, b) => a.startTime - b.startTime);
+      const out = [];
+      for (const x of s) {
+        const last = out[out.length - 1];
+        if (last && x.startTime - last.endTime <= gap) last.endTime = Math.max(last.endTime, x.endTime);
+        else out.push({ ...x });
+      }
+      return out;
+    };
+    const bySpeaker = new Map();
+    for (const u of (Array.isArray(data.utterances) ? data.utterances : [])) {
+      const k = u.speaker || '?';
+      if (!bySpeaker.has(k)) bySpeaker.set(k, { speaker: k, segments: [], sample: '' });
+      const g = bySpeaker.get(k);
+      const start = (u.start || 0) / 1000, end = (u.end || 0) / 1000;
+      if (end > start) {
+        g.segments.push({ startTime: start, endTime: end });
+        if (g.sample.length < 90 && u.text) g.sample = (g.sample ? `${g.sample} ` : '') + u.text;
+      }
+    }
+    const speakers = Array.from(bySpeaker.values()).map(s => {
+      const segments = merge(s.segments);
+      const totalSeconds = segments.reduce((sum, x) => sum + (x.endTime - x.startTime), 0);
+      return {
+        speaker: `Speaker ${s.speaker}`,
+        segments,
+        count: segments.length,
+        totalSeconds,
+        totalFormatted: this.formatTime(totalSeconds),
+        sample: s.sample.slice(0, 90),
+      };
+    }).sort((a, b) => b.totalSeconds - a.totalSeconds);
+
+    this.updateJob(jobId, { status: 'ready', step: 'speakers_ready', progress: 100, currentClip: '', speakers });
+    console.log(`[ManualClip ${jobId}] ✓ Detected ${speakers.length} speaker(s)`);
+    return { success: true, speakers };
   }
 
   getAudioDuration(audioPath) {
