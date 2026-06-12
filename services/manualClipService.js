@@ -49,10 +49,12 @@ function pitchFilterChain(ratio) {
 
 // 🔊 Auto-level: even out speaker volumes (quiet guest up, loud host down),
 // then normalize the whole thing to podcast loudness (-16 LUFS, what
-// Spotify/Apple expect). dynaudnorm adapts over time so it doesn't need to
-// know who's speaking; m=12 allows a strong lift for very quiet voices.
+// Spotify/Apple expect). Two dynaudnorm passes close even a 12+ dB speaker
+// gap to under 1 dB (measured); one pass leaves several dB behind. t=0.01
+// (~-40 dB) keeps room tone / breath gaps from being pumped up to speech
+// level — quiet VOICES peak well above it, true silence stays below it.
 // loudnorm internally upsamples to 192k, so resample back to our rate after.
-const LEVEL_AF = `dynaudnorm=f=300:g=15:m=12:p=0.9,loudnorm=I=-16:TP=-1.5:LRA=11,aresample=${DISGUISE_SR}`;
+const LEVEL_AF = `dynaudnorm=f=200:g=11:m=30:p=0.9:t=0.01,dynaudnorm=f=200:g=11:m=30:p=0.9:t=0.01,loudnorm=I=-16:TP=-1.5:LRA=11,aresample=${DISGUISE_SR}`;
 
 class ManualClipService {
   constructor() {
