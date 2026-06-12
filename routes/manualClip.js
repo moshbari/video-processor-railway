@@ -260,13 +260,13 @@ router.post('/generate/:jobId', async (req, res) => {
 router.post('/render-sequence/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
-    const { hooks, cuts, disguise, title, levelAudio } = req.body;
+    const { hooks, cuts, disguise, title, levelAudio, removeSilences } = req.body;
 
     const hookList = Array.isArray(hooks) ? hooks : [];
     const cutList = Array.isArray(cuts) ? cuts : [];
     const disguiseList = Array.isArray(disguise) ? disguise : [];
 
-    if (hookList.length === 0 && cutList.length === 0 && disguiseList.length === 0) {
+    if (hookList.length === 0 && cutList.length === 0 && disguiseList.length === 0 && !removeSilences) {
       return res.status(400).json({
         success: false,
         error: 'Add at least one hook, a section to remove, or a voice to disguise, first.'
@@ -329,7 +329,7 @@ router.post('/render-sequence/:jobId', async (req, res) => {
       message: `Building your video! Use the status endpoint to track progress.`
     });
 
-    manualClipService.renderPodcastSequence(jobId, hookList, { title, cuts: cutList, disguise: disguiseList, levelAudio: !!levelAudio, userId: req.headers['x-user-id'] || null })
+    manualClipService.renderPodcastSequence(jobId, hookList, { title, cuts: cutList, disguise: disguiseList, levelAudio: !!levelAudio, removeSilences: !!removeSilences, userId: req.headers['x-user-id'] || null })
       .catch(error => {
         // Free the heavy intermediates a failed render left behind (don't fill the disk).
         manualClipService.cleanupRenderTemp(jobId).catch(() => {});

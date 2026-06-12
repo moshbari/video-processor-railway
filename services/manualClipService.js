@@ -717,6 +717,7 @@ class ManualClipService {
     // already-disguised) source, so every hook AND the full video downstream
     // share the same balanced audio. If it fails we still render: an uneven mix
     // is annoying but not a privacy problem like a failed disguise would be.
+    const removeSilences = !!options.removeSilences;
     if (levelAudio) {
       this.updateJob(jobId, { step: 'leveling_audio', currentClip: 'Evening out speaker volumes…', progress: Math.round(disguiseTop) });
       const leveledPath = path.join(seqDir, 'leveled_source.mp4');
@@ -727,6 +728,28 @@ class ManualClipService {
         if (built) videoPath = built;
       } catch (err) {
         console.error(`[ManualClip ${jobId}] Auto-level failed (rendering without it):`, err.message);
+      }
+    }
+
+    // Step 0c: 🔇 Silence remover toggle — find the quiet gaps now and treat
+    // them as extra Danger Zone cuts on the FULL video. Hooks are untouched:
+    // their ranges were hand-picked. Detection runs on the (possibly disguised/
+    // leveled) source, which shares the original timeline, so timestamps line
+    // up with the user's cuts. Best-effort: a detection failure never blocks
+    // the render.
+    let silenceCuts = [];
+    if (removeSilences) {
+      this.updateJob(jobId, { step: 'detecting_silence', progress: 5, currentClip: 'Finding silent gaps…' });
+      try {
+        const silences = await this.detectSilences(videoPath, { thresholdDb: -30, minSilenceSec: 0.6 });
+        const pad = 0.1; // keep a hair of each gap so speech isn't clipped
+        silenceCuts = silences
+          .map(s => ({ startTime: s.start + pad, endTime: s.end - pad }))
+          .filter(c => c.endTime - c.startTime > 0.1);
+        const gapSeconds = silenceCuts.reduce((sum, c) => sum + (c.endTime - c.startTime), 0);
+        console.log(`  Silence remover: cutting ${silenceCuts.length} quiet gap(s) (${gapSeconds.toFixed(1)}s) from the full video`);
+      } catch (err) {
+        console.error(`[ManualClip ${jobId}] Silence detection failed (rendering without it):`, err.message);
       }
     }
 
@@ -758,7 +781,9 @@ class ManualClipService {
     // Step 2: Build the FINAL segment from the FULL source video. If the user
     // marked any "remove" sections (Danger Zone), cut those out first so the
     // full video at the end has them deleted; otherwise use the whole video.
-    const cuts = Array.isArray(options.cuts) ? options.cuts : [];
+    // User's Danger Zone cuts + auto-detected silence gaps, merged as one list
+    // (keepSegmentsFromRemovals de-overlaps them).
+    const cuts = [...(Array.isArray(options.cuts) ? options.cuts : []), ...silenceCuts];
     let fullSeconds = videoDuration || 0;
     let cutsApplied = false;
     let removedSeconds = 0;
