@@ -260,7 +260,7 @@ router.post('/generate/:jobId', async (req, res) => {
 router.post('/render-sequence/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
-    const { hooks, cuts, disguise, title } = req.body;
+    const { hooks, cuts, disguise, title, levelAudio } = req.body;
 
     const hookList = Array.isArray(hooks) ? hooks : [];
     const cutList = Array.isArray(cuts) ? cuts : [];
@@ -329,7 +329,7 @@ router.post('/render-sequence/:jobId', async (req, res) => {
       message: `Building your video! Use the status endpoint to track progress.`
     });
 
-    manualClipService.renderPodcastSequence(jobId, hookList, { title, cuts: cutList, disguise: disguiseList, userId: req.headers['x-user-id'] || null })
+    manualClipService.renderPodcastSequence(jobId, hookList, { title, cuts: cutList, disguise: disguiseList, levelAudio: !!levelAudio, userId: req.headers['x-user-id'] || null })
       .catch(error => {
         // Free the heavy intermediates a failed render left behind (don't fill the disk).
         manualClipService.cleanupRenderTemp(jobId).catch(() => {});
@@ -412,9 +412,9 @@ router.post('/remove-silence/:jobId', async (req, res) => {
 router.post('/voice-preview/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
-    const { startTime, endTime, preset } = req.body || {};
+    const { startTime, endTime, preset, level } = req.body || {};
     const result = await manualClipService.voicePreview(jobId, {
-      startTime, endTime, preset,
+      startTime, endTime, preset, level: !!level,
       userId: req.headers['x-user-id'] || null,
     });
     res.json({ success: true, ...result });

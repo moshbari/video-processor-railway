@@ -47,6 +47,13 @@ function pitchFilterChain(ratio) {
   return `aresample=${DISGUISE_SR},asetrate=${DISGUISE_SR}*${r},aresample=${DISGUISE_SR},atempo=${tempo}`;
 }
 
+// 🔊 Auto-level: even out speaker volumes (quiet guest up, loud host down),
+// then normalize the whole thing to podcast loudness (-16 LUFS, what
+// Spotify/Apple expect). dynaudnorm adapts over time so it doesn't need to
+// know who's speaking; m=12 allows a strong lift for very quiet voices.
+// loudnorm internally upsamples to 192k, so resample back to our rate after.
+const LEVEL_AF = `dynaudnorm=f=300:g=15:m=12:p=0.9,loudnorm=I=-16:TP=-1.5:LRA=11,aresample=${DISGUISE_SR}`;
+
 class ManualClipService {
   constructor() {
     this.tempDir = process.env.TEMP_DIR || '/app/temp';
@@ -683,6 +690,9 @@ class ManualClipService {
     // source first and use it for EVERYTHING below (hooks + full video), so the
     // disguise is consistent throughout the final render.
     const disguise = Array.isArray(options.disguise) ? options.disguise : [];
+    const levelAudio = !!options.levelAudio;
+    // Split the 2->5 progress band between the two audio passes when both run.
+    const disguiseTop = levelAudio ? 3.5 : 5;
     if (disguise.length > 0) {
       this.updateJob(jobId, { step: 'disguising_voices', currentClip: 'Disguising the marked voices…', progress: 2 });
       console.log(`  Disguising ${disguise.length} voice segment(s) before render`);
@@ -690,7 +700,7 @@ class ManualClipService {
       let built = null;
       try {
         built = await this.buildDisguisedSource(videoPath, disguise, videoDuration, disguisedPath, (pct) => {
-          this.updateJob(jobId, { progress: Math.round(2 + (pct / 100) * 3) }); // 2 -> 5
+          this.updateJob(jobId, { progress: Math.round(2 + (pct / 100) * (disguiseTop - 2)) }); // 2 -> 5 (or 3.5)
         });
       } catch (err) {
         // Disguise was requested — if it fails we must NOT fall through to a
@@ -699,6 +709,23 @@ class ManualClipService {
         throw new Error('Could not disguise the marked voices. Please try again.');
       }
       if (built) videoPath = built;
+    }
+
+    // Step 0b: 🔊 Auto-level voices — even out speaker volumes on the (possibly
+    // already-disguised) source, so every hook AND the full video downstream
+    // share the same balanced audio. If it fails we still render: an uneven mix
+    // is annoying but not a privacy problem like a failed disguise would be.
+    if (levelAudio) {
+      this.updateJob(jobId, { step: 'leveling_audio', currentClip: 'Evening out speaker volumes…', progress: Math.round(disguiseTop) });
+      const leveledPath = path.join(seqDir, 'leveled_source.mp4');
+      try {
+        const built = await this.buildLeveledSource(videoPath, videoDuration, leveledPath, (pct) => {
+          this.updateJob(jobId, { progress: Math.round(disguiseTop + (pct / 100) * (5 - disguiseTop)) }); // -> 5
+        });
+        if (built) videoPath = built;
+      } catch (err) {
+        console.error(`[ManualClip ${jobId}] Auto-level failed (rendering without it):`, err.message);
+      }
     }
 
     // Step 1: Extract each hook section at max quality, in order.
@@ -883,6 +910,8 @@ class ManualClipService {
     // the next render's final write fails ("Conversion failed!").
     await fs.remove(path.join(seqDir, 'disguised_source.mp4')).catch(() => {});
     await fs.remove(path.join(seqDir, 'disguised_source.mp4.filter.txt')).catch(() => {});
+    await fs.remove(path.join(seqDir, 'leveled_source.mp4')).catch(() => {});
+    await fs.remove(path.join(seqDir, 'leveled_source.mp4.audio.m4a')).catch(() => {});
     await fs.remove(path.join(seqDir, 'full_trimmed.mp4')).catch(() => {});
     await fs.remove(path.join(workDir, 'source.mp4')).catch(() => {});
     this.scheduleServerCopyCleanup(jobId, outputPath, r2Url ? 15 * 60 * 1000 : 6 * 60 * 60 * 1000);
@@ -1748,6 +1777,36 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return outputPath;
   }
 
+  /**
+   * 🔊 Build a copy of the video whose AUDIO is auto-leveled (speaker volumes
+   * evened out + podcast loudness). Video stream is copied — only the audio is
+   * rebuilt. Same audio-first-then-copy-mux pattern as buildDisguisedSource so
+   * long videos can't OOM the container.
+   */
+  async buildLeveledSource(videoPath, duration, outputPath, onProgress) {
+    const audioPath = `${outputPath}.audio.m4a`;
+    console.log('  [Level] Evening out speaker volumes — audio-first then copy-mux');
+
+    await this._runFfmpeg([
+      '-y', '-i', videoPath,
+      '-vn', '-af', LEVEL_AF,
+      '-c:a', 'aac', '-ar', String(DISGUISE_SR), '-ac', '2', '-b:a', '320k',
+      audioPath,
+    ], { duration, onProgress, label: 'Level audio' });
+
+    await this._runFfmpeg([
+      '-y', '-i', videoPath, '-i', audioPath,
+      '-map', '0:v:0', '-map', '1:a:0',
+      '-c:v', 'copy', '-c:a', 'copy',
+      '-movflags', '+faststart',
+      outputPath,
+    ], { label: 'Level mux' });
+
+    await fs.remove(audioPath).catch(() => {});
+    console.log('  [Level] ✓ done');
+    return outputPath;
+  }
+
   // Run one ffmpeg invocation as a promise, with optional progress reporting.
   _runFfmpeg(args, { duration, onProgress, label = 'ffmpeg' } = {}) {
     return new Promise((resolve, reject) => {
@@ -1776,7 +1835,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
    * applied, so the user can hear it and pick a voice before rendering. Returns
    * a public MP3 URL (kept briefly on R2). Capped to a few seconds.
    */
-  async voicePreview(jobId, { startTime, endTime, preset, userId } = {}) {
+  async voicePreview(jobId, { startTime, endTime, preset, level, userId } = {}) {
     // Stream just the needed seconds straight from R2 (no full download). Prefer
     // a local copy if the job already has one, else the public playback URL.
     const memJob = this.jobs.get(jobId);
@@ -1791,12 +1850,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     const videoPath = srcInput;
     const start = Math.max(0, parseFloat(startTime) || 0);
     const rawDur = Math.max(0, (parseFloat(endTime) || 0) - start);
-    const dur = Math.min(8, rawDur > 0 ? rawDur : 6); // preview at most 8s
+    // Leveling previews get a longer window — the listener needs to hear BOTH
+    // speakers (quiet and loud) to judge the balance.
+    const maxDur = level ? 20 : 8;
+    const dur = Math.min(maxDur, rawDur > 0 ? rawDur : 6);
 
     const ratio = DISGUISE_PRESETS[preset]?.ratio;
+    // Chain: disguise pitch first (if any), then leveling — same order as a render.
+    const afParts = [];
+    if (ratio) afParts.push(pitchFilterChain(ratio));
+    if (level) afParts.push(LEVEL_AF);
+    const af = afParts.join(',');
+    const tag = `${preset || 'orig'}${level ? '_lvl' : ''}`;
     const workDir = path.join(this.tempDir, `manual-${jobId}`, 'preview');
     await fs.ensureDir(workDir);
-    const outPath = path.join(workDir, `prev_${preset || 'orig'}_${Math.round(start)}.mp3`);
+    const outPath = path.join(workDir, `prev_${tag}_${Math.round(start)}.mp3`);
 
     await new Promise((resolve, reject) => {
       const args = [
@@ -1805,7 +1873,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         '-t', String(dur),
         '-i', videoPath,
         '-vn',
-        ...(ratio ? ['-af', pitchFilterChain(ratio)] : []),
+        ...(af ? ['-af', af] : []),
         '-c:a', 'libmp3lame',
         '-q:a', '4',
         outPath,
@@ -1817,11 +1885,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       proc.on('error', reject);
     });
 
-    const key = `manual-clip/${jobId}/preview/${preset || 'orig'}_${Math.round(start)}_${Math.round(dur)}.mp3`;
+    const key = `manual-clip/${jobId}/preview/${tag}_${Math.round(start)}_${Math.round(dur)}.mp3`;
     const up = await r2Service.uploadFile(outPath, key, 'audio/mpeg');
     // Clean the local copy soon; R2 keeps the short-lived preview.
     this.scheduleServerCopyCleanup(`${jobId}-prev`, outPath, 10 * 60 * 1000);
-    return { url: up.downloadUrl, preset: preset || null, durationPreviewed: dur };
+    return { url: up.downloadUrl, preset: preset || null, leveled: !!level, durationPreviewed: dur };
   }
 
   // ============================================================
