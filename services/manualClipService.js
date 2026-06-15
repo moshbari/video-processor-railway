@@ -1009,6 +1009,96 @@ class ManualClipService {
     });
   }
 
+  /**
+   * Stitch a FINISHED render together with inserted clips in ONE pass, so the
+   * existing render is re-encoded only ONCE — no extra quality loss beyond what
+   * a normal render already costs. The base render is input 0; each inserted
+   * clip is its own input. `items` is the ordered final timeline:
+   *   { type: 'base', start, end }     -> a slice taken from input 0 via trim
+   *   { type: 'clip', inputIndex }     -> a whole inserted-clip input
+   * Every segment is standardised to 1920x1080@30fps + stereo 48k and the joins
+   * are loudness-evened, exactly like concatenateSequence16x9 — but here the base
+   * is split+trimmed inside the same graph instead of being pre-cut to disk
+   * first (which would re-encode it a second time).
+   */
+  concatRenderWithInserts(inputPaths, items, outputPath, totalSeconds, onProgress) {
+    return new Promise((resolve, reject) => {
+      (async () => {
+        const inputArgs = inputPaths.flatMap(p => ['-i', p]);
+        const baseItems = items.filter(it => it.type === 'base');
+        const baseCount = baseItems.length;
+
+        const V = '[%I%:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p';
+        const A = '[%I%:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo';
+
+        const parts = [];
+        // Split input 0 (the render) into one branch per base slice, so the same
+        // source stream can be trimmed into several non-overlapping pieces.
+        if (baseCount > 0) {
+          parts.push(`[0:v]split=${baseCount}${baseItems.map((_, i) => `[bv${i}]`).join('')}`);
+          parts.push(`[0:a]asplit=${baseCount}${baseItems.map((_, i) => `[ba${i}]`).join('')}`);
+        }
+
+        let bIdx = 0;
+        const concatLabels = [];
+        items.forEach((it, j) => {
+          if (it.type === 'base') {
+            const s = Number(it.start).toFixed(3);
+            const e = Number(it.end).toFixed(3);
+            parts.push(`[bv${bIdx}]trim=start=${s}:end=${e},setpts=PTS-STARTPTS,scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v${j}]`);
+            parts.push(`[ba${bIdx}]atrim=start=${s}:end=${e},asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${j}]`);
+            bIdx++;
+          } else {
+            parts.push(`${V.replace('%I%', it.inputIndex)}[v${j}]`);
+            parts.push(`${A.replace('%I%', it.inputIndex)}[a${j}]`);
+          }
+          concatLabels.push(`[v${j}][a${j}]`);
+        });
+        parts.push(`${concatLabels.join('')}concat=n=${items.length}:v=1:a=1[outv][preAudio]`);
+        parts.push(`[preAudio]loudnorm=I=-16:TP=-1.5:LRA=11[outa]`);
+
+        // Pass the (potentially large) graph via a script file — no arg-length limit.
+        const filterPath = `${outputPath}.filter.txt`;
+        await fs.writeFile(filterPath, parts.join(';'));
+
+        const args = [
+          '-y',
+          ...inputArgs,
+          '-filter_complex_script', filterPath,
+          '-map', '[outv]',
+          '-map', '[outa]',
+          '-c:v', 'libx264',
+          '-preset', 'medium',
+          '-crf', '20',
+          '-c:a', 'aac',
+          '-b:a', '320k',
+          '-movflags', '+faststart',
+          outputPath
+        ];
+
+        console.log(`  [InsertConcat] ${items.length} segment(s) (base re-encoded once) -> 1920x1080@30fps + loudnorm`);
+        const proc = spawn('ffmpeg', args);
+        let stderr = '';
+        proc.stderr.on('data', (d) => {
+          const s = d.toString();
+          stderr += s;
+          if (stderr.length > 20000) stderr = stderr.slice(-10000);
+          const m = s.match(/time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})/);
+          if (m && onProgress && totalSeconds > 0) {
+            const cur = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 100;
+            onProgress(Math.min(100, (cur / totalSeconds) * 100));
+          }
+        });
+        proc.on('close', async (code) => {
+          await fs.remove(filterPath).catch(() => {});
+          if (code === 0) { console.log('  [InsertConcat] ✓ done'); resolve(outputPath); }
+          else { console.error(stderr.slice(-800)); reject(new Error('Could not stitch the new video. Please try again.')); }
+        });
+        proc.on('error', (err) => reject(err));
+      })().catch(reject);
+    });
+  }
+
   // ============================================================
   // 🔇 ONE-CLICK SILENCE REMOVER
   // ============================================================
@@ -1327,40 +1417,43 @@ class ManualClipService {
       .filter(p => p.clipUrls.length > 0)
       .sort((a, b) => (a.at - b.at) || (a._i - b._i));
 
-    // 5. Build the segment list: base slice, clip(s), base slice, clip(s)… so
-    //    each clip is spliced IN at its time and the rest of the video slides
-    //    later. extractClipMaxQuality cuts the base at the exact split points.
+    // 5. Build the ordered timeline: base slice, clip(s), base slice, clip(s)…
+    //    so each clip is spliced IN at its time and the rest of the video slides
+    //    later. We DON'T pre-cut the base to disk (that would re-encode it an
+    //    extra time, costing quality) — instead the base render is input 0 and
+    //    gets split+trimmed inside the single stitch pass below, so the existing
+    //    video is re-encoded only once. Each inserted clip is its own input.
     this.updateJob(jobId, { step: 'cutting_render', progress: 32, currentClip: 'Placing your clips…' });
-    const segmentPaths = [];
+    const inputPaths = [basePath];
+    const items = [];
     let cursor = 0;
-    let sliceNo = 0;
     for (const p of pts) {
       if (p.at > cursor + 0.05) {
-        const segPath = path.join(seqDir, `base_${String(++sliceNo).padStart(2, '0')}.mp4`);
-        await this.extractClipMaxQuality(basePath, cursor, p.at, segPath);
-        segmentPaths.push(segPath);
+        items.push({ type: 'base', start: cursor, end: p.at });
         cursor = p.at;
       }
       for (const u of p.clipUrls) {
         const lp = localByUrl.get(u);
-        if (lp) segmentPaths.push(lp);
+        if (lp) {
+          // A clip used at two spots becomes two inputs of the same file — fine.
+          inputPaths.push(lp);
+          items.push({ type: 'clip', inputIndex: inputPaths.length - 1 });
+        }
       }
     }
     // Whatever is left of the original video after the last insertion point.
     if (cursor < baseDuration - 0.05) {
-      const segPath = path.join(seqDir, `base_${String(++sliceNo).padStart(2, '0')}.mp4`);
-      await this.extractClipMaxQuality(basePath, cursor, baseDuration, segPath);
-      segmentPaths.push(segPath);
+      items.push({ type: 'base', start: cursor, end: baseDuration });
     }
 
-    if (segmentPaths.length < 2) throw new Error('Nothing to add. Please add at least one clip.');
+    if (items.length < 2) throw new Error('Nothing to add. Please add at least one clip.');
 
-    // 6. Stitch everything into one 16:9 file — same path the podcast render
-    //    uses, so mixed sources/sizes join seamlessly and loudness is evened out.
+    // 6. Stitch everything into one 16:9 file in a single pass (mixed sources/
+    //    sizes join seamlessly, loudness is evened out, base encoded just once).
     this.updateJob(jobId, { step: 'concatenating', progress: 38, currentClip: 'Stitching your new video together…' });
     const totalSeconds = baseDuration + clipsTotalSeconds;
     const outputPath = path.join(seqDir, 'render_with_inserts.mp4');
-    await this.concatenateSequence16x9(segmentPaths, outputPath, totalSeconds, (pct) => {
+    await this.concatRenderWithInserts(inputPaths, items, outputPath, totalSeconds, (pct) => {
       this.updateJob(jobId, { progress: Math.round(38 + (pct / 100) * 54) }); // 38 -> 92
     });
 
@@ -1435,13 +1528,10 @@ class ManualClipService {
       }
     }
 
-    // 9. Clean up: drop the base slices + downloaded clips + base render now;
-    //    keep the finished file on disk for a grace window for direct download.
+    // 9. Clean up: drop the downloaded clips + the base render copy now; keep the
+    //    finished file on disk for a grace window for the direct download.
     for (const lp of localByUrl.values()) await fs.remove(lp).catch(() => {});
     await fs.remove(basePath).catch(() => {});
-    for (const sp of segmentPaths) {
-      if (sp !== outputPath && sp.startsWith(seqDir)) await fs.remove(sp).catch(() => {});
-    }
     this.scheduleServerCopyCleanup(jobId, outputPath, r2Url ? 15 * 60 * 1000 : 6 * 60 * 60 * 1000);
 
     return {
