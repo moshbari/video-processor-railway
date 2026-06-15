@@ -458,6 +458,132 @@ router.post('/detect-speakers/:jobId', async (req, res) => {
 });
 
 // ============================================================
+// POST /api/manual-clip/fetch-clip
+// ➕ Fetch ONE clip to insert into a finished render, from ANY source —
+// a URL (Tella / YouTube / TikTok / Instagram / Drive link, etc.) OR an
+// uploaded file — and park it on R2. Returns a jobId immediately; the frontend
+// polls /status/:jobId and reads generatedClips[0] (downloadUrl + duration)
+// once status === 'complete'. Async because Tella exports can take minutes.
+// Accepts: video file upload OR { url } in body.
+// ============================================================
+router.post('/fetch-clip', upload.single('video'), async (req, res) => {
+  try {
+    const { url } = req.body;
+
+    if (!url && !req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please provide a clip URL or upload a clip file.'
+      });
+    }
+
+    const jobId = require('crypto').randomUUID();
+
+    // Seed status BEFORE responding so the first poll can't 404.
+    manualClipService.updateJob(jobId, {
+      status: 'generating', step: 'queued', progress: 1,
+      currentClip: 'Starting…', generatedClips: [], error: null,
+    });
+
+    console.log(`\n[ManualClip] Fetch-clip request (${url ? 'URL' : 'upload'}) -> job ${jobId}`);
+
+    res.json({
+      success: true,
+      jobId,
+      message: 'Fetching your clip! Use the status endpoint to track progress.'
+    });
+
+    const input = {};
+    if (url) {
+      input.url = url;
+    } else {
+      input.videoPath = req.file.path;
+      input.originalFilename = req.file.originalname;
+    }
+
+    manualClipService.fetchInsertClip(jobId, input).catch(error => {
+      console.error('[ManualClip] Fetch-clip failed:', error.message);
+      let friendly = 'Could not fetch that clip. Please try again.';
+      if (/Tella/i.test(error.message)) {
+        friendly = error.message.replace(/^Tella download failed:\s*/i, '');
+      } else if (/Unsupported/i.test(error.message)) {
+        friendly = 'This link is not supported. Try a YouTube, TikTok, Instagram, Tella, or other supported link.';
+      } else if (/too large|too long|not found/i.test(error.message)) {
+        friendly = error.message;
+      }
+      manualClipService.updateJob(jobId, { status: 'error', error: friendly });
+    });
+
+  } catch (error) {
+    console.error('[ManualClip] Fetch-clip route error:', error);
+    res.status(500).json({ success: false, error: 'Could not start fetching the clip. Please try again.' });
+  }
+});
+
+// ============================================================
+// POST /api/manual-clip/insert/:renderId
+// ➕ Add clips to a FINISHED render: splice already-fetched clips into the
+// rendered video at chosen time points, then stitch into ONE new 16:9 file.
+// Saved as a NEW render — the original is untouched. Returns a fresh jobId;
+// the frontend polls /status/:jobId (and can download from /download/:jobId).
+// Body: { points: [{ atTime: Number|null, clipUrls: [String] }], title }
+//   atTime = seconds into the finished video (null/past-the-end = at the end).
+// ============================================================
+router.post('/insert/:renderId', async (req, res) => {
+  try {
+    const { renderId } = req.params;
+    const { points, title } = req.body || {};
+
+    const list = Array.isArray(points) ? points : [];
+    const hasClips = list.some(p =>
+      p && Array.isArray(p.clipUrls) && p.clipUrls.filter(Boolean).length > 0
+    );
+    if (!hasClips) {
+      return res.status(400).json({
+        success: false,
+        error: 'Add at least one clip to insert first.'
+      });
+    }
+
+    const jobId = require('crypto').randomUUID();
+
+    // Seed status BEFORE responding so the first poll can't 404.
+    manualClipService.updateJob(jobId, {
+      status: 'generating', step: 'queued', progress: 1,
+      totalClips: 1, completedClips: 0,
+      currentClip: 'Starting…', generatedClips: [], error: null,
+    });
+
+    console.log(`\n[ManualClip] Insert-clips request for render ${renderId} -> job ${jobId} (${list.length} point(s))`);
+
+    res.json({
+      success: true,
+      jobId,
+      message: 'Adding your clips! Use the status endpoint to track progress.'
+    });
+
+    manualClipService.insertClipsIntoRender(jobId, renderId, list, {
+      title,
+      userId: req.headers['x-user-id'] || null,
+    }).catch(error => {
+      // Free the heavy intermediates a failed render left behind.
+      manualClipService.cleanupRenderTemp(jobId).catch(() => {});
+      console.error('[ManualClip] Insert clips failed:', error.message);
+      manualClipService.updateJob(jobId, {
+        status: 'error',
+        error: (error.message && error.message.length < 140)
+          ? error.message
+          : 'Adding your clips failed. Please try again.'
+      });
+    });
+
+  } catch (error) {
+    console.error('[ManualClip] Insert route error:', error);
+    res.status(500).json({ success: false, error: 'Could not start adding your clips. Please try again.' });
+  }
+});
+
+// ============================================================
 // GET /api/manual-clip/status/:jobId
 // Check progress of preparation or generation
 // ============================================================

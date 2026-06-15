@@ -1179,6 +1179,280 @@ class ManualClipService {
     };
   }
 
+  // ============================================================
+  // ➕ ADD CLIPS TO A FINISHED RENDER
+  // Splice extra clips (from ANY source) into an already-rendered video at
+  // chosen time points, then stitch it all back into ONE new 16:9 file. The
+  // original render is never touched — the result is saved as a NEW render.
+  // ============================================================
+
+  /**
+   * Fetch ONE clip to insert, from any source — a URL (Tella / YouTube / TikTok /
+   * Instagram / Google Drive link, etc.) OR an uploaded file — and park it on R2
+   * so the insert-render step can pull it down. Reuses the exact same downloader
+   * the main Clip Maker input uses, so every source it supports works here too.
+   * Runs in the background; the frontend polls /status/:jobId and reads
+   * generatedClips[0] (downloadUrl + duration) once status === 'complete'.
+   *
+   * @param {string} jobId - status/polling id for this fetch
+   * @param {Object} input - { url } OR { videoPath, originalFilename }
+   */
+  async fetchInsertClip(jobId, input) {
+    const workDir = path.join(this.tempDir, `insert-fetch-${jobId}`);
+    await fs.ensureDir(workDir);
+
+    this.updateJob(jobId, {
+      status: 'generating', step: 'fetching_clip', progress: 5,
+      currentClip: 'Getting your clip…', generatedClips: [], error: null,
+    });
+
+    let videoPath;
+    let title = 'Clip';
+    let duration = 0;
+
+    if (input.url) {
+      console.log(`[InsertClip ${jobId}] Fetching from URL: ${input.url}`);
+      const dl = await downloadService.downloadVideo(input.url, `insert-${jobId}`);
+      videoPath = dl.videoPath;
+      title = dl.title || 'Clip';
+      duration = dl.duration || 0;
+    } else if (input.videoPath) {
+      videoPath = input.videoPath;
+      if (input.originalFilename) title = path.parse(input.originalFilename).name;
+    } else {
+      throw new Error('Please provide a clip URL or upload a clip file.');
+    }
+
+    if (!duration) duration = await this.getVideoDuration(videoPath).catch(() => 0);
+
+    this.updateJob(jobId, { step: 'saving_clip', progress: 55, currentClip: 'Saving your clip…' });
+
+    // Park it under its own prefix (not the permanent renders/sources) so it can
+    // be cleaned up later without touching anyone's library.
+    const key = `manual-clip-inserts/${jobId}.mp4`;
+    const up = await r2Service.uploadFile(videoPath, key, 'video/mp4');
+
+    const clip = {
+      clipNumber: 1,
+      title,
+      duration,
+      durationFormatted: this.formatTime(duration),
+      downloadUrl: up.downloadUrl,
+      r2Key: key,
+      isInsertClip: true,
+    };
+
+    this.updateJob(jobId, {
+      status: 'complete', step: 'done', progress: 100,
+      currentClip: '', generatedClips: [clip], completedAt: new Date().toISOString(),
+    });
+
+    await fs.remove(workDir).catch(() => {});
+    console.log(`[InsertClip ${jobId}] ✓ Clip ready: ${up.downloadUrl} (${this.formatTime(duration)})`);
+    return clip;
+  }
+
+  /**
+   * Splice already-fetched clips into a FINISHED render at chosen time points and
+   * stitch the result into ONE new 16:9 file. Each "point" is { atTime, clipUrls }:
+   * `atTime` is the number of seconds INTO the finished video where the clip(s)
+   * go — everything after it slides later, nothing is covered or replaced. An
+   * `atTime` of null (or past the end of the render) means "at the very end".
+   * Unlimited points, unlimited clips per point. Saved as a NEW render; the
+   * original render is left untouched.
+   *
+   * @param {string} jobId     - status/polling id for THIS insert render
+   * @param {string} renderId  - the finished render to add clips to
+   * @param {Array}  points    - [{ atTime:Number|null, clipUrls:[String] }]
+   * @param {Object} options   - { userId, title }
+   */
+  async insertClipsIntoRender(jobId, renderId, points, options = {}) {
+    const userId = options.userId || null;
+
+    this.updateJob(jobId, {
+      status: 'generating', step: 'starting_insert', progress: 0,
+      totalClips: 1, completedClips: 0,
+      currentClip: 'Opening your rendered video…', generatedClips: [], error: null,
+    });
+
+    // 1. Find the finished render (user's library first, then the public one).
+    const record = (await manualVideoLibraryService.getRender(userId, renderId))
+      || (await manualVideoLibraryService.getRender(null, renderId));
+    if (!record) throw new Error('That rendered video is no longer available.');
+
+    const workDir = path.join(this.tempDir, `insert-${jobId}`);
+    const seqDir = path.join(workDir, 'sequence');
+    await fs.ensureDir(seqDir);
+
+    // 2. Bring the finished render down from R2.
+    this.updateJob(jobId, { step: 'downloading_render', progress: 6, currentClip: 'Loading your video…' });
+    const baseUrl = record.downloadUrl || (record.r2Key ? r2Service.getPublicUrl(record.r2Key) : null);
+    if (!baseUrl) throw new Error('That rendered video is no longer available.');
+    const basePath = path.join(workDir, 'base_render.mp4');
+    await r2Service.downloadFile(baseUrl, basePath);
+    const baseDuration = await this.getVideoDuration(basePath).catch(() => record.duration || 0);
+
+    // 3. Download every clip to insert (dedupe by URL so a clip used at two
+    //    points only downloads once).
+    const urls = [];
+    for (const p of (points || [])) {
+      for (const u of (Array.isArray(p.clipUrls) ? p.clipUrls : [])) {
+        if (u && !urls.includes(u)) urls.push(u);
+      }
+    }
+    if (urls.length === 0) throw new Error('Add at least one clip to insert.');
+
+    const localByUrl = new Map();
+    let clipsTotalSeconds = 0;
+    for (let i = 0; i < urls.length; i++) {
+      this.updateJob(jobId, {
+        step: `downloading_clip_${i + 1}`,
+        progress: Math.round(8 + (i / urls.length) * 22), // 8 -> 30
+        currentClip: `Fetching clip ${i + 1} of ${urls.length}…`,
+      });
+      const clipPath = path.join(workDir, `insert_${i + 1}.mp4`);
+      await r2Service.downloadFile(urls[i], clipPath);
+      localByUrl.set(urls[i], clipPath);
+      clipsTotalSeconds += await this.getVideoDuration(clipPath).catch(() => 0);
+    }
+
+    // 4. Normalise + sort the insertion points by time. null / past-the-end -> end.
+    const pts = (points || [])
+      .map((p, i) => {
+        const raw = (p.atTime === null || p.atTime === undefined) ? baseDuration : parseFloat(p.atTime);
+        const at = Math.max(0, Math.min(Number.isFinite(raw) ? raw : baseDuration, baseDuration));
+        const clipUrls = (Array.isArray(p.clipUrls) ? p.clipUrls : []).filter(Boolean);
+        return { at, clipUrls, _i: i };
+      })
+      .filter(p => p.clipUrls.length > 0)
+      .sort((a, b) => (a.at - b.at) || (a._i - b._i));
+
+    // 5. Build the segment list: base slice, clip(s), base slice, clip(s)… so
+    //    each clip is spliced IN at its time and the rest of the video slides
+    //    later. extractClipMaxQuality cuts the base at the exact split points.
+    this.updateJob(jobId, { step: 'cutting_render', progress: 32, currentClip: 'Placing your clips…' });
+    const segmentPaths = [];
+    let cursor = 0;
+    let sliceNo = 0;
+    for (const p of pts) {
+      if (p.at > cursor + 0.05) {
+        const segPath = path.join(seqDir, `base_${String(++sliceNo).padStart(2, '0')}.mp4`);
+        await this.extractClipMaxQuality(basePath, cursor, p.at, segPath);
+        segmentPaths.push(segPath);
+        cursor = p.at;
+      }
+      for (const u of p.clipUrls) {
+        const lp = localByUrl.get(u);
+        if (lp) segmentPaths.push(lp);
+      }
+    }
+    // Whatever is left of the original video after the last insertion point.
+    if (cursor < baseDuration - 0.05) {
+      const segPath = path.join(seqDir, `base_${String(++sliceNo).padStart(2, '0')}.mp4`);
+      await this.extractClipMaxQuality(basePath, cursor, baseDuration, segPath);
+      segmentPaths.push(segPath);
+    }
+
+    if (segmentPaths.length < 2) throw new Error('Nothing to add. Please add at least one clip.');
+
+    // 6. Stitch everything into one 16:9 file — same path the podcast render
+    //    uses, so mixed sources/sizes join seamlessly and loudness is evened out.
+    this.updateJob(jobId, { step: 'concatenating', progress: 38, currentClip: 'Stitching your new video together…' });
+    const totalSeconds = baseDuration + clipsTotalSeconds;
+    const outputPath = path.join(seqDir, 'render_with_inserts.mp4');
+    await this.concatenateSequence16x9(segmentPaths, outputPath, totalSeconds, (pct) => {
+      this.updateJob(jobId, { progress: Math.round(38 + (pct / 100) * 54) }); // 38 -> 92
+    });
+
+    if (!await fs.pathExists(outputPath)) {
+      throw new Error('The new video could not be created. Please try again.');
+    }
+
+    // 7. Make it downloadable straight from this server immediately, then push
+    //    the durable copy to R2 (same pattern as the podcast render).
+    const baseTitle = options.title || record.title || 'Video';
+    const safeTitle = this.sanitizeFilename(baseTitle);
+    const downloadName = `${safeTitle || 'video'}_plus_clips.mp4`;
+    const finalDuration = await this.getVideoDuration(outputPath).catch(() => totalSeconds);
+    const serverDownloadUrl = `${this.publicBaseUrl()}/api/manual-clip/download/${jobId}`;
+
+    this.updateJob(jobId, {
+      step: 'uploading', progress: 94,
+      currentClip: 'Your video is ready — saving a cloud copy…',
+      serverDownload: { path: outputPath, filename: downloadName },
+      serverDownloadUrl,
+    });
+
+    const r2FileName = `manual-clips/${jobId}/render_with_inserts_${safeTitle}.mp4`;
+    let r2Url = null;
+    try {
+      const up = await r2Service.uploadFile(outputPath, r2FileName);
+      r2Url = up.downloadUrl;
+    } catch (err) {
+      console.error(`[InsertClip ${jobId}] R2 upload failed, serving local copy:`, err.message);
+    }
+
+    const insertedCount = pts.reduce((n, p) => n + p.clipUrls.length, 0);
+    const resultClip = {
+      clipNumber: 1,
+      title: `${baseTitle} — +${insertedCount} clip${insertedCount !== 1 ? 's' : ''}`,
+      isInsertResult: true,
+      insertedCount,
+      duration: finalDuration,
+      durationFormatted: this.formatTime(finalDuration),
+      downloadUrl: r2Url || serverDownloadUrl,
+      serverDownloadUrl,
+      hasCaptions: false,
+    };
+
+    this.updateJob(jobId, {
+      status: 'complete', step: 'done', progress: 100,
+      completedClips: 1, currentClip: '',
+      generatedClips: [resultClip], completedAt: new Date().toISOString(),
+    });
+
+    console.log(`[InsertClip ${jobId}] ✓ Added ${insertedCount} clip(s) to render ${renderId}: ${resultClip.downloadUrl}`);
+
+    // 8. Save the result as a NEW render (only once it's safely on R2, so a
+    //    server-only URL can't die on restart).
+    if (r2Url) {
+      try {
+        let renderSize = 0;
+        try { renderSize = (await fs.stat(outputPath)).size; } catch { /* best-effort */ }
+        await manualVideoLibraryService.addRender(userId, {
+          title: resultClip.title,
+          downloadUrl: r2Url,
+          r2Key: r2FileName,
+          fileSize: renderSize,
+          duration: finalDuration,
+          durationFormatted: this.formatTime(finalDuration),
+          sourceJobId: record.sourceJobId || null,
+          hookCount: 0,
+          createdAt: new Date().toISOString(),
+        });
+      } catch (libErr) {
+        console.error(`[InsertClip ${jobId}] Could not save render to library:`, libErr.message);
+      }
+    }
+
+    // 9. Clean up: drop the base slices + downloaded clips + base render now;
+    //    keep the finished file on disk for a grace window for direct download.
+    for (const lp of localByUrl.values()) await fs.remove(lp).catch(() => {});
+    await fs.remove(basePath).catch(() => {});
+    for (const sp of segmentPaths) {
+      if (sp !== outputPath && sp.startsWith(seqDir)) await fs.remove(sp).catch(() => {});
+    }
+    this.scheduleServerCopyCleanup(jobId, outputPath, r2Url ? 15 * 60 * 1000 : 6 * 60 * 60 * 1000);
+
+    return {
+      success: true,
+      jobId,
+      downloadUrl: resultClip.downloadUrl,
+      serverDownloadUrl,
+      clips: [resultClip],
+    };
+  }
+
   /**
    * Turn the user's "remove these ranges" list into the segments to KEEP.
    * Clamps each range to the video, merges overlapping/adjacent removals, then
@@ -2111,6 +2385,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     await fs.remove(path.join(workDir, 'source.mp4')).catch(() => {});
     await fs.remove(path.join(workDir, 'sections')).catch(() => {});
     await fs.remove(path.join(workDir, 'desilence')).catch(() => {});
+    // ➕ Add-clips-to-render uses its own temp dirs.
+    await fs.remove(path.join(this.tempDir, `insert-${jobId}`)).catch(() => {});
+    await fs.remove(path.join(this.tempDir, `insert-fetch-${jobId}`)).catch(() => {});
     console.log(`[ManualClip ${jobId}] Cleaned up render temp after failure`);
   }
 
