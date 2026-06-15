@@ -712,6 +712,7 @@ router.post('/restore/:jobId', async (req, res) => {
       hooks: record.hooks || [],
       cuts: record.cuts || [],
       disguise: record.disguise || [],
+      inserts: record.inserts || [],
     });
   } catch (error) {
     console.error('[ManualClip] Restore error:', error);
@@ -770,6 +771,25 @@ router.put('/library/:jobId/disguise', async (req, res) => {
   } catch (error) {
     console.error('[ManualClip] Save disguise error:', error);
     res.status(500).json({ success: false, error: 'Could not save your voice-disguise settings.' });
+  }
+});
+
+// ============================================================
+// PUT /api/manual-clip/library/:jobId/inserts
+// Auto-save the user's added clips / CTAs for a saved video, so reopening the
+// project brings them back like hooks/cuts.
+// Body: { inserts: [{ atTime: Number|null, clipUrls: [String] }] }
+// ============================================================
+router.put('/library/:jobId/inserts', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const { inserts } = req.body;
+    await manualVideoLibraryService.updateInserts(userId, jobId, inserts || []);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[ManualClip] Save inserts error:', error);
+    res.status(500).json({ success: false, error: 'Could not save your added clips.' });
   }
 });
 

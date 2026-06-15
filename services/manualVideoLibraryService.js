@@ -135,6 +135,29 @@ class ManualVideoLibraryService {
   }
 
   /**
+   * Save the user's added clips / CTAs for one video (auto-save from the editor),
+   * so reopening the project brings them back like hooks/cuts. Stored lean:
+   * { atTime: Number|null (null = at the very end), clipUrls: [String R2 urls] }.
+   */
+  async updateInserts(userId, jobId, inserts) {
+    const lean = (Array.isArray(inserts) ? inserts : [])
+      .map(p => ({
+        atTime: (p.atTime === null || p.atTime === undefined) ? null : Number(p.atTime),
+        clipUrls: (Array.isArray(p.clipUrls) ? p.clipUrls : []).filter(Boolean).map(String),
+      }))
+      .filter(p => p.clipUrls.length > 0);
+    for (const owner of [userId, null]) {
+      const data = await this.load(owner);
+      const v = data.videos.find(x => x.jobId === jobId);
+      if (v) {
+        v.inserts = lean;
+        await this.save(owner, data);
+        return;
+      }
+    }
+  }
+
+  /**
    * Merge a patch into one saved video record (e.g. after re-encoding it to
    * match YouTube timestamps: new sourceKey/playbackUrl/duration/waveform +
    * a `normalized` flag). Looks in the user's library first, then the public
