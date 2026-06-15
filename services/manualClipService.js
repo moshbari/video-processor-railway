@@ -835,6 +835,25 @@ class ManualClipService {
       throw new Error('The final video could not be created. Please try again.');
     }
 
+    // ➕ Weave in any outside clips (CTAs) the user lined up in the editor, at
+    // their chosen times in the FINAL video. We splice them into the just-built
+    // podcast file and overwrite it, so everything below sees the woven result.
+    // If the user explicitly added clips and weaving fails, fail loudly rather
+    // than quietly handing back a video that's missing their CTAs.
+    const inserts = Array.isArray(options.inserts) ? options.inserts : [];
+    const insertedClipCount = inserts.reduce((n, p) =>
+      n + (Array.isArray(p.clipUrls) ? p.clipUrls.filter(Boolean).length : 0), 0);
+    if (insertedClipCount > 0) {
+      this.updateJob(jobId, { step: 'adding_clips', progress: 90, currentClip: 'Adding your extra clips…' });
+      const woven = await this.weaveInsertsIntoFile(outputPath, inserts, seqDir, jobId, (pct) => {
+        this.updateJob(jobId, { progress: Math.round(90 + (pct / 100) * 3) }); // 90 -> 93
+      }).catch((err) => {
+        console.error(`[ManualClip ${jobId}] Weaving extra clips failed:`, err.message);
+        throw new Error('Built the video, but could not add your extra clips. Please check the links and try again.');
+      });
+      if (woven) await fs.move(woven, outputPath, { overwrite: true });
+    }
+
     // Step 4: The finished render is on local disk now. Make it downloadable
     // straight from THIS server immediately — so the user can grab it without
     // waiting for the (sometimes slow) cloud upload. R2 is still the durable
@@ -869,6 +888,7 @@ class ManualClipService {
     const titleParts = [];
     if (totalHooks > 0) titleParts.push(`${totalHooks} Hook${totalHooks !== 1 ? 's' : ''}`);
     titleParts.push('Full Video');
+    if (insertedClipCount > 0) titleParts.push(`${insertedClipCount} Clip${insertedClipCount !== 1 ? 's' : ''}`);
     let sequenceTitle = `${videoTitle} — ${titleParts.join(' + ')}`;
     if (cutsApplied) sequenceTitle += ` (−${this.formatTime(removedSeconds)} removed)`;
 
@@ -1097,6 +1117,71 @@ class ManualClipService {
         proc.on('error', (err) => reject(err));
       })().catch(reject);
     });
+  }
+
+  /**
+   * Weave already-fetched outside clips (CTAs) into a finished video file at
+   * chosen time points, and return the path to the woven result (or null if
+   * there was nothing to weave). Used by the editor's Render Podcast so the user
+   * can line up CTAs while editing and get them spliced into the final video in
+   * the same flow. `inserts` is [{ atTime:Number|null, clipUrls:[String] }] where
+   * atTime is seconds into the FINAL video (null / past-the-end = at the end).
+   */
+  async weaveInsertsIntoFile(basePath, inserts, workDir, jobId, onProgress) {
+    const baseDuration = await this.getVideoDuration(basePath).catch(() => 0);
+
+    // Download every clip to weave (dedupe by URL).
+    const urls = [];
+    for (const p of (inserts || [])) {
+      for (const u of (Array.isArray(p.clipUrls) ? p.clipUrls : [])) {
+        if (u && !urls.includes(u)) urls.push(u);
+      }
+    }
+    if (urls.length === 0) return null;
+
+    const localByUrl = new Map();
+    let clipsTotalSeconds = 0;
+    for (let i = 0; i < urls.length; i++) {
+      const clipPath = path.join(workDir, `weave_${i + 1}.mp4`);
+      await r2Service.downloadFile(urls[i], clipPath);
+      localByUrl.set(urls[i], clipPath);
+      clipsTotalSeconds += await this.getVideoDuration(clipPath).catch(() => 0);
+    }
+
+    // Normalise + sort the insertion points (null / past-the-end -> end).
+    const pts = (inserts || [])
+      .map((p, i) => {
+        const raw = (p.atTime === null || p.atTime === undefined) ? baseDuration : parseFloat(p.atTime);
+        const at = Math.max(0, Math.min(Number.isFinite(raw) ? raw : baseDuration, baseDuration));
+        const clipUrls = (Array.isArray(p.clipUrls) ? p.clipUrls : []).filter(Boolean);
+        return { at, clipUrls, _i: i };
+      })
+      .filter(p => p.clipUrls.length > 0)
+      .sort((a, b) => (a.at - b.at) || (a._i - b._i));
+
+    // Build the ordered timeline (base slices via trim of input 0 + clip inputs).
+    const inputPaths = [basePath];
+    const items = [];
+    let cursor = 0;
+    for (const p of pts) {
+      if (p.at > cursor + 0.05) { items.push({ type: 'base', start: cursor, end: p.at }); cursor = p.at; }
+      for (const u of p.clipUrls) {
+        const lp = localByUrl.get(u);
+        if (lp) { inputPaths.push(lp); items.push({ type: 'clip', inputIndex: inputPaths.length - 1 }); }
+      }
+    }
+    if (cursor < baseDuration - 0.05) items.push({ type: 'base', start: cursor, end: baseDuration });
+
+    if (items.length < 2) {
+      for (const lp of localByUrl.values()) await fs.remove(lp).catch(() => {});
+      return null;
+    }
+
+    const output = path.join(workDir, 'woven_with_inserts.mp4');
+    await this.concatRenderWithInserts(inputPaths, items, output, baseDuration + clipsTotalSeconds, onProgress);
+    for (const lp of localByUrl.values()) await fs.remove(lp).catch(() => {});
+    console.log(`[ManualClip ${jobId}] ✓ Wove ${items.filter(it => it.type === 'clip').length} extra clip(s) into the final video`);
+    return output;
   }
 
   // ============================================================

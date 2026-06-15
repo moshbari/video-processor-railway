@@ -260,16 +260,19 @@ router.post('/generate/:jobId', async (req, res) => {
 router.post('/render-sequence/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
-    const { hooks, cuts, disguise, title, levelAudio, removeSilences } = req.body;
+    const { hooks, cuts, disguise, title, levelAudio, removeSilences, inserts } = req.body;
 
     const hookList = Array.isArray(hooks) ? hooks : [];
     const cutList = Array.isArray(cuts) ? cuts : [];
     const disguiseList = Array.isArray(disguise) ? disguise : [];
+    // ➕ Outside clips (CTAs) lined up in the editor to splice into the final video.
+    const insertList = (Array.isArray(inserts) ? inserts : [])
+      .filter(p => p && Array.isArray(p.clipUrls) && p.clipUrls.filter(Boolean).length > 0);
 
-    if (hookList.length === 0 && cutList.length === 0 && disguiseList.length === 0 && !removeSilences) {
+    if (hookList.length === 0 && cutList.length === 0 && disguiseList.length === 0 && !removeSilences && insertList.length === 0) {
       return res.status(400).json({
         success: false,
-        error: 'Add at least one hook, a section to remove, or a voice to disguise, first.'
+        error: 'Add at least one hook, a section to remove, a voice to disguise, or a clip to insert, first.'
       });
     }
 
@@ -329,7 +332,7 @@ router.post('/render-sequence/:jobId', async (req, res) => {
       message: `Building your video! Use the status endpoint to track progress.`
     });
 
-    manualClipService.renderPodcastSequence(jobId, hookList, { title, cuts: cutList, disguise: disguiseList, levelAudio: !!levelAudio, removeSilences: !!removeSilences, userId: req.headers['x-user-id'] || null })
+    manualClipService.renderPodcastSequence(jobId, hookList, { title, cuts: cutList, disguise: disguiseList, levelAudio: !!levelAudio, removeSilences: !!removeSilences, inserts: insertList, userId: req.headers['x-user-id'] || null })
       .catch(error => {
         // Free the heavy intermediates a failed render left behind (don't fill the disk).
         manualClipService.cleanupRenderTemp(jobId).catch(() => {});
