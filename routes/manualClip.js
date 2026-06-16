@@ -428,6 +428,80 @@ router.post('/voice-preview/:jobId', async (req, res) => {
 });
 
 // ============================================================
+// POST /api/manual-clip/revoice-audio/:jobId
+// 🎙️ Upload ONE recorded voice clip for a section. Parks it on R2 and returns
+// its public URL + measured duration (the editor compares the duration to the
+// selected section to drive the short/long handling). Accepts: audio upload.
+// ============================================================
+router.post('/revoice-audio/:jobId', upload.single('audio'), async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: 'Please attach a recorded audio clip.' });
+    }
+    const result = await manualClipService.saveReVoiceAudio(jobId, req.file.path, req.file.originalname);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('[ManualClip] ReVoice audio upload error:', error.message);
+    res.status(500).json({ success: false, error: 'Could not save that recording. Please try again.' });
+  }
+});
+
+// ============================================================
+// POST /api/manual-clip/revoice-render/:jobId
+// 🎙️ Render the final video with the recorded clips dropped into their marked
+// sections. Returns immediately; the frontend polls /status/:jobId.
+// Body: { segments: [{ startTime, endTime, audioUrl, align, mode, fitMode,
+//         audioDuration }], title }
+// ============================================================
+router.post('/revoice-render/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const { segments } = req.body || {};
+    const list = Array.isArray(segments) ? segments : [];
+
+    if (list.length === 0) {
+      return res.status(400).json({ success: false, error: 'Add at least one section with a recorded voice first.' });
+    }
+    for (let i = 0; i < list.length; i++) {
+      const s = list[i] || {};
+      if (!s.audioUrl) {
+        return res.status(400).json({ success: false, error: `Section ${i + 1} is missing its recorded audio.` });
+      }
+      if (s.startTime === undefined || s.endTime === undefined || parseFloat(s.endTime) <= parseFloat(s.startTime)) {
+        return res.status(400).json({ success: false, error: `Section ${i + 1}: end time must be after start time.` });
+      }
+    }
+
+    const jobStatus = manualClipService.getJobStatus(jobId);
+    // Allow when the in-memory job is gone (restored inside reVoiceRender ->
+    // ensureSourceAvailable), but if present it must be ready/complete.
+    if (jobStatus && jobStatus.status !== 'ready' && jobStatus.status !== 'complete') {
+      return res.status(400).json({ success: false, error: 'Video is not ready yet. Please wait for preparation to complete.' });
+    }
+
+    console.log(`\n[ManualClip] ReVoice render request for job ${jobId} — ${list.length} section(s)`);
+
+    res.json({ success: true, jobId, message: 'Replacing your audio! Use the status endpoint to track progress.' });
+
+    manualClipService.reVoiceRender(jobId, list, { userId: req.headers['x-user-id'] || null })
+      .catch(error => {
+        manualClipService.cleanupRenderTemp?.(jobId)?.catch?.(() => {});
+        console.error('[ManualClip] ReVoice render failed:', error.message);
+        manualClipService.updateJob(jobId, {
+          status: 'error',
+          error: error.message && /not found|no longer/i.test(error.message)
+            ? 'That video session expired. Please re-open the video and try again.'
+            : 'Replacing the audio failed. Please try again.',
+        });
+      });
+  } catch (error) {
+    console.error('[ManualClip] ReVoice render route error:', error);
+    res.status(500).json({ success: false, error: 'Could not start replacing the audio. Please try again.' });
+  }
+});
+
+// ============================================================
 // POST /api/manual-clip/detect-speakers/:jobId
 // 🗣️ Auto-detect "who spoke when" (AssemblyAI). Runs in the background; the
 // frontend polls /status (done when step === 'speakers_ready', speakers on the
@@ -713,6 +787,7 @@ router.post('/restore/:jobId', async (req, res) => {
       cuts: record.cuts || [],
       disguise: record.disguise || [],
       inserts: record.inserts || [],
+      revoice: record.revoice || [],
     });
   } catch (error) {
     console.error('[ManualClip] Restore error:', error);
@@ -771,6 +846,26 @@ router.put('/library/:jobId/disguise', async (req, res) => {
   } catch (error) {
     console.error('[ManualClip] Save disguise error:', error);
     res.status(500).json({ success: false, error: 'Could not save your voice-disguise settings.' });
+  }
+});
+
+// ============================================================
+// PUT /api/manual-clip/library/:jobId/revoice
+// 🎙️ Auto-save the user's ReVoice sections (+ their recorded clip URLs) for a
+// saved video, so a refresh/reopen brings the whole ReVoice project back.
+// Body: { revoice: [{ title, startTime, endTime, audioUrl, audioDuration,
+//         align, mode, fitMode }] }
+// ============================================================
+router.put('/library/:jobId/revoice', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const { revoice } = req.body;
+    await manualVideoLibraryService.updateRevoice(userId, jobId, revoice || []);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[ManualClip] Save revoice error:', error);
+    res.status(500).json({ success: false, error: 'Could not save your ReVoice sections.' });
   }
 });
 

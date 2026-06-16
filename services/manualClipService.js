@@ -2283,6 +2283,284 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return outputPath;
   }
 
+  // ============================================================
+  // 🎙️ REVOICE — add / replace audio on hand-picked sections
+  // ============================================================
+  /**
+   * Does this file actually carry an audio stream? Silent screen-recordings
+   * don't — and ReVoice's headline use is "add a voiceover to a silent video",
+   * so we must build the base track from generated silence when there's none.
+   * Defaults to TRUE on probe failure (most videos do have audio).
+   */
+  hasAudioStream(filePath) {
+    return new Promise((resolve) => {
+      ffmpeg.ffprobe(filePath, (err, metadata) => {
+        if (err) { resolve(true); return; }
+        resolve((metadata.streams || []).some(s => s.codec_type === 'audio'));
+      });
+    });
+  }
+
+  /**
+   * Park ONE recorded voice clip on R2 so a later render can pull it down.
+   * Returns its public URL + measured duration (the editor needs the duration
+   * to compare against the selected section and decide short/long handling).
+   */
+  async saveReVoiceAudio(jobId, filePath, originalName) {
+    const ext = (path.extname(originalName || '') || '.webm').toLowerCase();
+    const audioId = require('crypto').randomBytes(8).toString('hex');
+    const duration = await this.getAudioDuration(filePath).catch(() => 0);
+    const mime = ext === '.mp3' ? 'audio/mpeg'
+      : ext === '.wav' ? 'audio/wav'
+      : ext === '.m4a' || ext === '.mp4' ? 'audio/mp4'
+      : ext === '.ogg' ? 'audio/ogg'
+      : 'audio/webm';
+    const key = `manual-clip/${jobId}/revoice/${audioId}${ext}`;
+    const up = await r2Service.uploadFile(filePath, key, mime);
+    await fs.remove(filePath).catch(() => {});
+    return { audioId, audioUrl: up.downloadUrl, duration, key };
+  }
+
+  /**
+   * Build a copy of the video whose AUDIO has the recorded clips dropped into
+   * their marked sections. Same OOM-safe pattern as buildDisguisedSource:
+   * build the new audio first, then copy-mux it back onto the untouched video.
+   *
+   * Each segment: { start, end, localPath, align, mode, fitMode, audioDuration }
+   *   mode    'replace' = silence the original under the slot, then lay the clip
+   *           'overlay' = keep the original and mix the clip on top
+   *   align   'start' | 'end'  — where a SHORTER clip sits inside the slot
+   *   fitMode 'auto' (decide by overflow), 'speed' (atempo to fit, Option-1
+   *           default), 'trim' (cut the tail), 'none' (place as-is)
+   *
+   * `hasAudio` false ⇒ the source is silent; the base track is generated
+   * silence (the "voiceover on a silent video" path).
+   */
+  async buildReVoicedSource(videoPath, segments, duration, hasAudio, outputPath, onProgress) {
+    const segs = (segments || [])
+      .filter(s => s && s.localPath)
+      .map(s => ({
+        start: Math.max(0, parseFloat(s.start) || 0),
+        end: Math.max(0, parseFloat(s.end) || 0),
+        localPath: s.localPath,
+        align: s.align === 'end' ? 'end' : 'start',
+        mode: s.mode === 'overlay' ? 'overlay' : 'replace',
+        fitMode: ['speed', 'trim', 'none'].includes(s.fitMode) ? s.fitMode : 'auto',
+        audioDuration: Math.max(0, parseFloat(s.audioDuration) || 0),
+      }))
+      .filter(s => s.end > s.start)
+      .sort((a, b) => a.start - b.start);
+    if (segs.length === 0) return null;
+
+    // input 0 = video (always — Step 2 copies its video stream); 1..N = clips.
+    const inputs = ['-i', videoPath];
+    segs.forEach(s => inputs.push('-i', s.localPath));
+    // When the source is silent, append a generated-silence input for the base.
+    let baseIdx = 0;
+    if (!hasAudio) {
+      baseIdx = segs.length + 1;
+      inputs.push('-f', 'lavfi', '-t', duration.toFixed(3), '-i', `anullsrc=r=${DISGUISE_SR}:cl=stereo`);
+    }
+
+    const parts = [];
+    // Base track, resampled to a common format. For replace-mode segments, mute
+    // the original underneath the slot (no-op on a silent base, harmless).
+    let base = `[${baseIdx}:a]aresample=${DISGUISE_SR},aformat=sample_fmts=fltp:sample_rates=${DISGUISE_SR}:channel_layouts=stereo`;
+    if (hasAudio) {
+      segs.filter(s => s.mode === 'replace').forEach(s => {
+        base += `,volume=enable='between(t,${s.start.toFixed(3)},${s.end.toFixed(3)})':volume=0`;
+      });
+    }
+    parts.push(`${base}[base]`);
+
+    const labels = ['[base]'];
+    segs.forEach((s, i) => {
+      const k = i + 1; // clip input index
+      const slot = s.end - s.start;
+      const A = s.audioDuration > 0 ? s.audioDuration : slot;
+      let chain = `[${k}:a]aresample=${DISGUISE_SR},aformat=sample_fmts=fltp:sample_rates=${DISGUISE_SR}:channel_layouts=stereo`;
+
+      // Decide how to fit the clip to the slot.
+      let fit = s.fitMode;
+      if (fit === 'auto') {
+        const overflow = slot > 0 ? A / slot : 1;
+        fit = A > slot ? (overflow <= 1.15 ? 'speed' : 'trim') : 'none';
+      }
+
+      let offset = s.start;
+      if (A > slot && fit === 'speed') {
+        // Option-1: gently speed up (pitch-preserved) so it fits the slot exactly.
+        const tempo = Math.min(2.0, Math.max(0.5, A / slot));
+        chain += `,atempo=${tempo.toFixed(5)},apad=whole_dur=${slot.toFixed(3)},atrim=0:${slot.toFixed(3)}`;
+        offset = s.start;
+      } else if (A > slot && fit === 'trim') {
+        chain += `,atrim=0:${slot.toFixed(3)}`;
+        offset = s.start;
+      } else {
+        // Shorter than (or equal to) the slot — align to start or end.
+        offset = s.align === 'end' ? Math.max(0, s.end - A) : s.start;
+        // For replace-mode, never let it spill past the (un-muted) end of the slot.
+        if (s.mode === 'replace' && A > slot) chain += `,atrim=0:${slot.toFixed(3)}`;
+      }
+
+      chain += ',asetpts=PTS-STARTPTS';
+      const offMs = Math.round(offset * 1000);
+      if (offMs > 0) chain += `,adelay=${offMs}|${offMs}`;
+      parts.push(`${chain}[r${i}]`);
+      labels.push(`[r${i}]`);
+    });
+
+    // Sum everything at full volume (normalize=0 ⇒ no auto-attenuation). The base
+    // is muted wherever a replace clip plays, so the sum doesn't double up.
+    parts.push(`${labels.join('')}amix=inputs=${labels.length}:normalize=0:duration=longest[outa]`);
+
+    const filterPath = `${outputPath}.filter.txt`;
+    await fs.writeFile(filterPath, parts.join(';'));
+    const audioPath = `${outputPath}.audio.m4a`;
+    console.log(`  [ReVoice] ${segs.length} segment(s), source ${hasAudio ? 'has audio' : 'is SILENT'} — audio-first then copy-mux`);
+
+    // STEP 1 — build the new audio only (don't mux the big video yet → low memory).
+    await this._runFfmpeg([
+      '-y', ...inputs,
+      '-filter_complex_script', filterPath,
+      '-map', '[outa]',
+      '-c:a', 'aac', '-ar', String(DISGUISE_SR), '-ac', '2', '-b:a', '320k',
+      audioPath,
+    ], { duration, onProgress, label: 'ReVoice audio' });
+
+    // STEP 2 — copy-mux the original video with the new audio (fast, buffers nothing).
+    await this._runFfmpeg([
+      '-y', '-i', videoPath, '-i', audioPath,
+      '-map', '0:v:0', '-map', '1:a:0',
+      '-c:v', 'copy', '-c:a', 'aac', '-b:a', '320k',
+      '-movflags', '+faststart',
+      outputPath,
+    ], { label: 'ReVoice mux' });
+
+    await fs.remove(audioPath).catch(() => {});
+    await fs.remove(filterPath).catch(() => {});
+    console.log('  [ReVoice] ✓ done');
+    return outputPath;
+  }
+
+  /**
+   * Orchestrate a full ReVoice render: restore the source, pull each recorded
+   * clip down from R2, rebuild the audio with buildReVoicedSource, then publish
+   * exactly like renderPodcastSequence (server copy now, durable R2 copy +
+   * library entry once uploaded). Frontend polls GET /status/:jobId.
+   *
+   * segments: [{ startTime, endTime, audioUrl, align, mode, fitMode, audioDuration }]
+   */
+  async reVoiceRender(jobId, segments, options = {}) {
+    const userId = options.userId || null;
+    const list = Array.isArray(segments) ? segments.filter(s => s && s.audioUrl) : [];
+    if (list.length === 0) throw new Error('No audio sections to replace.');
+
+    const job = await this.ensureSourceAvailable(jobId, userId);
+    const videoPath = job.videoPath;
+    const videoTitle = job.videoTitle || 'video';
+    const videoDuration = job.videoDuration || await this.getVideoDuration(videoPath).catch(() => 0);
+
+    this.updateJob(jobId, {
+      status: 'generating', step: 'revoice_preparing', progress: 4,
+      currentClip: 'Preparing your audio…', generatedClips: [], error: null,
+    });
+
+    const workDir = path.join(this.tempDir, `manual-${jobId}`, 'revoice');
+    await fs.ensureDir(workDir);
+
+    // Pull each recorded clip down locally and confirm its duration.
+    const prepared = [];
+    for (let i = 0; i < list.length; i++) {
+      const s = list[i];
+      const ext = path.extname(s.audioUrl.split('?')[0]) || '.webm';
+      const localPath = path.join(workDir, `aud_${i}${ext}`);
+      await r2Service.downloadFile(s.audioUrl, localPath);
+      const audioDuration = parseFloat(s.audioDuration) > 0
+        ? parseFloat(s.audioDuration)
+        : await this.getAudioDuration(localPath).catch(() => 0);
+      prepared.push({
+        start: s.startTime, end: s.endTime, localPath,
+        align: s.align, mode: s.mode, fitMode: s.fitMode, audioDuration,
+      });
+    }
+
+    this.updateJob(jobId, { step: 'revoice_rendering', progress: 15, currentClip: 'Replacing the audio…' });
+
+    const hasAudio = await this.hasAudioStream(videoPath);
+    const outputPath = path.join(workDir, `revoiced_${jobId}.mp4`);
+    const built = await this.buildReVoicedSource(videoPath, prepared, videoDuration, hasAudio, outputPath, (pct) => {
+      this.updateJob(jobId, { progress: Math.round(15 + (pct / 100) * 75) }); // 15 -> 90
+    });
+    if (!built) throw new Error('No audio sections to replace.');
+
+    // ---- Publish (mirrors renderPodcastSequence's tail) ----
+    const safeTitle = this.sanitizeFilename(videoTitle);
+    const downloadName = `${safeTitle || 'revoiced'}.mp4`;
+    const finalDuration = await this.getVideoDuration(outputPath).catch(() => videoDuration);
+    const serverDownloadUrl = `${this.publicBaseUrl()}/api/manual-clip/download/${jobId}`;
+
+    this.updateJob(jobId, {
+      step: 'uploading', progress: 94,
+      currentClip: 'Your video is ready — saving a cloud copy...',
+      serverDownload: { path: outputPath, filename: downloadName },
+      serverDownloadUrl,
+    });
+
+    const r2FileName = `manual-clips/${jobId}/revoiced_${safeTitle}.mp4`;
+    let r2Url = null;
+    try {
+      const uploadResult = await r2Service.uploadFile(outputPath, r2FileName);
+      r2Url = uploadResult.downloadUrl;
+    } catch (err) {
+      console.error(`[ReVoice ${jobId}] R2 upload failed, serving local copy:`, err.message);
+    }
+
+    const resultClip = {
+      clipNumber: 1,
+      title: `${videoTitle} — ReVoiced (${list.length} section${list.length !== 1 ? 's' : ''})`,
+      isSequence: true,
+      duration: finalDuration,
+      durationFormatted: this.formatTime(finalDuration),
+      downloadUrl: r2Url || serverDownloadUrl,
+      serverDownloadUrl,
+      hasCaptions: false,
+    };
+
+    this.updateJob(jobId, {
+      status: 'complete', step: 'done', progress: 100,
+      currentClip: '', generatedClips: [resultClip],
+      completedAt: new Date().toISOString(),
+    });
+    console.log(`[ReVoice ${jobId}] ✓ ReVoice complete: ${resultClip.downloadUrl}`);
+
+    if (r2Url) {
+      try {
+        let renderSize = 0;
+        try { renderSize = (await fs.stat(outputPath)).size; } catch { /* best-effort */ }
+        await manualVideoLibraryService.addRender(userId, {
+          title: `${videoTitle} (ReVoiced)`,
+          downloadUrl: r2Url,
+          r2Key: r2FileName,
+          fileSize: renderSize,
+          duration: finalDuration,
+          durationFormatted: this.formatTime(finalDuration),
+          sourceJobId: jobId,
+          createdAt: new Date().toISOString(),
+        });
+      } catch (libErr) {
+        console.error(`[ReVoice ${jobId}] Could not save render to library:`, libErr.message);
+      }
+    }
+
+    // Keep the final file briefly for in-flight server downloads, then drop it
+    // (R2 holds the durable copy). Also free the pulled-down clips.
+    this.scheduleServerCopyCleanup(jobId, outputPath);
+    for (const p of prepared) { await fs.remove(p.localPath).catch(() => {}); }
+
+    return resultClip;
+  }
+
   // Run one ffmpeg invocation as a promise, with optional progress reporting.
   _runFfmpeg(args, { duration, onProgress, label = 'ffmpeg' } = {}) {
     return new Promise((resolve, reject) => {

@@ -158,6 +158,37 @@ class ManualVideoLibraryService {
   }
 
   /**
+   * 🎙️ Save the user's ReVoice sections for one video (auto-save from the
+   * editor), so a refresh/reopen brings back every marked section AND its
+   * recorded clip. The recordings already live in R2, so we only store their
+   * URLs here. Stored lean: { title, startTime, endTime, audioUrl,
+   * audioDuration, align, mode, fitMode }.
+   */
+  async updateRevoice(userId, jobId, revoice) {
+    const lean = (Array.isArray(revoice) ? revoice : [])
+      .map(r => ({
+        title: r.title || '',
+        startTime: Number(r.startTime) || 0,
+        endTime: Number(r.endTime) || 0,
+        audioUrl: r.audioUrl ? String(r.audioUrl) : null,
+        audioDuration: Number(r.audioDuration) || 0,
+        align: r.align === 'end' ? 'end' : 'start',
+        mode: r.mode === 'overlay' ? 'overlay' : 'replace',
+        fitMode: ['speed', 'trim', 'none'].includes(r.fitMode) ? r.fitMode : 'auto',
+      }))
+      .filter(r => r.audioUrl && r.endTime > r.startTime);
+    for (const owner of [userId, null]) {
+      const data = await this.load(owner);
+      const v = data.videos.find(x => x.jobId === jobId);
+      if (v) {
+        v.revoice = lean;
+        await this.save(owner, data);
+        return;
+      }
+    }
+  }
+
+  /**
    * Merge a patch into one saved video record (e.g. after re-encoding it to
    * match YouTube timestamps: new sourceKey/playbackUrl/duration/waveform +
    * a `normalized` flag). Looks in the user's library first, then the public
