@@ -16,6 +16,7 @@ const fs = require('fs-extra');
 
 const manualClipService = require('../services/manualClipService');
 const manualVideoLibraryService = require('../services/manualVideoLibraryService');
+const voiceService = require('../services/voiceService');
 
 // Upload directory for manual clip videos
 const uploadDir = path.join(process.env.TEMP_DIR || '/app/temp', 'manual-uploads');
@@ -444,6 +445,56 @@ router.post('/revoice-audio/:jobId', upload.single('audio'), async (req, res) =>
   } catch (error) {
     console.error('[ManualClip] ReVoice audio upload error:', error.message);
     res.status(500).json({ success: false, error: 'Could not save that recording. Please try again.' });
+  }
+});
+
+// ============================================================
+// GET /api/manual-clip/tts-voices
+// ✨ List the AI text-to-voice providers that are usable right now (key set)
+// and the voices each offers. Drives the ReVoice "AI Voice" picker.
+// ============================================================
+router.get('/tts-voices', async (req, res) => {
+  try {
+    const catalog = await voiceService.getTtsCatalog();
+    res.json({ success: true, ...catalog });
+  } catch (error) {
+    console.error('[ManualClip] TTS voices error:', error.message);
+    res.status(500).json({ success: false, error: 'Could not load the AI voices. Please try again.' });
+  }
+});
+
+// ============================================================
+// POST /api/manual-clip/revoice-tts/:jobId
+// ✨ Turn typed text into an AI voiceover for a section. Generates the audio,
+// parks it on R2 (same store as a recording) and returns its URL + measured
+// duration — so the editor treats it exactly like a recorded clip.
+// Body: { text, provider, voice }
+// ============================================================
+router.post('/revoice-tts/:jobId', async (req, res) => {
+  let tmpPath = null;
+  try {
+    const { jobId } = req.params;
+    const { text, provider, voice } = req.body || {};
+    if (!text || !text.trim()) {
+      return res.status(400).json({ success: false, error: 'Please type some text to turn into a voice.' });
+    }
+
+    const { buffer, ext } = await voiceService.generateTTS({ provider, text, voice });
+
+    // Park the generated audio on disk so saveReVoiceAudio can upload + probe it
+    // (same uploadDir + cleanup contract as the recorded-clip path).
+    fs.ensureDirSync(uploadDir);
+    tmpPath = path.join(uploadDir, require('crypto').randomBytes(16).toString('hex') + ext);
+    await fs.writeFile(tmpPath, buffer);
+
+    const result = await manualClipService.saveReVoiceAudio(jobId, tmpPath, `tts${ext}`);
+    tmpPath = null; // saveReVoiceAudio removes the temp file on success
+    res.json({ success: true, ...result });
+  } catch (error) {
+    if (tmpPath) await fs.remove(tmpPath).catch(() => {});
+    console.error('[ManualClip] ReVoice TTS error:', error.message);
+    // Surface the friendly message from generateTTS (bad voice, too long, key missing…)
+    res.status(500).json({ success: false, error: error.message || 'Could not generate that voice. Please try again.' });
   }
 });
 

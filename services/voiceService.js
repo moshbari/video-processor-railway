@@ -8,6 +8,45 @@ const OpenAI = require('openai');
 const DEFAULT_OPENAI_VOICE = 'nova';   // clear, neutral
 const DEFAULT_ELEVENLABS_VOICE_ID = 'TxGEqnHWrfWFTfGW9XjX'; // Josh
 
+// ── ReVoice AI text-to-voice catalog ──────────────────────────────────────
+// Ported from the multi-voice-over-clip-creator app so ReVoice can offer the
+// same providers/voices. The render pipeline only needs an audio file, so all
+// three providers feed the same saveReVoiceAudio() flow.
+const OPENAI_TTS_HD_MODEL = 'tts-1-hd';
+const OPENAI_TTS_VOICES = ['alloy', 'ash', 'ballad', 'coral', 'echo', 'fable', 'nova', 'onyx', 'sage', 'shimmer'];
+
+const ELEVENLABS_TTS_MODEL = 'eleven_multilingual_v2';
+
+// Stock ElevenLabs voices — stable public IDs that work on any account and,
+// crucially, WITHOUT the `voices_read` API permission. Used as the fallback
+// when listing the live library fails (e.g. a key scoped to TTS only).
+const ELEVENLABS_STOCK_VOICES = [
+  { id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel · calm female' },
+  { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella · soft female' },
+  { id: 'MF3mGyEYCl7XYWbV9V6O', name: 'Elli · emotional female' },
+  { id: 'AZnzlk1XvdvUeBnXmlld', name: 'Domi · strong female' },
+  { id: 'ErXwobaYiN019PkySvjV', name: 'Antoni · well-rounded male' },
+  { id: 'TxGEqnHWrfWFTfGW9XjX', name: 'Josh · deep male' },
+  { id: 'pNInz6obpgDQGcFmaJgB', name: 'Adam · deep male' },
+  { id: 'VR6AewLTigWG4xSOukaG', name: 'Arnold · crisp male' },
+  { id: 'yoZ06aMxZJJ28mfd3POQ', name: 'Sam · raspy male' },
+  { id: 'IKne3meq5aSn9XLyUdCD', name: 'Charlie · Australian male' },
+  { id: 'JBFqnCBsd6RMkjVDRZzb', name: 'George · warm UK male' },
+];
+
+// Speechmatics TTS preview API — voice is passed in the URL path, WAV output.
+// Docs: https://docs.speechmatics.com/text-to-speech/quickstart
+const SPEECHMATICS_TTS_URL = 'https://preview.tts.speechmatics.com/generate';
+const SPEECHMATICS_TTS_VOICES = [
+  { id: 'sarah', name: 'Sarah · UK · friendly support' },
+  { id: 'theo',  name: 'Theo · UK · trusted presenter' },
+  { id: 'jack',  name: 'Jack · US · support specialist' },
+  { id: 'megan', name: 'Megan · US · clear companion' },
+];
+
+// Generous cap — ReVoice sections are usually short, but a long overlay is fine.
+const MAX_TTS_CHARS = 5000;
+
 class VoiceService {
   constructor() {
     this.apiKey = process.env.ELEVENLABS_API_KEY;
@@ -273,6 +312,141 @@ class VoiceService {
       // Default Josh voice ID
       return 'TxGEqnHWrfWFTfGW9XjX';
     }
+  }
+
+  // ========================================================================
+  // 🎙️ ReVoice AI text-to-voice — unified catalog + generator (3 providers)
+  // ========================================================================
+
+  /**
+   * Which providers are usable right now (i.e. their API key is set) + the
+   * voices each one offers. ElevenLabs voices are fetched live; OpenAI and
+   * Speechmatics are fixed lists. Best-effort: a provider that errors while
+   * listing simply comes back with no voices.
+   *
+   * Returns: { providers: [{ id, name, available, voices: [{ id, name }] }] }
+   */
+  async getTtsCatalog() {
+    const openaiAvailable = !!process.env.OPENAI_API_KEY;
+    const elevenAvailable = !!this.apiKey;
+    const speechmaticsAvailable = !!(process.env.SPEECHMATICS_API_KEY || '').trim();
+
+    // Prefer the account's live library (includes custom/cloned voices); fall
+    // back to stock voices when the key can't list them (no voices_read perm).
+    let elevenVoices = [];
+    if (elevenAvailable) {
+      try {
+        const data = await this.getAvailableVoices();
+        elevenVoices = (data.voices || []).map(v => ({ id: v.voice_id, name: v.name }));
+      } catch (e) {
+        console.error('[VoiceService] ElevenLabs voice list failed, using stock voices:', e.message);
+      }
+      if (elevenVoices.length === 0) elevenVoices = ELEVENLABS_STOCK_VOICES;
+    }
+
+    return {
+      providers: [
+        {
+          id: 'openai',
+          name: 'OpenAI',
+          available: openaiAvailable,
+          voices: OPENAI_TTS_VOICES.map(v => ({ id: v, name: v[0].toUpperCase() + v.slice(1) })),
+        },
+        {
+          id: 'elevenlabs',
+          name: 'ElevenLabs',
+          available: elevenAvailable,
+          voices: elevenVoices,
+        },
+        {
+          id: 'speechmatics',
+          name: 'Speechmatics',
+          available: speechmaticsAvailable,
+          voices: SPEECHMATICS_TTS_VOICES,
+        },
+      ],
+    };
+  }
+
+  /**
+   * Generate speech from text for ReVoice. Returns the raw audio so the caller
+   * can park it on R2 (same path as a recorded clip).
+   *
+   * @param {object} opts
+   * @param {string} opts.provider  'openai' | 'elevenlabs' | 'speechmatics'
+   * @param {string} opts.text      the words to speak
+   * @param {string} opts.voice     OpenAI voice name / ElevenLabs voiceId / Speechmatics voice id
+   * @returns {Promise<{ buffer: Buffer, ext: string, mime: string }>}
+   */
+  async generateTTS({ provider = 'openai', text, voice }) {
+    const clean = (text || '').trim();
+    if (!clean) throw new Error('Please type some text to turn into a voice.');
+    if (clean.length > MAX_TTS_CHARS) {
+      throw new Error(`That text is too long (${clean.length} chars). Keep it under ${MAX_TTS_CHARS}.`);
+    }
+    const p = (provider || 'openai').toLowerCase();
+
+    if (p === 'openai') {
+      if (!process.env.OPENAI_API_KEY) throw new Error('OpenAI is not configured on the server.');
+      const v = OPENAI_TTS_VOICES.includes(voice) ? voice : DEFAULT_OPENAI_VOICE;
+      const openai = this.getOpenAIClient();
+      const resp = await openai.audio.speech.create({
+        model: OPENAI_TTS_HD_MODEL,
+        voice: v,
+        input: clean,
+        response_format: 'mp3',
+      });
+      const buffer = Buffer.from(await resp.arrayBuffer());
+      return { buffer, ext: '.mp3', mime: 'audio/mpeg' };
+    }
+
+    if (p === 'elevenlabs' || p === '11labs') {
+      if (!this.apiKey) throw new Error('ElevenLabs is not configured on the server.');
+      const voiceId = voice || DEFAULT_ELEVENLABS_VOICE_ID;
+      const response = await fetch(
+        `${this.apiUrl}/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_192`,
+        {
+          method: 'POST',
+          headers: {
+            'xi-api-key': this.apiKey,
+            'Content-Type': 'application/json',
+            'Accept': 'audio/mpeg',
+          },
+          body: JSON.stringify({ text: clean, model_id: ELEVENLABS_TTS_MODEL }),
+        }
+      );
+      if (!response.ok) {
+        const t = await response.text();
+        throw new Error(`ElevenLabs ${response.status}: ${t.slice(0, 300)}`);
+      }
+      const buffer = await response.buffer();
+      return { buffer, ext: '.mp3', mime: 'audio/mpeg' };
+    }
+
+    if (p === 'speechmatics') {
+      const key = (process.env.SPEECHMATICS_API_KEY || '').trim();
+      if (!key) throw new Error('Speechmatics is not configured on the server.');
+      if (!SPEECHMATICS_TTS_VOICES.some(sv => sv.id === voice)) {
+        throw new Error(`Unknown Speechmatics voice: ${voice}`);
+      }
+      const response = await fetch(`${SPEECHMATICS_TTS_URL}/${encodeURIComponent(voice)}`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${key}`,
+          'Content-Type': 'application/json',
+          'Accept': 'audio/wav',
+        },
+        body: JSON.stringify({ text: clean }),
+      });
+      if (!response.ok) {
+        const t = await response.text();
+        throw new Error(`Speechmatics ${response.status}: ${t.slice(0, 300)}`);
+      }
+      const buffer = await response.buffer();
+      return { buffer, ext: '.wav', mime: 'audio/wav' };
+    }
+
+    throw new Error(`Unknown TTS provider: ${provider}`);
   }
 }
 
