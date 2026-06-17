@@ -175,6 +175,10 @@ class ManualVideoLibraryService {
         align: r.align === 'end' ? 'end' : 'start',
         mode: r.mode === 'overlay' ? 'overlay' : 'replace',
         fitMode: ['speed', 'trim', 'none'].includes(r.fitMode) ? r.fitMode : 'auto',
+        source: r.source === 'ai' ? 'ai' : r.source === 'recording' ? 'recording' : null,
+        provider: r.provider ? String(r.provider) : null,
+        voiceName: r.voiceName ? String(r.voiceName) : null,
+        createdAt: Number(r.createdAt) || null,
       }))
       .filter(r => r.audioUrl && r.endTime > r.startTime);
     for (const owner of [userId, null]) {
