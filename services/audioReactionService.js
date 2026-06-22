@@ -165,18 +165,75 @@ class AudioReactionService {
   }
 
   /**
+   * Measure the true integrated loudness of a file's audio (loudnorm pass 1).
+   * Returns the measured values needed for an accurate two-pass normalization,
+   * or null if the audio is silent/unmeasurable (caller then falls back to one-pass).
+   */
+  async measureLoudness(inputPath) {
+    return new Promise((resolve) => {
+      const cmd = `ffmpeg -hide_banner -i "${inputPath}" -af "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null -`;
+      exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
+        try {
+          const output = stderr || '';
+          // loudnorm prints its JSON report as the last { ... } block on stderr
+          const start = output.lastIndexOf('{');
+          const end = output.lastIndexOf('}');
+          if (start === -1 || end === -1 || end < start) {
+            console.warn('[AudioReaction] Loudness measure: no JSON found — falling back to one-pass');
+            return resolve(null);
+          }
+          const json = JSON.parse(output.substring(start, end + 1));
+          const measured = {
+            input_i: parseFloat(json.input_i),
+            input_tp: parseFloat(json.input_tp),
+            input_lra: parseFloat(json.input_lra),
+            input_thresh: parseFloat(json.input_thresh),
+            target_offset: parseFloat(json.target_offset),
+          };
+          // -inf / NaN means silent or unmeasurable → use safe one-pass fallback
+          if (!Number.isFinite(measured.input_i) || measured.input_i <= -70) {
+            console.warn('[AudioReaction] Loudness measure silent/invalid — falling back to one-pass');
+            return resolve(null);
+          }
+          console.log(`[AudioReaction] Measured loudness: ${measured.input_i} LUFS (${path.basename(inputPath)})`);
+          resolve(measured);
+        } catch (e) {
+          console.warn('[AudioReaction] Loudness measure parse failed — falling back to one-pass:', e.message);
+          resolve(null);
+        }
+      });
+    });
+  }
+
+  /**
+   * Build the loudnorm audio filter string.
+   * With measurements → accurate linear two-pass normalization (everything lands at exactly -16 LUFS).
+   * Without → the original one-pass behaviour (safe fallback for silent/odd clips).
+   */
+  buildLoudnormFilter(measured) {
+    if (!measured) {
+      return 'loudnorm=I=-16:TP=-1.5:LRA=11';
+    }
+    const offset = Number.isFinite(measured.target_offset) ? measured.target_offset : 0;
+    return `loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=${measured.input_i}:measured_TP=${measured.input_tp}:measured_LRA=${measured.input_lra}:measured_thresh=${measured.input_thresh}:offset=${offset}:linear=true`;
+  }
+
+  /**
    * Create a frozen frame video with audio
    * The frozen frame that plays during audio reaction
    */
   async createFrozenFrameWithAudio(framePath, audioPath, outputPath, targetWidth, targetHeight) {
+    // Pass 1: measure the rant audio so pass 2 hits -16 LUFS exactly
+    const measured = await this.measureLoudness(audioPath);
+    const afilter = this.buildLoudnormFilter(measured);
     return new Promise(async (resolve, reject) => {
       try {
         const audioDuration = await this.getMediaDuration(audioPath);
-        console.log(`[AudioReaction] Creating frozen frame video (${audioDuration.toFixed(2)}s) with normalized audio...`);
-        
+        console.log(`[AudioReaction] Creating frozen frame video (${audioDuration.toFixed(2)}s) with normalized audio (${measured ? 'two-pass' : 'one-pass fallback'})...`);
+
         // Create frozen video from image + add audio with normalization
-        const cmd = `ffmpeg -y -loop 1 -i "${framePath}" -i "${audioPath}" -t ${audioDuration} -vf "scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,fps=30" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -ar 44100 -af "loudnorm=I=-16:TP=-1.5:LRA=11" -shortest -pix_fmt yuv420p "${outputPath}"`;
-        
+        const cmd = `ffmpeg -y -loop 1 -i "${framePath}" -i "${audioPath}" -t ${audioDuration} -vf "scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,fps=30" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -ar 44100 -af "${afilter}" -shortest -pix_fmt yuv420p "${outputPath}"`;
+
         exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
           if (error) {
             console.error('[AudioReaction] Frozen frame creation error:', stderr ? stderr.substring(stderr.length - 500) : error.message);
@@ -196,11 +253,14 @@ class AudioReactionService {
    * Normalize audio in original video clips for consistent levels
    */
   async normalizeVideoClip(inputPath, outputPath) {
+    // Pass 1: measure the clip's true loudness so pass 2 hits -16 LUFS exactly
+    const measured = await this.measureLoudness(inputPath);
+    const afilter = this.buildLoudnormFilter(measured);
     return new Promise((resolve, reject) => {
-      console.log(`[AudioReaction] Normalizing clip: ${path.basename(inputPath)}`);
-      
-      const cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset fast -crf 23 -r 30 -c:a aac -b:a 192k -ar 44100 -af "loudnorm=I=-16:TP=-1.5:LRA=11" -pix_fmt yuv420p "${outputPath}"`;
-      
+      console.log(`[AudioReaction] Normalizing clip (${measured ? 'two-pass' : 'one-pass fallback'}): ${path.basename(inputPath)}`);
+
+      const cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset fast -crf 23 -r 30 -c:a aac -b:a 192k -ar 44100 -af "${afilter}" -pix_fmt yuv420p "${outputPath}"`;
+
       exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
         if (error) {
           console.error('[AudioReaction] Normalization error:', stderr ? stderr.substring(stderr.length - 300) : error.message);
