@@ -4,7 +4,7 @@
   "description": "Video processor for downloading, transcribing, splitting and combining videos",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "(pip3 install --break-system-packages -U yt-dlp >/dev/null 2>&1 || true) && node server.js",
     "dev": "nodemon server.js"
   },
   "dependencies": {

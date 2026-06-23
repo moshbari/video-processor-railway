@@ -8,6 +8,27 @@ const execAsync = promisify(exec);
 
 const tellaService = require('./tellaService');
 
+const isTikTok = (url) => /tiktok\.com|vm\.tiktok|vt\.tiktok/i.test(url);
+
+// Login cookies (Instagram/Facebook + YouTube bot-check) come from YTDLP_COOKIES_B64
+// — a base64 of a Netscape cookies.txt. Written once to /tmp and passed to yt-dlp.
+let cookiesWritten = false;
+function ytdlpExtra() {
+  const args = ['--no-playlist', '--no-warnings'];
+  if (process.env.YTDLP_COOKIES_B64) {
+    try {
+      if (!cookiesWritten) {
+        fs.writeFileSync('/tmp/yt-cookies.txt', Buffer.from(process.env.YTDLP_COOKIES_B64, 'base64').toString('utf8'));
+        cookiesWritten = true;
+      }
+      args.push('--cookies', '/tmp/yt-cookies.txt');
+    } catch (e) {
+      console.error('cookie write failed:', e.message);
+    }
+  }
+  return args.join(' ');
+}
+
 class DownloadService {
   constructor() {
     this.tempDir = process.env.TEMP_DIR || '/app/temp';
@@ -53,12 +74,22 @@ class DownloadService {
       }
     }
 
+    // --- TikTok: yt-dlp is IP-blocked from datacenter, resolve via tikwm CDN ---
+    if (isTikTok(url)) {
+      try {
+        return await this.downloadTikTok(url, outputPath, id);
+      } catch (e) {
+        console.error('TikTok resolver failed, falling back to yt-dlp:', e.message);
+        // fall through to yt-dlp
+      }
+    }
+
     const outputFile = path.join(outputPath, 'video.%(ext)s');
 
     try {
       // Get video info first
       console.log(`Getting info for: ${url}`);
-      const infoCommand = `yt-dlp --dump-json "${url}"`;
+      const infoCommand = `yt-dlp ${ytdlpExtra()} --dump-json "${url}"`;
       const { stdout: infoJson } = await execAsync(infoCommand);
       const info = JSON.parse(infoJson);
 
@@ -74,7 +105,7 @@ class DownloadService {
 
       // Download the video
       console.log(`Downloading video: ${info.title || 'Unknown'}`);
-      const downloadCommand = `yt-dlp -f "best[ext=mp4]/best" --merge-output-format mp4 -o "${outputFile}" "${url}"`;
+      const downloadCommand = `yt-dlp ${ytdlpExtra()} -f "best[ext=mp4]/best" --merge-output-format mp4 -o "${outputFile}" "${url}"`;
       
       await execAsync(downloadCommand, {
         maxBuffer: 1024 * 1024 * 100 // 100MB buffer
@@ -119,6 +150,48 @@ class DownloadService {
   }
 
   /**
+   * Download a TikTok video via the tikwm resolver (no-watermark MP4 from a CDN
+   * that serves cloud IPs), since yt-dlp is IP-blocked for TikTok on the server.
+   */
+  async downloadTikTok(url, outputPath, id) {
+    const videoPath = path.join(outputPath, 'video.mp4');
+    let data = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const resp = await fetch('https://www.tikwm.com/api/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0' },
+        body: `url=${encodeURIComponent(url)}&hd=1`,
+      });
+      const j = await resp.json().catch(() => ({}));
+      if (j.code === 0 && j.data && (j.data.hdplay || j.data.play)) { data = j.data; break; }
+      if (j.msg && /limit/i.test(j.msg)) { await new Promise((r) => setTimeout(r, 1200)); continue; }
+      throw new Error(`tikwm: ${j.msg || 'resolve failed'}`);
+    }
+    if (!data) throw new Error('tikwm rate limited');
+
+    const playUrl = data.hdplay || data.play;
+    const vresp = await fetch(playUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (!vresp.ok) throw new Error(`TikTok CDN download failed: HTTP ${vresp.status}`);
+    await fs.writeFile(videoPath, Buffer.from(await vresp.arrayBuffer()));
+    const stats = await fs.stat(videoPath);
+
+    return {
+      jobId: id,
+      videoPath,
+      filename: 'video.mp4',
+      title: data.title || 'TikTok video',
+      duration: data.duration || 0,
+      fileSize: stats.size,
+      thumbnail: data.cover || data.origin_cover || null,
+      platform: 'tiktok',
+      uploadDate: null,
+      uploader: (data.author && data.author.unique_id) || null,
+      description: data.title || null,
+      url,
+    };
+  }
+
+  /**
    * Get supported platforms info
    */
   async getSupportedPlatforms() {
@@ -148,7 +221,7 @@ class DownloadService {
    */
   async validateUrl(url) {
     try {
-      const command = `yt-dlp --dump-json --skip-download "${url}"`;
+      const command = `yt-dlp ${ytdlpExtra()} --dump-json --skip-download "${url}"`;
       const { stdout } = await execAsync(command, { timeout: 10000 });
       const info = JSON.parse(stdout);
       
