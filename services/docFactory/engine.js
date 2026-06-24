@@ -310,6 +310,10 @@ async function runDocFactory({ idea, minutes, oauthToken, apiKey, subModel, apiM
   let lastLine = '';
   const factBankText = (blueprint.fact_bank || [])
     .map((f) => `- [${f.type}] ${f.claim}${f.source ? ` (${f.source})` : ''}`).join('\n');
+  // Word budget keeps the finished video close to the requested length
+  // (~145 spoken words/min). Split evenly across the beats.
+  const wordBudget = Math.round(targetMinutes * 145);
+  const perBeatWords = Math.max(40, Math.round(wordBudget / blueprint.beats.length));
 
   for (let i = 0; i < blueprint.beats.length; i++) {
     const beat = blueprint.beats[i];
@@ -322,6 +326,7 @@ async function runDocFactory({ idea, minutes, oauthToken, apiKey, subModel, apiM
       (lastLine
         ? `The previous panel's narration line was: "${lastLine}". Continue smoothly from it.\n\n`
         : `This is the OPENING of the video — the first 1-2 lines must hook hard.\n\n`) +
+      `LENGTH: keep this beat's narration to about ${perBeatWords} words total (the whole video targets ~${wordBudget} words for ${targetMinutes} min). Be economical — short lines, no padding.\n\n` +
       `Expand ONLY this beat into panels now. Return the panels JSON.`;
     let beatPanels = [];
     try {
