@@ -66,6 +66,7 @@ const webinarMultiRoutes = require('./routes/webinarMulti');
 const clipLibraryRoutes = require('./routes/clipLibrary');  // 📚 CLIP LIBRARY
 const opusClipRoutes = require('./routes/opusClip');        // 🎬 OPUS CLIP
 const manualClipRoutes = require('./routes/manualClip');    // ✂️ MANUAL CLIP
+const docFactoryRoutes = require('./routes/docFactory');    // 🎬 DOC FACTORY
 
 // Import services
 const cleanupService = require('./services/cleanupService');
@@ -126,6 +127,7 @@ app.get('/health', (req, res) => {
       jobs: 'active',
       opusClip: 'active',       // 🎬 OPUS CLIP
       manualClip: 'active',     // ✂️ MANUAL CLIP
+      docFactory: 'active',     // 🎬 DOC FACTORY
       render: 'active',
       singleReaction: 'active',
       split: 'active',
@@ -144,6 +146,7 @@ app.use('/api/audio-reaction', audioReactionRoutes);
 app.use('/api/clip-library', clipLibraryRoutes);  // 📚 CLIP LIBRARY
 app.use('/api/opus-clip', opusClipRoutes);        // 🎬 OPUS CLIP
 app.use('/api/manual-clip', manualClipRoutes);    // ✂️ MANUAL CLIP
+app.use('/api/doc-factory', docFactoryRoutes);    // 🎬 DOC FACTORY
 app.use('/api/combine', combineRoutes);
 app.use('/api/download', downloadRoutes);
 app.use('/api/jobs', jobsRoutes);
