@@ -72,7 +72,7 @@ async function storeUploadedImage(project, n, buffer, mime) {
  * mode==='api', generate them too; if mode==='manual', leave them for upload.
  * Returns { textCards, generated, pendingManual }.
  */
-async function fillImages(project, { mode = 'manual', onProgress } = {}) {
+async function fillImages(project, { mode = 'manual', limit = Infinity, onProgress } = {}) {
   let textCards = 0, generated = 0, pendingManual = 0;
   for (const panel of project.panels) {
     if (panel.image) continue; // already filled (e.g. a prior partial run)
@@ -80,7 +80,7 @@ async function fillImages(project, { mode = 'manual', onProgress } = {}) {
       await renderTextCardPanel(project, panel);
       textCards++;
       onProgress && onProgress({ n: panel.n, kind: 'text-card' });
-    } else if (mode === 'api') {
+    } else if (mode === 'api' && generated < limit) {
       await generateApiImage(project, panel);
       generated++;
       onProgress && onProgress({ n: panel.n, kind: 'api' });

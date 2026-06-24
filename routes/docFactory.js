@@ -151,8 +151,9 @@ router.post('/project/:id/generate-images', async (req, res) => {
   const project = await getProject(req.params.id).catch(() => null);
   if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
   const mode = (req.body && req.body.mode) === 'api' ? 'api' : 'manual';
+  const limit = (req.body && Number(req.body.limit) > 0) ? Number(req.body.limit) : Infinity;
   try {
-    const result = await imageProvider.fillImages(project, { mode });
+    const result = await imageProvider.fillImages(project, { mode, limit });
     await store.saveProject(project).catch(() => {});
     res.json({ success: true, mode, ...result, pending: project.panels.filter((p) => !p.image).map((p) => p.n) });
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
