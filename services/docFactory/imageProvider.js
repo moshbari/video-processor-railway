@@ -41,11 +41,14 @@ async function generateApiImage(project, panel) {
   if (!process.env.OPENAI_API_KEY) throw new Error('No image API configured (set OPENAI_API_KEY) — use manual upload instead.');
   const OpenAI = require('openai');
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  const prompt = panel.doodlePrompt || `${project.style_bible} Scene: ${panel.narration}`;
+  const bgName = panel.bg === 'night' ? 'solid dark navy blue' : panel.bg === 'parchment' ? 'solid warm parchment cream' : 'solid white';
+  const base = panel.doodlePrompt || `${project.style_bible} Scene: ${panel.narration}`;
+  const prompt = `${base} Background: ${bgName}, flat, no border. 16:9 framing.`;
   const resp = await client.images.generate({
     model: 'gpt-image-1',
     prompt,
-    size: '1536x1024', // closest 3:2 landscape; assembler pads/crops to 16:9
+    size: '1536x1024', // closest 3:2 landscape; assembler pads to 16:9
+    quality: process.env.DOC_FACTORY_IMG_QUALITY || 'medium', // doodles are line art; 'medium' is plenty and ~3x cheaper than 'high'
     n: 1,
   });
   const b64 = resp.data && resp.data[0] && resp.data[0].b64_json;
