@@ -162,12 +162,30 @@ async function assemble(project, opts = {}) {
     }
   }
 
-  // 6) upload to R2
-  const key = `docfactory/${project.id}/video.mp4`;
+  // 6) upload to R2 — name the file after the video's TITLE so a download saves
+  // as "What-Did-Ancient-Humans-Do-at-Night.mp4", not a generic "video.mp4".
+  // R2 is a different domain, so the browser takes the filename from the URL's
+  // last segment; putting the title there is what actually renames the download.
+  const fileName = fileSlug(project.title);
+  const key = `docfactory/${project.id}/${fileName}.mp4`;
   const up = await r2Service.uploadFile(finalFile, key, 'video/mp4');
   fs.remove(work).catch(() => {});
 
-  return { url: up.downloadUrl || up.url, key, durationSec: +totalSec.toFixed(1), panels: panels.length };
+  return { url: up.downloadUrl || up.url, key, fileName: `${fileName}.mp4`, durationSec: +totalSec.toFixed(1), panels: panels.length };
 }
 
-module.exports = { assemble };
+// Turn a title into a safe, readable file name (keeps words + case, drops
+// punctuation/emoji, spaces -> hyphens). Falls back if the title is empty.
+function fileSlug(title) {
+  const base = String(title || '')
+    .normalize('NFKD')
+    .replace(/[^\w\s-]/g, '')   // strip punctuation, emoji, ? ! : etc.
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .slice(0, 80)
+    .replace(/^-+|-+$/g, '');
+  return base || 'doodle-documentary';
+}
+
+module.exports = { assemble, fileSlug };
