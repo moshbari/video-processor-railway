@@ -36,7 +36,13 @@ async function renderTextCardPanel(project, panel) {
   return panel;
 }
 
-// ---- api: OpenAI gpt-image-1 from the doodle prompt -> R2 ------------------
+// ---- api: OpenAI gpt-image from the doodle prompt -> R2 --------------------
+// Default to gpt-image-2 at LOW quality: our panels are flat doodle line art
+// (thick outlines, flat fills), so low quality looks identical to the eye while
+// costing ~12x less than the old gpt-image-1 @ medium. gpt-image-1 is the older
+// model OpenAI is winding down anyway; gpt-image-2 is the current cheaper one.
+// Both knobs are env vars (DOC_FACTORY_IMG_MODEL / DOC_FACTORY_IMG_QUALITY) so
+// we can dial quality up for a specific run without a code change.
 async function generateApiImage(project, panel) {
   if (!process.env.OPENAI_API_KEY) throw new Error('No image API configured (set OPENAI_API_KEY) — use manual upload instead.');
   const OpenAI = require('openai');
@@ -45,10 +51,10 @@ async function generateApiImage(project, panel) {
   const base = panel.doodlePrompt || `${project.style_bible} Scene: ${panel.narration}`;
   const prompt = `${base} Background: ${bgName}, flat, no border. 16:9 framing.`;
   const resp = await client.images.generate({
-    model: 'gpt-image-1',
+    model: process.env.DOC_FACTORY_IMG_MODEL || 'gpt-image-2',
     prompt,
     size: '1536x1024', // closest 3:2 landscape; assembler pads to 16:9
-    quality: process.env.DOC_FACTORY_IMG_QUALITY || 'medium', // doodles are line art; 'medium' is plenty and ~3x cheaper than 'high'
+    quality: process.env.DOC_FACTORY_IMG_QUALITY || 'low', // flat doodles: 'low' is plenty and far cheaper
     n: 1,
   });
   const b64 = resp.data && resp.data[0] && resp.data[0].b64_json;
