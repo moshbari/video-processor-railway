@@ -27,6 +27,7 @@ const engine = require('../services/docFactory/engine');
 const store = require('../services/docFactory/store');
 const imageProvider = require('../services/docFactory/imageProvider');
 const assembleService = require('../services/docFactory/assembleService');
+const library = require('../services/docFactory/library');
 
 router.use((req, res, next) => {
   req.setTimeout(20 * 60 * 1000);
@@ -64,6 +65,7 @@ router.post('/generate', (req, res) => {
     return res.status(400).json({ success: false, error: 'No Claude connected. Set CLAUDE_CODE_OAUTH_TOKEN (your subscription) or ANTHROPIC_API_KEY on the server.' });
   }
 
+  const userId = req.headers['x-user-id'] || null;
   const jobId = uuidv4();
   const job = { status: 'running', events: [], result: null, error: null, created: Date.now() };
   JOBS.set(jobId, job);
@@ -78,10 +80,13 @@ router.post('/generate', (req, res) => {
   })
     .then(async (result) => {
       result.id = jobId;
+      result.userId = userId;            // so the render step can update the library
+      result.createdAt = Date.now();
       result.video = null;
       job.result = result;
       store.cacheProject(result);
       try { await store.saveProject(result); } catch (_) { /* R2 optional */ }
+      try { await library.add(userId, result); } catch (_) { /* library optional */ }
       job.status = 'done';
     })
     .catch((err) => {
@@ -104,10 +109,29 @@ router.get('/job/:id', (req, res) => {
 });
 
 // ===================== Phase 2: project + images =====================
+
+// A user's saved videos — so paid work is never lost. Scoped by X-User-Id.
+router.get('/projects', async (req, res) => {
+  const userId = req.headers['x-user-id'] || null;
+  try {
+    const projects = await library.list(userId);
+    res.json({ success: true, projects });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
 router.get('/project/:id', async (req, res) => {
   const project = await getProject(req.params.id).catch(() => null);
   if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
   res.json({ success: true, project });
+});
+
+// Remove a project from the user's library list (R2 assets are left in place).
+router.delete('/project/:id', async (req, res) => {
+  const userId = req.headers['x-user-id'] || null;
+  try {
+    const removed = await library.remove(userId, req.params.id);
+    res.json({ success: true, removed });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 router.get('/project/:id/prompt-sheet', async (req, res) => {
@@ -181,6 +205,8 @@ router.post('/project/:id/render', async (req, res) => {
     .then(async (out) => {
       project.video = out.url; project.video_meta = out;
       try { await store.saveProject(project); } catch (_) {}
+      // Record the finished video in the owner's library so they can find it later.
+      try { await library.setVideo(project.userId || req.headers['x-user-id'] || null, project.id, out.url); } catch (_) {}
       job.video = out; job.status = 'done';
       pushEvent(job, { type: 'phase', key: 'done' });
     })
