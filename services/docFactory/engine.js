@@ -61,7 +61,10 @@ WHAT MAKES THE FORMAT WORK (obey all of it):
 - IT IS HONEST. Mix established facts with clearly-framed informed speculation
   ("we can't know for sure, but the bones suggest..."). Never invent fake facts.
 - THE VISUALS are dead simple doodles, ONE idea per panel, changing every few
-  seconds. Many panels are just a BOLD WORD or number on screen (a "text-card").
+  seconds. EVERY panel has a doodle — even the ones that land a key word or
+  number. For those, the bold word/number is laid OVER the doodle as on-screen
+  text; it is NEVER bare text on an empty card. There is always a drawing behind
+  it, because a picture holds the viewer far better than a word alone.
 - Pace: a new panel roughly every 3 seconds. An 8-minute video is ~150 panels.`;
 
 const BLUEPRINT_SHAPE = `{
@@ -98,9 +101,9 @@ const PANELS_SHAPE = `{
   "panels": [
     {
       "narration": "ONE short spoken line for this panel — ~6-14 words, calm/immersive/present-tense, flows naturally from the previous line. This is what the voiceover says while this panel is on screen.",
-      "panelType": "illustration | text-card",
-      "doodlePrompt": "for an 'illustration' panel: a short description of ONE simple doodle scene that matches the line (subject + action + setting). Empty string for a text-card.",
-      "callout": "bold on-screen text for this panel (a word, number, or 2-4 words). REQUIRED for 'text-card'; optional small label for an 'illustration'; empty string if none.",
+      "panelType": "illustration | text-card  (text-card = an EMPHASIS panel — it still has a doodle, it just also carries a big bold word/number)",
+      "doodlePrompt": "ALWAYS REQUIRED, for every panel: a short description of ONE simple doodle scene that matches the line (subject + action + setting). For an emphasis panel, draw a doodle that visually represents the key word/number too — never leave this empty.",
+      "callout": "bold on-screen text laid OVER the doodle (a word, number, or 2-4 words) — REQUIRED for 'text-card' emphasis panels, optional short label otherwise; empty string if none.",
       "bg": "white | night | parchment"
     }
   ]
@@ -116,10 +119,10 @@ ${STYLE_BIBLE}
 
 YOUR JOB IN THIS PASS:
 - THE NARRATOR: write the voiceover for this beat as a flowing sequence of SHORT lines (~6-14 words each). Calm, immersive, present-tense, plain words. It must connect smoothly to the previous beat (you are given the last line) and tease forward. Cover the beat fully but do not drift into other beats.
-- THE CINEMATOGRAPHER: split the narration so EACH line is ONE panel (~3 seconds on screen). For each panel decide:
-   • an "illustration" with a one-subject doodlePrompt that literally shows the line, OR
-   • a "text-card" when the line lands a key word, number, or phrase — set the bold "callout".
-  Use a sensible mix; text-cards for emphasis/numbers, illustrations for scenes. Choose bg (white default; night for dark/nighttime scenes; parchment for ancient/historical framing).
+- THE CINEMATOGRAPHER: split the narration so EACH line is ONE panel (~3 seconds on screen). EVERY panel gets a doodlePrompt — a one-subject doodle that literally shows the line. Then for each panel decide:
+   • a plain "illustration" — just the doodle, no big text (callout empty or a tiny label), OR
+   • a "text-card" emphasis panel when the line lands a key word, number, or phrase — STILL give it a doodlePrompt (a doodle that pictures that idea) AND set the bold "callout" that will sit on top of the doodle.
+  NEVER produce a panel with an empty doodlePrompt. Use a sensible mix of emphasis vs plain panels. Choose bg (white default; night for dark/nighttime scenes; parchment for ancient/historical framing).
 
 Aim for roughly 6-12 panels for this beat (more for big beats). Output ONLY a JSON object wrapped in <json></json> tags, no other prose, of this shape:
 <json>
@@ -346,9 +349,10 @@ async function runDocFactory({ idea, minutes, oauthToken, apiKey, subModel, apiM
         beat: beat.n || i + 1,
         narration,
         panelType,
-        doodlePrompt: panelType === 'illustration'
-          ? `${STYLE_BIBLE} Scene: ${String(p.doodlePrompt || narration).trim()}`
-          : '',
+        // EVERY panel gets a doodle now — even emphasis ("text-card") panels.
+        // The bold callout is laid over this doodle by the assembler, so the
+        // viewer always sees a drawing, never bare text on a flat card.
+        doodlePrompt: `${STYLE_BIBLE} Scene: ${String(p.doodlePrompt || narration).trim()}`,
         callout: String(p.callout || '').trim(),
         bg,
         bgHex: bgHex(bg),

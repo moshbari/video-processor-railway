@@ -88,4 +88,32 @@ function renderTextCard({ callout, bgHex, outPath }) {
   });
 }
 
-module.exports = { renderTextCard, textColor, wrap, W, H };
+/**
+ * Build a drawtext filter that lays a bold CALLOUT over an existing doodle
+ * (used by the assembler so emphasis panels show a drawing AND the key word).
+ * Writes the text to a temp file (avoids ffmpeg escaping headaches) and returns
+ * the filter snippet plus that file so the caller can clean it up.
+ *
+ * @param {{callout:string, tag:string}} opts
+ * @returns {Promise<{ vf:string, file:string }>}
+ */
+async function calloutOverlay({ callout, tag }) {
+  const lines = wrap((callout || '').toUpperCase(), 22);
+  const longest = lines.reduce((m, l) => Math.max(m, l.length), 1);
+  // Smaller than a full text-card — it sits ON the doodle, near the bottom.
+  let fontsize = Math.round(Math.min(150, Math.max(56, 1100 / longest)));
+  if (lines.length >= 3) fontsize = Math.min(fontsize, 96);
+
+  const file = path.join(os.tmpdir(), `dfcallout-${tag}-${process.hrtime()[1]}.txt`);
+  await fs.writeFile(file, lines.join('\n'), 'utf8');
+
+  const fontArg = process.env.DOC_FACTORY_FONT ? `fontfile='${process.env.DOC_FACTORY_FONT}':` : '';
+  // Bold dark text in a solid white pill, centered low — readable over any doodle.
+  const vf =
+    `drawtext=${fontArg}textfile='${file}':fontcolor=#111111:fontsize=${fontsize}:` +
+    `box=1:boxcolor=white@0.88:boxborderw=${Math.round(fontsize / 2.4)}:` +
+    `line_spacing=${Math.round(fontsize / 6)}:x=(w-text_w)/2:y=h-text_h-110`;
+  return { vf, file };
+}
+
+module.exports = { renderTextCard, calloutOverlay, textColor, wrap, W, H };

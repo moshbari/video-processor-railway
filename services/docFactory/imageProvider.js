@@ -71,15 +71,19 @@ async function storeUploadedImage(project, n, buffer, mime) {
 }
 
 /**
- * Fill every text-card panel (always free). For illustration panels: if
- * mode==='api', generate them too; if mode==='manual', leave them for upload.
+ * Every panel now has a doodle (emphasis panels included — their bold word is
+ * overlaid on the doodle by the assembler). If mode==='api' we generate those
+ * doodles; if mode==='manual' we leave them for the user's ChatGPT uploads. The
+ * rare panel with no doodlePrompt falls back to a plain text-card (free).
  * Returns { textCards, generated, pendingManual }.
  */
 async function fillImages(project, { mode = 'manual', limit = Infinity, onProgress } = {}) {
   let textCards = 0, generated = 0, pendingManual = 0;
   for (const panel of project.panels) {
     if (panel.image) continue; // already filled (e.g. a prior partial run)
-    if (panel.panelType === 'text-card' || (panel.callout && !panel.doodlePrompt)) {
+    // Every panel should have a doodle now (emphasis panels included). Only the
+    // rare panel with NO doodlePrompt falls back to a plain text-card.
+    if (!panel.doodlePrompt) {
       await renderTextCardPanel(project, panel);
       textCards++;
       onProgress && onProgress({ n: panel.n, kind: 'text-card' });
@@ -99,8 +103,10 @@ function promptSheet(project) {
   const lines = [`# ${project.title} — doodle prompt sheet`, ''];
   lines.push(`STYLE (paste once, keep it on every image):`, project.style_bible, '');
   for (const p of project.panels) {
-    if (p.panelType === 'text-card') continue; // those are auto-rendered
-    lines.push(`#${p.n}: ${p.doodlePrompt || p.narration}` + (p.callout ? `  [label: ${p.callout}]` : ''));
+    if (!p.doodlePrompt) continue; // the rare bare text-card is auto-rendered
+    // Every panel needs a doodle. The callout is added as overlay text by us —
+    // draw ONLY the doodle, leave room near the bottom for the bold word.
+    lines.push(`#${p.n}: ${p.doodlePrompt || p.narration}` + (p.callout ? `  [bold overlay text, added automatically: ${p.callout}]` : ''));
   }
   return lines.join('\n');
 }

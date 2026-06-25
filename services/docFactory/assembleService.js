@@ -22,7 +22,7 @@ const fs = require('fs-extra');
 const { spawn } = require('child_process');
 const r2Service = require('../r2Service');
 const voiceService = require('../voiceService');
-const { renderTextCard } = require('./textCard');
+const { renderTextCard, calloutOverlay } = require('./textCard');
 
 const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
 const FFPROBE = process.env.FFPROBE_PATH || 'ffprobe';
@@ -108,7 +108,17 @@ async function assemble(project, opts = {}) {
 
     // 3) build the segment (still image for `dur`, with audio or generated silence)
     const seg = path.join(segDir, `seg${String(i).padStart(3, '0')}.mp4`);
-    const vf = `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=${(panel.bgHex || '#000000').replace('#', '0x')},fps=${FPS},format=yuv420p`;
+    let vf = `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=${(panel.bgHex || '#000000').replace('#', '0x')},fps=${FPS},format=yuv420p`;
+    // Emphasis panels: lay the bold callout OVER the doodle. Skip when the image
+    // is a placeholder text-card (the callout is already the whole card there).
+    let calloutFile = null;
+    if (panel.callout && panel.callout.trim() && imgFile && !panel._placeholder) {
+      try {
+        const ov = await calloutOverlay({ callout: panel.callout, tag: `${project.id}-${panel.n}` });
+        vf += ',' + ov.vf;
+        calloutFile = ov.file;
+      } catch (_) { /* doodle alone is fine if the overlay can't be built */ }
+    }
     const args = ['-y', '-loop', '1', '-i', imgFile];
     if (audioFile) args.push('-i', audioFile);
     else args.push('-f', 'lavfi', '-i', `anullsrc=channel_layout=stereo:sample_rate=44100`);
@@ -120,6 +130,7 @@ async function assemble(project, opts = {}) {
       '-shortest', '-movflags', '+faststart', seg
     );
     await run(FFMPEG, args);
+    if (calloutFile) fs.remove(calloutFile).catch(() => {});
     segFiles.push(seg);
     totalSec += dur;
     say({ n: panel.n, of: panels.length, dur: +dur.toFixed(1), done: i + 1 });
