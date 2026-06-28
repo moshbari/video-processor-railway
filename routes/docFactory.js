@@ -28,6 +28,7 @@ const store = require('../services/docFactory/store');
 const imageProvider = require('../services/docFactory/imageProvider');
 const assembleService = require('../services/docFactory/assembleService');
 const library = require('../services/docFactory/library');
+const voiceService = require('../services/voiceService');
 
 router.use((req, res, next) => {
   req.setTimeout(20 * 60 * 1000);
@@ -53,6 +54,61 @@ async function getProject(id) {
   return store.loadProject(id);
 }
 
+// Claude credentials for any pass (generation OR a manual-mode revision).
+function claudeCreds(req) {
+  const oauthToken = engine.sanitizeClaudeToken((req.body && req.body.oauthToken) || process.env.CLAUDE_CODE_OAUTH_TOKEN || '');
+  const apiKey = process.env.ANTHROPIC_API_KEY || '';
+  return { oauthToken: oauthToken || undefined, apiKey: oauthToken ? undefined : apiKey };
+}
+
+// Turn the creator's voice choice into a stored preference used at render time.
+// Accepts either a direct {provider, voice} or a plain {gender, accent}.
+function parseVoicePref(body = {}) {
+  const speed = Math.max(0.7, Math.min(1.4, Number(body.speed) || 1));
+  if (body.provider && body.voice) return { provider: body.provider, voice: body.voice, speed };
+  if (body.gender || body.accent) {
+    const r = voiceService.resolveDocFactoryVoice({ gender: body.gender, accent: body.accent });
+    return { provider: r.provider, voice: r.voice, label: r.label, gender: body.gender || null, accent: body.accent || null, speed };
+  }
+  return { speed };
+}
+
+// Run an async AI revision as a tracked job so the frontend can poll /job/:id
+// and show the live "✍️ reworking…" feed, exactly like generation. The job's
+// result is the updated project (frontend reads result.panels).
+function startAiJob(work) {
+  const jobId = uuidv4();
+  const job = { status: 'running', events: [], result: null, error: null, created: Date.now() };
+  JOBS.set(jobId, job);
+  Promise.resolve()
+    .then(() => work((ev) => pushEvent(job, ev)))
+    .then((result) => { job.result = result; job.status = 'done'; pushEvent(job, { type: 'phase', key: 'done' }); })
+    .catch((err) => { job.error = (err && err.message) || 'That change failed — please try again.'; job.status = 'error'; pushEvent(job, { type: 'error', text: job.error }); });
+  return jobId;
+}
+
+const SUB_MODEL = process.env.DOC_FACTORY_SUB_MODEL || 'sonnet';
+const API_MODEL = process.env.DOC_FACTORY_API_MODEL || 'claude-opus-4-8';
+
+// Re-tally the stats card after a manual script change.
+function recomputeStats(panels) {
+  const words = panels.reduce((s, p) => s + (p.narration ? p.narration.split(/\s+/).length : 0), 0);
+  const textCards = panels.filter((p) => p.panelType === 'text-card').length;
+  return { panels: panels.length, text_cards: textCards, illustrations: panels.length - textCards, words, est_minutes: +(words / 150).toFixed(1) };
+}
+
+// Re-shape panels the creator edited by hand into the canonical panel shape.
+function normalizeEditedPanels(project, rawPanels) {
+  const style = project.style_bible || engine.STYLE_BIBLE;
+  const out = [];
+  for (const p of (rawPanels || [])) {
+    const narration = String(p.narration || '').trim();
+    if (!narration && !p.callout) continue;
+    out.push(engine.buildPanel(p, style, out.length + 1, p.beat || 1));
+  }
+  return out;
+}
+
 // ===================== Phase 1: generate =====================
 router.post('/generate', (req, res) => {
   const idea = String((req.body && req.body.idea) || '').trim();
@@ -65,13 +121,30 @@ router.post('/generate', (req, res) => {
     return res.status(400).json({ success: false, error: 'No Claude connected. Set CLAUDE_CODE_OAUTH_TOKEN (your subscription) or ANTHROPIC_API_KEY on the server.' });
   }
 
+  // Mode: 'auto' (full auto, the original), 'semi' (up-front directions then
+  // auto) or 'manual' (review/approve the script + image prompts by hand).
+  const body = req.body || {};
+  const mode = ['auto', 'semi', 'manual'].includes(body.mode) ? body.mode : 'auto';
+  // Semi-auto up-front directions (ignored in auto/manual so behaviour is unchanged).
+  const semiCfg = mode === 'semi'
+    ? {
+        hook: String(body.hook || '').trim(),
+        cta: String(body.cta || '').trim(),
+        directives: String(body.directives || '').trim(),
+        styleOverride: String(body.imageStyle || body.styleOverride || '').trim(),
+      }
+    : {};
+  // Voice/speed the creator picked up-front (semi) — applied at render time.
+  const voicePref = parseVoicePref(body);
+  const imageFill = body.imageFill === 'manual' ? 'manual' : (body.imageFill === 'api' ? 'api' : null);
+
   const userId = req.headers['x-user-id'] || null;
   const jobId = uuidv4();
   const job = { status: 'running', events: [], result: null, error: null, created: Date.now() };
   JOBS.set(jobId, job);
 
   engine.runDocFactory({
-    idea, minutes,
+    idea, minutes, mode, ...semiCfg,
     oauthToken: oauthToken || undefined,
     apiKey: oauthToken ? undefined : apiKey,
     subModel: process.env.DOC_FACTORY_SUB_MODEL || 'sonnet',
@@ -83,6 +156,10 @@ router.post('/generate', (req, res) => {
       result.userId = userId;            // so the render step can update the library
       result.createdAt = Date.now();
       result.video = null;
+      // Where the frontend should land: manual mode pauses on the script for review.
+      result.stage = mode === 'manual' ? 'script-review' : 'ready';
+      result.voicePref = voicePref;
+      if (imageFill) result.imageFill = imageFill;
       job.result = result;
       store.cacheProject(result);
       try { await store.saveProject(result); } catch (_) { /* R2 optional */ }
@@ -183,6 +260,99 @@ router.post('/project/:id/generate-images', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+// ===================== Manual mode: review gates =====================
+// The creator reviews the finished script, edits it (by hand or by asking the
+// AI), approves it, then does the same for the doodle image prompts.
+
+// What voice options + image-AI are usable right now (drives the semi-auto UI).
+router.get('/capabilities', (req, res) => {
+  res.json({ success: true, voices: voiceService.docFactoryVoiceOptions(), imageApi: !!process.env.OPENAI_API_KEY });
+});
+
+// Revise the SCRIPT. Either { panels: [...] } (the creator's own edits, applied
+// instantly) or { instruction: "..." } (the AI reworks it — returns a jobId you
+// poll at /job/:id, whose result is the updated project).
+router.post('/project/:id/revise-script', async (req, res) => {
+  const project = await getProject(req.params.id).catch(() => null);
+  if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
+  const body = req.body || {};
+
+  if (Array.isArray(body.panels)) {
+    project.panels = normalizeEditedPanels(project, body.panels);
+    project.stats = recomputeStats(project.panels);
+    project.stage = 'script-review';
+    await store.saveProject(project).catch(() => {});
+    return res.json({ success: true, project });
+  }
+
+  const instruction = String(body.instruction || '').trim();
+  if (!instruction) return res.status(400).json({ success: false, error: 'Tell the AI what to change, or send your own edits.' });
+  const creds = claudeCreds(req);
+  if (!creds.oauthToken && !creds.apiKey) return res.status(400).json({ success: false, error: 'No Claude connected.' });
+
+  const jobId = startAiJob(async (emit) => {
+    const panels = await engine.reviseScript({ project, instruction, ...creds, subModel: SUB_MODEL, apiModel: API_MODEL, emit });
+    project.panels = panels;
+    project.stats = recomputeStats(panels);
+    project.stage = 'script-review';
+    await store.saveProject(project).catch(() => {});
+    return project;
+  });
+  res.json({ success: true, jobId });
+});
+
+// Approve the script -> move on to the image-prompt review.
+router.post('/project/:id/approve-script', async (req, res) => {
+  const project = await getProject(req.params.id).catch(() => null);
+  if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
+  project.stage = 'image-review';
+  await store.saveProject(project).catch(() => {});
+  res.json({ success: true, project });
+});
+
+// Revise the IMAGE (doodle) PROMPTS. Either { prompts: [{n, doodlePrompt, callout}] }
+// (instant manual edits) or { instruction: "..." } (AI refine -> jobId).
+router.post('/project/:id/revise-image-prompts', async (req, res) => {
+  const project = await getProject(req.params.id).catch(() => null);
+  if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
+  const body = req.body || {};
+  const style = project.style_bible || engine.STYLE_BIBLE;
+
+  if (Array.isArray(body.prompts)) {
+    const byN = new Map(body.prompts.map((x) => [Number(x.n), x]));
+    for (const panel of project.panels) {
+      const upd = byN.get(panel.n);
+      if (!upd) continue;
+      const scene = engine.rawScene(upd.doodlePrompt);
+      if (scene) { panel.doodlePrompt = `${style} Scene: ${scene}`; panel.image = null; panel.imageSource = undefined; }
+      if (typeof upd.callout === 'string') panel.callout = upd.callout.trim();
+    }
+    await store.saveProject(project).catch(() => {});
+    return res.json({ success: true, project });
+  }
+
+  const instruction = String(body.instruction || '').trim();
+  if (!instruction) return res.status(400).json({ success: false, error: 'Tell the AI what to change, or send your own edits.' });
+  const creds = claudeCreds(req);
+  if (!creds.oauthToken && !creds.apiKey) return res.status(400).json({ success: false, error: 'No Claude connected.' });
+
+  const jobId = startAiJob(async (emit) => {
+    await engine.reviseImagePrompts({ project, instruction, ...creds, subModel: SUB_MODEL, apiModel: API_MODEL, emit });
+    await store.saveProject(project).catch(() => {});
+    return project;
+  });
+  res.json({ success: true, jobId });
+});
+
+// Approve the image prompts -> ready to generate/upload images.
+router.post('/project/:id/approve-image-prompts', async (req, res) => {
+  const project = await getProject(req.params.id).catch(() => null);
+  if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
+  project.stage = 'images';
+  await store.saveProject(project).catch(() => {});
+  res.json({ success: true, project });
+});
+
 // ===================== Phase 3: assemble =====================
 router.post('/project/:id/render', async (req, res) => {
   const project = await getProject(req.params.id).catch(() => null);
@@ -193,10 +363,15 @@ router.post('/project/:id/render', async (req, res) => {
   RENDERS.set(renderId, job);
   pushEvent(job, { type: 'phase', key: 'assembling' });
 
+  // Fall back to the voice/speed the creator chose up-front (semi mode) if the
+  // render request doesn't override it.
+  const pref = project.voicePref || {};
+  const body = req.body || {};
   assembleService.assemble(project, {
-    provider: (req.body && req.body.provider) || process.env.DOC_FACTORY_TTS_PROVIDER || 'openai',
-    voice: req.body && req.body.voice,
-    bgmUrl: req.body && req.body.bgmUrl,
+    provider: body.provider || pref.provider || process.env.DOC_FACTORY_TTS_PROVIDER || 'openai',
+    voice: body.voice || pref.voice,
+    speed: body.speed || pref.speed || 1,
+    bgmUrl: body.bgmUrl,
     onProgress: (m) => {
       if (m && m.done) pushEvent(job, { type: 'activity', text: `Panel ${m.done}/${m.of} (${m.dur}s)` });
       else if (m && m.warn) pushEvent(job, { type: 'activity', text: `⚠️ ${m.warn}` });

@@ -61,8 +61,22 @@ async function fetchToFile(url, dest) {
  * @param {object} opts { provider, voice, bgmUrl, bgmVolume, onProgress }
  * @returns {Promise<{url:string, durationSec:number, panels:number}>}
  */
+// Build an atempo filter chain for any speed (a single atempo only spans
+// 0.5–2.0, so we factor larger/smaller speeds into a chain). Our UI range is
+// ~0.7–1.4, well within one stage, but this keeps it safe either way.
+function atempoChain(speed) {
+  let s = Math.max(0.5, Math.min(3, Number(speed) || 1));
+  const stages = [];
+  while (s > 2.0) { stages.push(2.0); s /= 2.0; }
+  while (s < 0.5) { stages.push(0.5); s /= 0.5; }
+  stages.push(+s.toFixed(4));
+  return stages.map((x) => `atempo=${x}`).join(',');
+}
+
 async function assemble(project, opts = {}) {
   const { provider = 'openai', voice, bgmUrl, bgmVolume = 0.12, onProgress } = opts;
+  // Narration playback speed (1 = normal). Clamp to a sane, natural range.
+  const speed = Math.max(0.7, Math.min(1.4, Number(opts.speed) || 1));
   const work = path.join(process.env.TEMP_DIR || os.tmpdir(), `docfactory-${project.id}`);
   await fs.ensureDir(work);
   const segDir = path.join(work, 'segs');
@@ -85,6 +99,15 @@ async function assemble(project, opts = {}) {
         const { buffer, ext } = await voiceService.generateTTS({ provider, text: panel.narration, voice });
         audioFile = `${base}${ext}`;
         await fs.writeFile(audioFile, buffer);
+        // Apply the creator's chosen narration speed (slower/faster) uniformly,
+        // whatever the TTS provider — atempo changes tempo without pitch shift.
+        if (speed !== 1) {
+          try {
+            const sped = `${base}.spd${ext}`;
+            await run(FFMPEG, ['-y', '-i', audioFile, '-filter:a', atempoChain(speed), '-vn', sped]);
+            audioFile = sped;
+          } catch (_) { /* keep the original-speed audio if atempo fails */ }
+        }
         dur = Math.max(MIN_PANEL_SEC, await probeDuration(audioFile));
       } catch (e) {
         say({ n: panel.n, warn: `voice failed (${e.message.slice(0, 60)}) — silent panel` });

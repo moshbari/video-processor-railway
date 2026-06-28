@@ -368,6 +368,55 @@ class VoiceService {
     };
   }
 
+  // ========================================================================
+  // 🎬 DOC FACTORY — simple "male / female + accent" voice picker
+  // ========================================================================
+  // The creator just chooses a gender and an accent; we map that to a real
+  // provider + voice. Only providers whose API key is set are offered, and
+  // OpenAI (which already powers this backend) is the always-on fallback.
+  // Earlier entries are preferred when several match.
+  _docFactoryVoicePresets() {
+    return [
+      { accent: 'US',         gender: 'female', provider: 'openai',       voice: 'nova',                  label: 'Nova · warm US female' },
+      { accent: 'US',         gender: 'male',   provider: 'openai',       voice: 'onyx',                  label: 'Onyx · deep US male' },
+      { accent: 'UK',         gender: 'male',   provider: 'elevenlabs',   voice: 'JBFqnCBsd6RMkjVDRZzb',  label: 'George · warm UK male' },
+      { accent: 'UK',         gender: 'female', provider: 'speechmatics', voice: 'sarah',                 label: 'Sarah · UK female' },
+      { accent: 'UK',         gender: 'male',   provider: 'speechmatics', voice: 'theo',                  label: 'Theo · UK male' },
+      { accent: 'Australian', gender: 'male',   provider: 'elevenlabs',   voice: 'IKne3meq5aSn9XLyUdCD',  label: 'Charlie · Australian male' },
+      { accent: 'US',         gender: 'female', provider: 'elevenlabs',   voice: '21m00Tcm4TlvDq8ikWAM',  label: 'Rachel · calm US female' },
+      { accent: 'US',         gender: 'male',   provider: 'elevenlabs',   voice: 'pNInz6obpgDQGcFmaJgB',  label: 'Adam · deep US male' },
+    ];
+  }
+
+  _providerAvailable(p) {
+    if (p === 'openai') return !!process.env.OPENAI_API_KEY;
+    if (p === 'elevenlabs') return !!this.apiKey;
+    if (p === 'speechmatics') return !!(process.env.SPEECHMATICS_API_KEY || '').trim();
+    return false;
+  }
+
+  /** The gender/accent presets that actually work right now (key is set). */
+  docFactoryVoiceOptions() {
+    return this._docFactoryVoicePresets().filter((v) => this._providerAvailable(v.provider));
+  }
+
+  /**
+   * Turn { gender, accent } into a real { provider, voice }. Falls back to the
+   * best available match by gender, then to OpenAI's default voices.
+   */
+  resolveDocFactoryVoice({ gender, accent } = {}) {
+    const g = (gender || '').toLowerCase();
+    const a = (accent || '').toLowerCase();
+    const avail = this.docFactoryVoiceOptions();
+    const exact = avail.find((v) => v.gender === g && v.accent.toLowerCase() === a);
+    if (exact) return { provider: exact.provider, voice: exact.voice, label: exact.label };
+    const byGender = avail.find((v) => v.gender === g);
+    if (byGender) return { provider: byGender.provider, voice: byGender.voice, label: byGender.label };
+    // last resort: OpenAI defaults
+    const voice = g === 'male' ? 'onyx' : 'nova';
+    return { provider: 'openai', voice, label: `${voice[0].toUpperCase() + voice.slice(1)} · default` };
+  }
+
   /**
    * Generate speech from text for ReVoice. Returns the raw audio so the caller
    * can park it on R2 (same path as a recorded clip).

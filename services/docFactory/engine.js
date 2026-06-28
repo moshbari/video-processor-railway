@@ -39,6 +39,78 @@ function sanitizeClaudeToken(token) {
   return String(token || '').replace(/\s+/g, '');
 }
 
+// The look every panel shares. In SEMI-AUTOMATIC mode the creator may add a
+// style nudge (e.g. "watercolor", "neon", "2D South-Park style"); we append it
+// to the fixed bible so the whole video still feels like one hand.
+function effectiveStyle(styleOverride) {
+  const ov = String(styleOverride || '').trim();
+  return ov ? `${STYLE_BIBLE} ADDITIONAL STYLE DIRECTION FROM THE CREATOR (apply to every panel): ${ov}` : STYLE_BIBLE;
+}
+
+// SEMI-AUTOMATIC creator directives, folded into the writing prompts so the
+// script obeys them. Hook/CTA are ALSO injected deterministically after writing
+// (see injectHookCta) so they land word-for-word even if the model paraphrases.
+function directivesBlock({ hook, cta, directives } = {}) {
+  const parts = [];
+  if (hook && String(hook).trim()) parts.push(`- OPEN the video with THIS EXACT hook line, word for word, as the very first narration panel: "${String(hook).trim()}"`);
+  if (cta && String(cta).trim()) parts.push(`- END the video with THIS EXACT call-to-action, word for word, as the final narration panel: "${String(cta).trim()}"`);
+  if (directives && String(directives).trim()) parts.push(`- Also follow these instructions from the creator: ${String(directives).trim()}`);
+  if (!parts.length) return '';
+  return `\n\nCREATOR DIRECTIVES (these are mandatory — follow them exactly, they override the defaults):\n${parts.join('\n')}`;
+}
+
+// Strip the style-bible prefix we bake onto every doodlePrompt, leaving just the
+// human "scene" the creator sees + edits in the manual image-prompt review.
+function rawScene(doodlePrompt) {
+  const s = String(doodlePrompt || '');
+  const i = s.indexOf('Scene:');
+  return (i >= 0 ? s.slice(i + 'Scene:'.length) : s).trim();
+}
+
+// Build ONE normalized panel object the same way everywhere (main pipeline,
+// hook/CTA injection, and the manual revisers) so every panel has the same shape.
+function buildPanel({ narration, panelType, doodlePrompt, callout, bg }, styleBible, n, beat) {
+  const pt = panelType === 'text-card' ? 'text-card' : 'illustration';
+  const b = ['white', 'night', 'parchment'].includes(bg) ? bg : 'white';
+  const narr = String(narration || '').trim();
+  return {
+    n,
+    beat: beat || 1,
+    narration: narr,
+    panelType: pt,
+    // EVERY panel gets a doodle — the bold callout is overlaid on it later.
+    doodlePrompt: `${styleBible} Scene: ${rawScene(doodlePrompt) || narr}`,
+    callout: String(callout || '').trim(),
+    bg: b,
+    bgHex: bgHex(b),
+    image: null,
+  };
+}
+
+function renumber(panels) {
+  panels.forEach((p, i) => { p.n = i + 1; });
+  return panels;
+}
+
+// Deterministically guarantee the word-for-word hook/CTA the SEMI creator asked
+// for. If the writer already opened/closed with it (case-insensitive contains),
+// we leave it; otherwise we prepend/append a clean panel so it lands exactly.
+function injectHookCta(panels, { hook, cta }, styleBible) {
+  const h = String(hook || '').trim();
+  const c = String(cta || '').trim();
+  if (h) {
+    const first = panels[0];
+    const has = first && first.narration.toLowerCase().includes(h.toLowerCase());
+    if (!has) panels.unshift(buildPanel({ narration: h, panelType: 'illustration', doodlePrompt: h, bg: panels[0] ? panels[0].bg : 'white' }, styleBible, 1, 1));
+  }
+  if (c) {
+    const last = panels[panels.length - 1];
+    const has = last && last.narration.toLowerCase().includes(c.toLowerCase());
+    if (!has) panels.push(buildPanel({ narration: c, panelType: 'illustration', doodlePrompt: c, bg: last ? last.bg : 'white' }, styleBible, panels.length + 1, last ? last.beat : 1));
+  }
+  return renumber(panels);
+}
+
 // ---------------------------------------------------------------------------
 // Prompts
 // ---------------------------------------------------------------------------
@@ -109,13 +181,13 @@ const PANELS_SHAPE = `{
   ]
 }`;
 
-function panelsSystem() {
+function panelsSystem(styleBible = STYLE_BIBLE) {
   return `You are THE NARRATOR and THE CINEMATOGRAPHER of Doc Factory. You receive ONE beat of an already-structured documentary and you expand JUST THAT BEAT into a sequence of panels.
 
 ${MISSION}
 
 THE DOODLE STYLE BIBLE (every illustration shares this — describe only the subject, the look is fixed):
-${STYLE_BIBLE}
+${styleBible}
 
 YOUR JOB IN THIS PASS:
 - THE NARRATOR: write the voiceover for this beat as a flowing sequence of SHORT lines (~6-14 words each). Calm, immersive, present-tense, plain words. It must connect smoothly to the previous beat (you are given the last line) and tease forward. Cover the beat fully but do not drift into other beats.
@@ -287,17 +359,22 @@ function bgHex(bg) {
   return '#ffffff';
 }
 
-async function runDocFactory({ idea, minutes, oauthToken, apiKey, subModel, apiModel, emit }) {
+async function runDocFactory({ idea, minutes, oauthToken, apiKey, subModel, apiModel, emit, mode, hook, cta, directives, styleOverride }) {
   const say = (e) => { try { emit && emit(e); } catch (_) {} };
   const run = makeRunner({ oauthToken, apiKey, subModel, apiModel, emit });
   const targetMinutes = Math.max(3, Math.min(20, Number(minutes) || 8));
+  // SEMI-AUTOMATIC up-front directions. In 'auto' and 'manual' modes these are
+  // empty, so the prompts are byte-for-byte what they were before.
+  const semi = mode === 'semi' ? { hook, cta, directives } : {};
+  const styleBible = effectiveStyle(mode === 'semi' ? styleOverride : '');
+  const directives_ = directivesBlock(semi);
 
   // ---- Pass 1: blueprint (Scout + Researcher + Architect, with WebSearch) ----
   say({ type: 'phase', key: 'blueprint' });
   say({ type: 'activity', icon: '🧭', text: 'Scouting the angle and researching…' });
   const blueprintPrompt =
     `THE IDEA / KEYWORD FROM THE CREATOR:\n"""\n${String(idea || '').trim()}\n"""\n\n` +
-    `Target length: about ${targetMinutes} minutes. Produce the blueprint JSON now.`;
+    `Target length: about ${targetMinutes} minutes.${directives_}\n\nProduce the blueprint JSON now.`;
   const blueprintText = await run({
     system: BLUEPRINT_SYSTEM, prompt: blueprintPrompt, withTools: true, timeoutMs: 9 * 60 * 1000,
   });
@@ -329,11 +406,11 @@ async function runDocFactory({ idea, minutes, oauthToken, apiKey, subModel, apiM
       (lastLine
         ? `The previous panel's narration line was: "${lastLine}". Continue smoothly from it.\n\n`
         : `This is the OPENING of the video — the first 1-2 lines must hook hard.\n\n`) +
-      `LENGTH: keep this beat's narration to about ${perBeatWords} words total (the whole video targets ~${wordBudget} words for ${targetMinutes} min). Be economical — short lines, no padding.\n\n` +
+      `LENGTH: keep this beat's narration to about ${perBeatWords} words total (the whole video targets ~${wordBudget} words for ${targetMinutes} min). Be economical — short lines, no padding.${directives_}\n\n` +
       `Expand ONLY this beat into panels now. Return the panels JSON.`;
     let beatPanels = [];
     try {
-      const beatText = await run({ system: panelsSystem(), prompt: beatPrompt, withTools: false, timeoutMs: 5 * 60 * 1000 });
+      const beatText = await run({ system: panelsSystem(styleBible), prompt: beatPrompt, withTools: false, timeoutMs: 5 * 60 * 1000 });
       const parsed = extractJson(beatText);
       if (parsed && Array.isArray(parsed.panels)) beatPanels = parsed.panels;
     } catch (e) {
@@ -342,27 +419,18 @@ async function runDocFactory({ idea, minutes, oauthToken, apiKey, subModel, apiM
     for (const p of beatPanels) {
       const narration = String(p.narration || '').trim();
       if (!narration && !p.callout) continue;
-      const panelType = p.panelType === 'text-card' ? 'text-card' : 'illustration';
-      const bg = ['white', 'night', 'parchment'].includes(p.bg) ? p.bg : 'white';
-      panels.push({
-        n: panels.length + 1,
-        beat: beat.n || i + 1,
-        narration,
-        panelType,
-        // EVERY panel gets a doodle now — even emphasis ("text-card") panels.
-        // The bold callout is laid over this doodle by the assembler, so the
-        // viewer always sees a drawing, never bare text on a flat card.
-        doodlePrompt: `${STYLE_BIBLE} Scene: ${String(p.doodlePrompt || narration).trim()}`,
-        callout: String(p.callout || '').trim(),
-        bg,
-        bgHex: bgHex(bg),
-        image: null, // filled by the image layer (Phase 2)
-      });
+      // EVERY panel gets a doodle now — even emphasis ("text-card") panels. The
+      // bold callout is laid over the doodle by the assembler, so the viewer
+      // always sees a drawing, never bare text on a flat card.
+      panels.push(buildPanel(p, styleBible, panels.length + 1, beat.n || i + 1));
       if (narration) lastLine = narration;
     }
   }
 
   if (!panels.length) throw new Error('No panels were produced — please run it again.');
+
+  // ---- Semi-auto: guarantee the word-for-word hook/CTA the creator asked for ----
+  if (mode === 'semi') injectHookCta(panels, semi, styleBible);
 
   // ---- Pass 3: critic polishes the title + checks the opening (best effort) ----
   say({ type: 'phase', key: 'polish' });
@@ -396,7 +464,8 @@ async function runDocFactory({ idea, minutes, oauthToken, apiKey, subModel, apiM
     tone: blueprint.tone || '',
     thumbnail_idea: thumbnailIdea,
     target_minutes: targetMinutes,
-    style_bible: STYLE_BIBLE,
+    mode: mode === 'semi' ? 'semi' : mode === 'manual' ? 'manual' : 'auto',
+    style_bible: styleBible,
     fact_bank: blueprint.fact_bank || [],
     beats: blueprint.beats,
     panels,
@@ -410,9 +479,128 @@ async function runDocFactory({ idea, minutes, oauthToken, apiKey, subModel, apiM
   };
 }
 
+// ---------------------------------------------------------------------------
+// MANUAL MODE — revisers. The creator reviews the finished script (or the image
+// prompts) and either edits them by hand (done in the route) or asks the AI to
+// make changes. These run ONE Claude pass over the WHOLE current script.
+// ---------------------------------------------------------------------------
+
+// Rewrite the full script on the creator's note (re-runs the writer's room).
+async function reviseScript({ project, instruction, oauthToken, apiKey, subModel, apiModel, emit }) {
+  const say = (e) => { try { emit && emit(e); } catch (_) {} };
+  const run = makeRunner({ oauthToken, apiKey, subModel, apiModel, emit });
+  const styleBible = project.style_bible || STYLE_BIBLE;
+
+  say({ type: 'phase', key: 'scripting' });
+  say({ type: 'activity', icon: '✍️', text: 'Reworking the script on your notes…' });
+
+  const current = (project.panels || [])
+    .map((p) => `#${p.n} [${p.bg || 'white'}]${p.callout ? ` (bold: ${p.callout})` : ''} ${p.narration}`)
+    .join('\n');
+
+  const system = `You are THE NARRATOR and THE CINEMATOGRAPHER of Doc Factory, REVISING an existing, finished script for a faceless doodle documentary because the creator asked for changes.
+
+${MISSION}
+
+THE DOODLE STYLE BIBLE (every illustration shares this — describe only the subject, the look is fixed):
+${styleBible}
+
+You are given the CURRENT full script as an ordered list of panels (one short narration line each, with any bold on-screen word). Apply the creator's CHANGE REQUEST faithfully. You may rewrite, add, remove, reorder, split or merge panels — but ONLY change what the request implies; keep everything else as it is. Preserve the calm, immersive, present-tense voice, the one-short-line-per-panel rhythm, and the rule that EVERY panel has a doodlePrompt. Return the COMPLETE revised script (every panel, in final order).
+
+Output ONLY a JSON object wrapped in <json></json> tags, no other prose, of this shape:
+<json>
+${PANELS_SHAPE}
+</json>`;
+
+  const prompt =
+    `VIDEO TITLE: ${project.title}\nANGLE: ${project.angle || ''}\nTONE: ${project.tone || 'calm, immersive'}\n\n` +
+    `THE CURRENT SCRIPT (${(project.panels || []).length} panels):\n${current}\n\n` +
+    `THE CREATOR'S CHANGE REQUEST:\n"""\n${String(instruction || '').trim()}\n"""\n\n` +
+    `Return the full revised panels JSON now.`;
+
+  const text = await run({ system, prompt, withTools: false, timeoutMs: 8 * 60 * 1000 });
+  const parsed = extractJson(text);
+  if (!parsed || !Array.isArray(parsed.panels) || !parsed.panels.length) {
+    throw new Error("Couldn't apply those changes — please try rewording your note.");
+  }
+  const panels = [];
+  for (const p of parsed.panels) {
+    const narration = String(p.narration || '').trim();
+    if (!narration && !p.callout) continue;
+    panels.push(buildPanel(p, styleBible, panels.length + 1, p.beat || 1));
+  }
+  if (!panels.length) throw new Error("Couldn't apply those changes — please try again.");
+  return panels;
+}
+
+const IMAGE_PROMPTS_SHAPE = `{
+  "prompts": [
+    { "n": 1, "doodlePrompt": "the revised one-subject doodle scene for this panel (subject + action + setting; NO style words — the style is fixed)", "callout": "optional bold on-screen word/number, empty string if none" }
+  ]
+}`;
+
+// Refine the doodle (image) prompts on the creator's note. Narration is left
+// untouched; only the drawing each panel shows (and optionally its bold word).
+async function reviseImagePrompts({ project, instruction, oauthToken, apiKey, subModel, apiModel, emit }) {
+  const say = (e) => { try { emit && emit(e); } catch (_) {} };
+  const run = makeRunner({ oauthToken, apiKey, subModel, apiModel, emit });
+  const styleBible = project.style_bible || STYLE_BIBLE;
+
+  say({ type: 'phase', key: 'scripting' });
+  say({ type: 'activity', icon: '🎬', text: 'Refining the doodle prompts…' });
+
+  const current = (project.panels || [])
+    .map((p) => `#${p.n}: ${rawScene(p.doodlePrompt) || p.narration}${p.callout ? `  (bold: ${p.callout})` : ''}  // line: ${p.narration}`)
+    .join('\n');
+
+  const system = `You are THE CINEMATOGRAPHER of Doc Factory, REVISING the doodle image prompts for a faceless doodle documentary because the creator asked for changes. Do NOT change the narration — only the doodle scene each panel draws (and, if asked, the bold on-screen callout word).
+
+${MISSION}
+
+THE DOODLE STYLE BIBLE (fixed — never restate it inside a prompt, just describe the subject):
+${styleBible}
+
+You are given every panel: its current doodle scene and the narration line it must illustrate. Apply the creator's CHANGE REQUEST to the doodle prompts. Keep ONE clear subject per panel. Return ONE entry per panel, in order, for EVERY panel (include unchanged ones unchanged).
+
+Output ONLY a JSON object wrapped in <json></json> tags of this shape:
+<json>
+${IMAGE_PROMPTS_SHAPE}
+</json>`;
+
+  const prompt =
+    `VIDEO TITLE: ${project.title}\n\nEVERY PANEL (#n: current doodle // narration line):\n${current}\n\n` +
+    `THE CREATOR'S CHANGE REQUEST:\n"""\n${String(instruction || '').trim()}\n"""\n\nReturn the prompts JSON now.`;
+
+  const text = await run({ system, prompt, withTools: false, timeoutMs: 8 * 60 * 1000 });
+  const parsed = extractJson(text);
+  if (!parsed || !Array.isArray(parsed.prompts)) {
+    throw new Error("Couldn't refine the prompts — please try rewording your note.");
+  }
+  const byN = new Map(parsed.prompts.map((x) => [Number(x.n), x]));
+  let changed = 0;
+  for (const panel of project.panels) {
+    const upd = byN.get(panel.n);
+    if (!upd) continue;
+    const scene = rawScene(upd.doodlePrompt);
+    if (scene) {
+      panel.doodlePrompt = `${styleBible} Scene: ${scene}`;
+      panel.image = null;            // a changed prompt invalidates any old image
+      panel.imageSource = undefined;
+      changed++;
+    }
+    if (typeof upd.callout === 'string') panel.callout = upd.callout.trim();
+  }
+  return { panels: project.panels, changed };
+}
+
 module.exports = {
   runDocFactory,
+  reviseScript,
+  reviseImagePrompts,
   STYLE_BIBLE,
+  effectiveStyle,
+  rawScene,
+  buildPanel,
   extractJson,
   sanitizeClaudeToken,
   bgHex,
