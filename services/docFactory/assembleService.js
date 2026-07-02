@@ -23,10 +23,11 @@ const { spawn } = require('child_process');
 const r2Service = require('../r2Service');
 const voiceService = require('../voiceService');
 const { renderTextCard, calloutOverlay } = require('./textCard');
+const { frameDims } = require('./dims');
 
 const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
 const FFPROBE = process.env.FFPROBE_PATH || 'ffprobe';
-const W = 1920, H = 1080, FPS = 30;
+const FPS = 30;
 const MIN_PANEL_SEC = 1.6; // floor for panels with no/short narration
 
 function run(bin, args) {
@@ -77,6 +78,9 @@ async function assemble(project, opts = {}) {
   const { provider = 'openai', voice, bgmUrl, bgmVolume = 0.12, onProgress } = opts;
   // Narration playback speed (1 = normal). Clamp to a sane, natural range.
   const speed = Math.max(0.7, Math.min(1.4, Number(opts.speed) || 1));
+  // Orientation: render override wins, else the project's, else landscape.
+  // Both are full 1080p — landscape 1920x1080, portrait 1080x1920.
+  const { W, H, orientation } = frameDims(opts.orientation || project.orientation);
   const work = path.join(process.env.TEMP_DIR || os.tmpdir(), `docfactory-${project.id}`);
   await fs.ensureDir(work);
   const segDir = path.join(work, 'segs');
@@ -125,7 +129,7 @@ async function assemble(project, opts = {}) {
     } else { imgFile = null; }
     if (!imgFile) {
       imgFile = `${base}.png`;
-      await renderTextCard({ callout: panel.callout || panel.narration || '', bgHex: panel.bgHex, outPath: imgFile });
+      await renderTextCard({ callout: panel.callout || panel.narration || '', bgHex: panel.bgHex, outPath: imgFile, W, H });
       panel._placeholder = true;
     }
 
@@ -137,7 +141,7 @@ async function assemble(project, opts = {}) {
     let calloutFile = null;
     if (panel.callout && panel.callout.trim() && imgFile && !panel._placeholder) {
       try {
-        const ov = await calloutOverlay({ callout: panel.callout, tag: `${project.id}-${panel.n}` });
+        const ov = await calloutOverlay({ callout: panel.callout, tag: `${project.id}-${panel.n}`, W });
         vf += ',' + ov.vf;
         calloutFile = ov.file;
       } catch (_) { /* doodle alone is fine if the overlay can't be built */ }
@@ -194,7 +198,7 @@ async function assemble(project, opts = {}) {
   const up = await r2Service.uploadFile(finalFile, key, 'video/mp4');
   fs.remove(work).catch(() => {});
 
-  return { url: up.downloadUrl || up.url, key, fileName: `${fileName}.mp4`, durationSec: +totalSec.toFixed(1), panels: panels.length };
+  return { url: up.downloadUrl || up.url, key, fileName: `${fileName}.mp4`, durationSec: +totalSec.toFixed(1), panels: panels.length, orientation, width: W, height: H };
 }
 
 // Turn a title into a safe, readable file name (keeps words + case, drops

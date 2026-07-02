@@ -45,19 +45,23 @@ function wrap(text, maxChars) {
 
 /**
  * Render one text-card PNG.
- * @param {{callout:string, bgHex?:string, outPath:string}} opts
+ * @param {{callout:string, bgHex?:string, outPath:string, W?:number, H?:number}} opts
  * @returns {Promise<string>} outPath
  */
-function renderTextCard({ callout, bgHex, outPath }) {
+function renderTextCard({ callout, bgHex, outPath, W: w = W, H: h = H }) {
   return new Promise(async (resolve, reject) => {
     const bg = bgHex || '#ffffff';
     const fg = textColor(bg);
-    const lines = wrap((callout || '').toUpperCase(), 16);
-    // Scale font to the longest line + line count so big words fill the frame
-    // and long ones still fit.
+    // Wrap tighter on a narrow (portrait) frame so the word still fills it.
+    const maxChars = Math.max(8, Math.round(w / 120)); // 1920->16, 1080->9
+    const lines = wrap((callout || '').toUpperCase(), maxChars);
+    // Scale font to the frame WIDTH + the longest line + line count so big words
+    // fill the frame and long ones still fit — works for landscape and portrait.
     const longest = lines.reduce((m, l) => Math.max(m, l.length), 1);
-    let fontsize = Math.round(Math.min(220, Math.max(70, 1500 / longest)));
-    if (lines.length >= 4) fontsize = Math.min(fontsize, 120);
+    const capHi = Math.round(w * 0.115); // 1920->221, 1080->124
+    const capLo = Math.round(w * 0.036); // 1920->70,  1080->39
+    let fontsize = Math.round(Math.min(capHi, Math.max(capLo, (w * 0.78) / longest)));
+    if (lines.length >= 4) fontsize = Math.min(fontsize, Math.round(w * 0.0625)); // 1920->120
 
     await fs.ensureDir(path.dirname(outPath));
     const txtFile = path.join(os.tmpdir(), `dfcard-${Date.now()}-${Math.round(process.hrtime()[1] / 1e3)}.txt`);
@@ -71,7 +75,7 @@ function renderTextCard({ callout, bgHex, outPath }) {
 
     const args = [
       '-y',
-      '-f', 'lavfi', '-i', `color=c=${bg}:s=${W}x${H}`,
+      '-f', 'lavfi', '-i', `color=c=${bg}:s=${w}x${h}`,
       '-vf', draw,
       '-frames:v', '1',
       outPath,
@@ -94,15 +98,19 @@ function renderTextCard({ callout, bgHex, outPath }) {
  * Writes the text to a temp file (avoids ffmpeg escaping headaches) and returns
  * the filter snippet plus that file so the caller can clean it up.
  *
- * @param {{callout:string, tag:string}} opts
+ * @param {{callout:string, tag:string, W?:number}} opts
  * @returns {Promise<{ vf:string, file:string }>}
  */
-async function calloutOverlay({ callout, tag }) {
-  const lines = wrap((callout || '').toUpperCase(), 22);
+async function calloutOverlay({ callout, tag, W: w = W }) {
+  const maxChars = Math.max(12, Math.round(w / 87)); // 1920->22, 1080->12
+  const lines = wrap((callout || '').toUpperCase(), maxChars);
   const longest = lines.reduce((m, l) => Math.max(m, l.length), 1);
   // Smaller than a full text-card — it sits ON the doodle, near the bottom.
-  let fontsize = Math.round(Math.min(150, Math.max(56, 1100 / longest)));
-  if (lines.length >= 3) fontsize = Math.min(fontsize, 96);
+  // Scale to frame WIDTH so the pill fits landscape and portrait alike.
+  const capHi = Math.round(w * 0.078); // 1920->150, 1080->84
+  const capLo = Math.round(w * 0.029); // 1920->56,  1080->31
+  let fontsize = Math.round(Math.min(capHi, Math.max(capLo, (w * 0.573) / longest)));
+  if (lines.length >= 3) fontsize = Math.min(fontsize, Math.round(w * 0.05)); // 1920->96
 
   const file = path.join(os.tmpdir(), `dfcallout-${tag}-${process.hrtime()[1]}.txt`);
   await fs.writeFile(file, lines.join('\n'), 'utf8');

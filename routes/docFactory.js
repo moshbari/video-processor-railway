@@ -29,6 +29,7 @@ const imageProvider = require('../services/docFactory/imageProvider');
 const assembleService = require('../services/docFactory/assembleService');
 const library = require('../services/docFactory/library');
 const voiceService = require('../services/voiceService');
+const { normalizeOrientation } = require('../services/docFactory/dims');
 
 router.use((req, res, next) => {
   req.setTimeout(20 * 60 * 1000);
@@ -136,6 +137,10 @@ router.post('/generate', (req, res) => {
     : {};
   // Voice/speed the creator picked up-front (semi) — applied at render time.
   const voicePref = parseVoicePref(body);
+  // Portrait (9:16 Shorts/Reels) or landscape (16:9). Locked on the project so
+  // the text-cards, doodles and final video all share the shape. Works for all
+  // three modes (auto / semi / manual). Defaults to landscape (unchanged).
+  const orientation = normalizeOrientation(body.orientation);
   const imageFill = body.imageFill === 'manual' ? 'manual' : (body.imageFill === 'api' ? 'api' : null);
 
   const userId = req.headers['x-user-id'] || null;
@@ -159,6 +164,7 @@ router.post('/generate', (req, res) => {
       // Where the frontend should land: manual mode pauses on the script for review.
       result.stage = mode === 'manual' ? 'script-review' : 'ready';
       result.voicePref = voicePref;
+      result.orientation = orientation;
       if (imageFill) result.imageFill = imageFill;
       job.result = result;
       store.cacheProject(result);
@@ -367,10 +373,14 @@ router.post('/project/:id/render', async (req, res) => {
   // render request doesn't override it.
   const pref = project.voicePref || {};
   const body = req.body || {};
+  // Orientation override at render time (rare — normally locked on the project
+  // so the images match). If overridden here, remember it on the project too.
+  if (body.orientation) project.orientation = normalizeOrientation(body.orientation);
   assembleService.assemble(project, {
     provider: body.provider || pref.provider || process.env.DOC_FACTORY_TTS_PROVIDER || 'openai',
     voice: body.voice || pref.voice,
     speed: body.speed || pref.speed || 1,
+    orientation: project.orientation,
     bgmUrl: body.bgmUrl,
     onProgress: (m) => {
       if (m && m.done) pushEvent(job, { type: 'activity', text: `Panel ${m.done}/${m.of} (${m.dur}s)` });

@@ -17,6 +17,7 @@ const path = require('path');
 const fs = require('fs-extra');
 const r2Service = require('../r2Service');
 const { renderTextCard } = require('./textCard');
+const { frameDims } = require('./dims');
 
 const IMG_W = 1920;
 const IMG_H = 1080;
@@ -27,8 +28,9 @@ function r2KeyForImage(id, n) {
 
 // ---- text-card: ffmpeg drawtext -> R2 -------------------------------------
 async function renderTextCardPanel(project, panel) {
+  const { W, H } = frameDims(project.orientation);
   const tmp = path.join(os.tmpdir(), `df-${project.id}-card-${panel.n}.png`);
-  await renderTextCard({ callout: panel.callout || '', bgHex: panel.bgHex, outPath: tmp });
+  await renderTextCard({ callout: panel.callout || '', bgHex: panel.bgHex, outPath: tmp, W, H });
   const up = await r2Service.uploadBuffer(await fs.readFile(tmp), r2KeyForImage(project.id, panel.n), 'image/png');
   fs.remove(tmp).catch(() => {});
   panel.image = up.url;
@@ -49,11 +51,15 @@ async function generateApiImage(project, panel) {
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   const bgName = panel.bg === 'night' ? 'solid dark navy blue' : panel.bg === 'parchment' ? 'solid warm parchment cream' : 'solid white';
   const base = panel.doodlePrompt || `${project.style_bible} Scene: ${panel.narration}`;
-  const prompt = `${base} Background: ${bgName}, flat, no border. 16:9 framing.`;
+  // Match the doodle's shape to the video's orientation so it fills the frame.
+  const { portrait } = frameDims(project.orientation);
+  const framing = portrait ? '9:16 vertical framing' : '16:9 framing';
+  const size = portrait ? '1024x1536' : '1536x1024'; // closest 2:3 / 3:2; assembler pads to exact
+  const prompt = `${base} Background: ${bgName}, flat, no border. ${framing}.`;
   const resp = await client.images.generate({
     model: process.env.DOC_FACTORY_IMG_MODEL || 'gpt-image-2',
     prompt,
-    size: '1536x1024', // closest 3:2 landscape; assembler pads to 16:9
+    size,
     quality: process.env.DOC_FACTORY_IMG_QUALITY || 'low', // flat doodles: 'low' is plenty and far cheaper
     n: 1,
   });
