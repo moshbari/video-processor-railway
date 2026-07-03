@@ -53,7 +53,7 @@ function effectiveStyle(styleOverride) {
 function directivesBlock({ hook, cta, directives } = {}) {
   const parts = [];
   if (hook && String(hook).trim()) parts.push(`- OPEN the video with THIS EXACT hook line, word for word, as the very first narration panel: "${String(hook).trim()}"`);
-  if (cta && String(cta).trim()) parts.push(`- END the video with THIS EXACT call-to-action, word for word, as the final narration panel: "${String(cta).trim()}"`);
+  if (cta && String(cta).trim()) parts.push(`- The closing call-to-action is FIXED and is added automatically as the final panel. Do NOT write your own CTA, pitch, sign-off, or "DM me / link in bio" lines, and do NOT repeat, split, or paraphrase the CTA anywhere in the script. Simply end on the story's natural payoff — the CTA follows on its own.`);
   if (directives && String(directives).trim()) parts.push(`- Also follow these instructions from the creator: ${String(directives).trim()}`);
   if (!parts.length) return '';
   return `\n\nCREATOR DIRECTIVES (these are mandatory — follow them exactly, they override the defaults):\n${parts.join('\n')}`;
@@ -104,9 +104,17 @@ function injectHookCta(panels, { hook, cta }, styleBible) {
     if (!has) panels.unshift(buildPanel({ narration: h, panelType: 'illustration', doodlePrompt: h, bg: panels[0] ? panels[0].bg : 'white' }, styleBible, 1, 1));
   }
   if (c) {
+    // The CTA belongs exactly once, at the very end. The writer sometimes still
+    // sprinkles the pitch across several panels (or repeats it), so first strip
+    // ANY panel that is just a fragment or echo of the CTA, then append it clean.
+    const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const nc = norm(c);
+    for (let i = panels.length - 1; i >= 0; i--) {
+      const np = norm(panels[i].narration);
+      if (np.length >= 6 && (nc.includes(np) || np.includes(nc))) panels.splice(i, 1);
+    }
     const last = panels[panels.length - 1];
-    const has = last && last.narration.toLowerCase().includes(c.toLowerCase());
-    if (!has) panels.push(buildPanel({ narration: c, panelType: 'illustration', doodlePrompt: c, bg: last ? last.bg : 'white' }, styleBible, panels.length + 1, last ? last.beat : 1));
+    panels.push(buildPanel({ narration: c, panelType: 'illustration', doodlePrompt: c, bg: last ? last.bg : 'white' }, styleBible, panels.length + 1, last ? last.beat : 1));
   }
   return renumber(panels);
 }
