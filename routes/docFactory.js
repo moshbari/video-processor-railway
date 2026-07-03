@@ -41,6 +41,9 @@ router.use((req, res, next) => {
 const JOBS = new Map();
 // renderId -> { status, events, video, error, created, projectId }  (assembly jobs)
 const RENDERS = new Map();
+// projectId -> renderId, ONLY while a render is running. Lets any tab discover
+// an in-flight render and attach to it instead of starting a duplicate.
+const ACTIVE_RENDERS = new Map();
 const TTL_MS = 60 * 60 * 1000;
 
 function pushEvent(job, ev) { job.events.push({ ...ev, at: Date.now() }); }
@@ -364,9 +367,21 @@ router.post('/project/:id/render', async (req, res) => {
   const project = await getProject(req.params.id).catch(() => null);
   if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
 
+  // Already rendering this project? Attach to that job — never start a second
+  // render (double-clicks / multiple tabs would otherwise clog the server).
+  const existingId = ACTIVE_RENDERS.get(project.id);
+  if (existingId) {
+    const existing = RENDERS.get(existingId);
+    if (existing && existing.status === 'running') {
+      return res.json({ success: true, renderId: existingId, attached: true });
+    }
+    ACTIVE_RENDERS.delete(project.id);
+  }
+
   const renderId = uuidv4();
   const job = { status: 'running', events: [], video: null, error: null, created: Date.now(), projectId: project.id };
   RENDERS.set(renderId, job);
+  ACTIVE_RENDERS.set(project.id, renderId);
   pushEvent(job, { type: 'phase', key: 'assembling' });
 
   // Fall back to the voice/speed the creator chose up-front (semi mode) if the
@@ -383,7 +398,8 @@ router.post('/project/:id/render', async (req, res) => {
     orientation: project.orientation,
     bgmUrl: body.bgmUrl,
     onProgress: (m) => {
-      if (m && m.done) pushEvent(job, { type: 'activity', text: `Panel ${m.done}/${m.of} (${m.dur}s)` });
+      // Include structured done/of so the frontend can show a real progress bar.
+      if (m && m.done) pushEvent(job, { type: 'activity', text: `Panel ${m.done}/${m.of} (${m.dur}s)`, done: m.done, of: m.of });
       else if (m && m.warn) pushEvent(job, { type: 'activity', text: `⚠️ ${m.warn}` });
     },
   })
@@ -399,9 +415,20 @@ router.post('/project/:id/render', async (req, res) => {
       job.error = (err && err.message) || 'Render failed.';
       job.status = 'error';
       pushEvent(job, { type: 'error', text: job.error });
-    });
+    })
+    .finally(() => { if (ACTIVE_RENDERS.get(project.id) === renderId) ACTIVE_RENDERS.delete(project.id); });
 
   res.json({ success: true, renderId });
+});
+
+// Is this project currently rendering? Lets any tab (or a reloaded one) re-attach
+// to a live render and show its progress instead of starting a fresh one.
+router.get('/project/:id/active-render', (req, res) => {
+  const renderId = ACTIVE_RENDERS.get(req.params.id);
+  const job = renderId ? RENDERS.get(renderId) : null;
+  if (!job || job.status !== 'running') return res.json({ success: true, rendering: false });
+  const last = [...job.events].reverse().find((e) => e.done);
+  res.json({ success: true, rendering: true, renderId, done: (last && last.done) || 0, of: (last && last.of) || 0 });
 });
 
 router.get('/render/:renderId', (req, res) => {
