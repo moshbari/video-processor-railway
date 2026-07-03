@@ -371,11 +371,14 @@ async function runDocFactory({ idea, minutes, oauthToken, apiKey, subModel, apiM
   const say = (e) => { try { emit && emit(e); } catch (_) {} };
   const run = makeRunner({ oauthToken, apiKey, subModel, apiModel, emit });
   const targetMinutes = Math.max(3, Math.min(20, Number(minutes) || 8));
-  // SEMI-AUTOMATIC up-front directions. In 'auto' and 'manual' modes these are
-  // empty, so the prompts are byte-for-byte what they were before.
-  const semi = mode === 'semi' ? { hook, cta, directives } : {};
+  // The word-for-word CTA is honored in ALL modes (it's business-critical, so the
+  // creator controls it everywhere). The hook, freeform directions and style
+  // override stay a Semi-only nicety — in 'auto'/'manual' those remain empty.
+  const ctaText = String(cta || '').trim();
+  const semiHook = mode === 'semi' ? String(hook || '').trim() : '';
+  const semiDirectives = mode === 'semi' ? directives : '';
   const styleBible = effectiveStyle(mode === 'semi' ? styleOverride : '');
-  const directives_ = directivesBlock(semi);
+  const directives_ = directivesBlock({ hook: semiHook, cta: ctaText, directives: semiDirectives });
 
   // ---- Pass 1: blueprint (Scout + Researcher + Architect, with WebSearch) ----
   say({ type: 'phase', key: 'blueprint' });
@@ -437,8 +440,8 @@ async function runDocFactory({ idea, minutes, oauthToken, apiKey, subModel, apiM
 
   if (!panels.length) throw new Error('No panels were produced — please run it again.');
 
-  // ---- Semi-auto: guarantee the word-for-word hook/CTA the creator asked for ----
-  if (mode === 'semi') injectHookCta(panels, semi, styleBible);
+  // ---- Guarantee the word-for-word CTA (ALL modes) + the semi hook, exactly once ----
+  if (ctaText || semiHook) injectHookCta(panels, { hook: semiHook, cta: ctaText }, styleBible);
 
   // ---- Pass 3: critic polishes the title + checks the opening (best effort) ----
   say({ type: 'phase', key: 'polish' });

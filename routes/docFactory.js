@@ -129,11 +129,12 @@ router.post('/generate', (req, res) => {
   // auto) or 'manual' (review/approve the script + image prompts by hand).
   const body = req.body || {};
   const mode = ['auto', 'semi', 'manual'].includes(body.mode) ? body.mode : 'auto';
-  // Semi-auto up-front directions (ignored in auto/manual so behaviour is unchanged).
+  // The word-for-word CTA is business-critical, so it's accepted in EVERY mode.
+  const cta = String(body.cta || '').trim();
+  // Other up-front directions (hook, freeform notes, style) stay Semi-only.
   const semiCfg = mode === 'semi'
     ? {
         hook: String(body.hook || '').trim(),
-        cta: String(body.cta || '').trim(),
         directives: String(body.directives || '').trim(),
         styleOverride: String(body.imageStyle || body.styleOverride || '').trim(),
       }
@@ -152,7 +153,7 @@ router.post('/generate', (req, res) => {
   JOBS.set(jobId, job);
 
   engine.runDocFactory({
-    idea, minutes, mode, ...semiCfg,
+    idea, minutes, mode, cta, ...semiCfg,
     oauthToken: oauthToken || undefined,
     apiKey: oauthToken ? undefined : apiKey,
     subModel: process.env.DOC_FACTORY_SUB_MODEL || 'sonnet',
