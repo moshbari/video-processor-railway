@@ -230,10 +230,19 @@ class AudioReactionService {
     return new Promise(async (resolve, reject) => {
       try {
         const audioDuration = await this.getMediaDuration(audioPath);
-        console.log(`[AudioReaction] Creating frozen frame video (${audioDuration.toFixed(2)}s) with normalized audio (${measured ? 'two-pass' : 'one-pass fallback'})...`);
+        console.log(`[AudioReaction] Creating frozen frame video (~${(audioDuration || 0).toFixed(2)}s reported) with normalized audio (${measured ? 'two-pass' : 'one-pass fallback'})...`);
 
-        // Create frozen video from image + add audio with normalization
-        const cmd = `ffmpeg -y -loop 1 -i "${framePath}" -i "${audioPath}" -t ${audioDuration} -vf "scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,fps=30" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -ar 44100 -af "${afilter}" -shortest -pix_fmt yuv420p "${outputPath}"`;
+        // Create frozen video from image + add audio with normalization.
+        //
+        // IMPORTANT: we do NOT cap the output with `-t <ffprobe duration>`.
+        // ffprobe's format.duration is only an ESTIMATE for VBR MP3 (reads short →
+        // clips the tail of the reaction) and is often missing/0 for browser webm
+        // mic recordings (would make `-t 0` produce an empty reaction). Instead the
+        // looping still image is the only endless input, so `-shortest` ends the
+        // output exactly when the (padded) audio ends. `apad` adds a short tail of
+        // silence so `-shortest`'s frame-boundary rounding can never chop the last
+        // word — the reaction always plays in full, followed by a tiny frozen hold.
+        const cmd = `ffmpeg -y -loop 1 -i "${framePath}" -i "${audioPath}" -vf "scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,fps=30" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -ar 44100 -af "${afilter},apad=pad_dur=0.35" -shortest -pix_fmt yuv420p "${outputPath}"`;
 
         exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
           if (error) {
@@ -348,6 +357,47 @@ class AudioReactionService {
   }
 
   /**
+   * Build ONE "rant" segment: freeze on the given clip's last frame and play the
+   * reaction audio over it (optionally with burned captions).
+   * Returns the path to the finished segment, ready to be concatenated.
+   * Extracted so both the normal per-clip path AND the safety-net append path
+   * (for reactions whose clipIndex has no matching clip) use identical logic.
+   */
+  async buildRantSegment(sourceClipPath, reaction, workDir, label, targetWidth, targetHeight, captionsEnabled, captionStyle) {
+    // Freeze on the last frame of the source clip
+    const framePath = path.join(workDir, `frame_${label}.jpg`);
+    await this.extractLastFrame(sourceClipPath, framePath);
+
+    // Frozen frame + reaction audio (duration auto-matched to the audio)
+    const frozenWithAudioPath = path.join(workDir, `frozen_audio_${label}.mp4`);
+    await this.createFrozenFrameWithAudio(framePath, reaction.audioPath, frozenWithAudioPath, targetWidth, targetHeight);
+
+    // OPTIONAL: burn captions onto this rant section ONLY (never on original clips)
+    let finalRantPath = frozenWithAudioPath;
+    if (captionsEnabled) {
+      const captionedRantPath = path.join(workDir, `frozen_audio_${label}_captioned.mp4`);
+      try {
+        await captionService.addCaptionsToVideo(
+          frozenWithAudioPath,
+          captionedRantPath,
+          captionStyle,
+          { width: targetWidth, height: targetHeight }
+        );
+        finalRantPath = captionedRantPath;
+        console.log(`[AudioReaction] ✓ Captions added to rant ${label}`);
+        await fs.remove(frozenWithAudioPath).catch(() => {});
+      } catch (capErr) {
+        console.error(`[AudioReaction] ⚠ Caption burn failed for rant ${label}, using uncaptioned version:`, capErr.message);
+        finalRantPath = frozenWithAudioPath;
+      }
+    }
+
+    // Clean up the frame image
+    await fs.remove(framePath).catch(() => {});
+    return finalRantPath;
+  }
+
+  /**
    * MAIN FUNCTION: Combine clips with audio reactions
    * @param {string} jobId - Split job ID
    * @param {Array} audioReactions - Array of { clipIndex, audioPath }
@@ -403,76 +453,87 @@ class AudioReactionService {
       const targetHeight = dimensions.height;
       console.log(`[AudioReaction] Target dimensions: ${targetWidth}x${targetHeight}`);
       
-      // Step 2: Create map of which clips have audio reactions
+      // Step 2: Create map of which clips have audio reactions.
+      // Group by clipIndex into ARRAYS (not a single value) so that if two
+      // reactions ever resolve to the same clip they BOTH play instead of one
+      // silently overwriting the other.
       const reactionMap = {};
       for (const reaction of audioReactions) {
-        reactionMap[reaction.clipIndex] = reaction.audioPath;
-        console.log(`[AudioReaction] Reaction mapped: clip ${reaction.clipIndex} → ${path.basename(reaction.audioPath)}`);
+        const idx = parseInt(reaction.clipIndex, 10);
+        if (!Number.isFinite(idx)) {
+          console.warn(`[AudioReaction] ⚠ Reaction has invalid clipIndex (${reaction.clipIndex}) — will be appended at the end so it is not lost`);
+          continue; // handled by the safety-net append below
+        }
+        if (!reactionMap[idx]) reactionMap[idx] = [];
+        reactionMap[idx].push(reaction);
+        console.log(`[AudioReaction] Reaction mapped: clip ${idx} → ${path.basename(reaction.audioPath)}`);
       }
-      
+
+      // Track which clipIndexes actually got a matching clip on disk, so we can
+      // detect (and rescue) any reaction whose clipIndex has no clip — the root
+      // cause of "the last reaction is missing" when the splitter dropped a
+      // sub-0.5s segment and the clip count fell below the reaction count.
+      const placedClipIndexes = new Set();
+
       // Step 3: Build all segments
       this.updateProgress(jobId, 'processing', 25, 'Processing clips...');
-      
+
       const allSegments = [];
       const totalClips = clipPaths.length;
-      
+      let lastNormalizedClipPath = null;
+
       for (let i = 0; i < totalClips; i++) {
         const clipPath = clipPaths[i];
         const clipIndex = i + 1;  // 1-based index
-        
+
         console.log(`\n[AudioReaction] Processing clip ${clipIndex}/${totalClips}...`);
-        
+
         // Normalize the original clip's audio
         const normalizedClipPath = path.join(workDir, `clip_${clipIndex}_normalized.mp4`);
         await this.normalizeVideoClip(clipPath, normalizedClipPath);
         allSegments.push(normalizedClipPath);
-        
-        // Check if this clip has an audio reaction
-        if (reactionMap[clipIndex]) {
-          const audioPath = reactionMap[clipIndex];
+        lastNormalizedClipPath = normalizedClipPath;
+
+        // Add every audio reaction attached to this clip (usually 0 or 1)
+        const clipReactions = reactionMap[clipIndex] || [];
+        for (let r = 0; r < clipReactions.length; r++) {
+          const reaction = clipReactions[r];
           console.log(`[AudioReaction] 🎙️ Adding audio reaction after clip ${clipIndex}`);
-          
-          // Extract last frame of this clip
-          const framePath = path.join(workDir, `frame_${clipIndex}.jpg`);
-          await this.extractLastFrame(normalizedClipPath, framePath);
-          
-          // Create frozen frame video with audio (duration auto-matched to audio)
-          const frozenWithAudioPath = path.join(workDir, `frozen_audio_${clipIndex}.mp4`);
-          await this.createFrozenFrameWithAudio(framePath, audioPath, frozenWithAudioPath, targetWidth, targetHeight);
-          
-          // OPTIONAL: Burn captions onto this rant section ONLY (never on original clips)
-          let finalRantPath = frozenWithAudioPath;
           if (captionsEnabled) {
-            const captionedRantPath = path.join(workDir, `frozen_audio_${clipIndex}_captioned.mp4`);
-            try {
-              this.updateProgress(jobId, 'processing', 25 + ((i + 0.5) / totalClips) * 45, `Adding captions to rant ${clipIndex}/${totalClips}...`);
-              await captionService.addCaptionsToVideo(
-                frozenWithAudioPath,
-                captionedRantPath,
-                captionStyle,
-                { width: targetWidth, height: targetHeight }
-              );
-              finalRantPath = captionedRantPath;
-              console.log(`[AudioReaction] ✓ Captions added to rant ${clipIndex}`);
-              // Cleanup uncaptioned version to save disk space
-              await fs.remove(frozenWithAudioPath).catch(() => {});
-            } catch (capErr) {
-              // Captions failed for this rant — keep going without captions for this one section
-              console.error(`[AudioReaction] ⚠ Caption burn failed for rant ${clipIndex}, using uncaptioned version:`, capErr.message);
-              finalRantPath = frozenWithAudioPath;
-            }
+            this.updateProgress(jobId, 'processing', 25 + ((i + 0.5) / totalClips) * 45, `Adding captions to rant ${clipIndex}/${totalClips}...`);
           }
-          
+          const label = clipReactions.length > 1 ? `${clipIndex}_${r + 1}` : `${clipIndex}`;
+          const finalRantPath = await this.buildRantSegment(
+            normalizedClipPath, reaction, workDir, label,
+            targetWidth, targetHeight, captionsEnabled, captionStyle
+          );
           allSegments.push(finalRantPath);
-          
-          // Clean up frame image
-          await fs.remove(framePath).catch(() => {});
         }
-        
+        if (clipReactions.length) placedClipIndexes.add(clipIndex);
+
         const progress = 25 + ((i + 1) / totalClips) * 45;
         this.updateProgress(jobId, 'processing', progress, `Processed clip ${clipIndex}/${totalClips}`);
       }
-      
+
+      // SAFETY NET: any reaction whose clipIndex never matched a clip on disk
+      // (out of range, or invalid) would previously be dropped SILENTLY. Instead,
+      // freeze on the last real clip's final frame and append these at the very
+      // end so the reaction always makes it into the video (and we log loudly).
+      const unplaced = audioReactions
+        .filter(r => !placedClipIndexes.has(parseInt(r.clipIndex, 10)))
+        .sort((a, b) => (parseInt(a.clipIndex, 10) || 0) - (parseInt(b.clipIndex, 10) || 0));
+      if (unplaced.length && lastNormalizedClipPath) {
+        console.warn(`[AudioReaction] ⚠️ ${unplaced.length} reaction(s) had no matching clip (clipIndex out of range for ${totalClips} clips): [${unplaced.map(r => r.clipIndex).join(', ')}] — appending them at the end so none are lost`);
+        for (let u = 0; u < unplaced.length; u++) {
+          const reaction = unplaced[u];
+          const finalRantPath = await this.buildRantSegment(
+            lastNormalizedClipPath, reaction, workDir, `overflow_${u + 1}`,
+            targetWidth, targetHeight, captionsEnabled, captionStyle
+          );
+          allSegments.push(finalRantPath);
+        }
+      }
+
       // Step 4: Concatenate all segments
       this.updateProgress(jobId, 'rendering', 70, 'Creating final video...');
       
