@@ -103,9 +103,16 @@ class DownloadService {
         throw new Error(`Video too large. Max ${this.maxSizeMB}MB`);
       }
 
-      // Download the video
+      // Download the video.
+      // Prefer the highest quality UP TO 1080p. `best[ext=mp4]` alone only ever
+      // returns YouTube's single-file progressive stream, which caps at 360p —
+      // every resolution above that (720p/1080p/4K) is DASH (separate video+audio
+      // that must be merged). This selector grabs the best <=1080p video + best
+      // audio and merges to mp4, so a 1080p source arrives as 1080p (capped at
+      // 1080p so 4K sources don't balloon), with graceful fallbacks for odd sites.
       console.log(`Downloading video: ${info.title || 'Unknown'}`);
-      const downloadCommand = `yt-dlp ${ytdlpExtra()} -f "best[ext=mp4]/best" --merge-output-format mp4 -o "${outputFile}" "${url}"`;
+      const fmt = 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080][ext=mp4]/best[ext=mp4]/best';
+      const downloadCommand = `yt-dlp ${ytdlpExtra()} -f "${fmt}" --merge-output-format mp4 -o "${outputFile}" "${url}"`;
       
       await execAsync(downloadCommand, {
         maxBuffer: 1024 * 1024 * 100 // 100MB buffer

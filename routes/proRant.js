@@ -88,9 +88,19 @@ router.post('/ingest', upload.single('video'), async (req, res) => {
     const up = await r2Service.uploadFile(localPath, key, 'video/mp4');
     const r2Url = up.downloadUrl || r2Service.getPublicUrl(key);
 
+    // Quality guardrail: the final render matches the main video's real pixels,
+    // so if the source came in below 1080p the export can't be 1080p. Surface a
+    // clear warning (esp. for YouTube/link fetches, where the available quality
+    // is out of the user's hands) so they can swap in a higher-res source.
+    const height = dims.height || 0;
+    const isHD = height >= 1080;
+    const warning = isHD ? null
+      : `This video is only ${dims.width}×${height} — smaller than 1080p. Your final video will be this size too. For the best quality, download a 1080p file from the source, then upload it here.`;
+
     res.json({
       success: true,
-      main: { id, r2Key: key, r2Url, url: r2Url, width: dims.width, height: dims.height, duration, ...meta },
+      warning,
+      main: { id, r2Key: key, r2Url, url: r2Url, width: dims.width, height, duration, isHD, ...meta },
     });
   } catch (err) {
     console.error('[ProRant] ingest error:', err.message);
