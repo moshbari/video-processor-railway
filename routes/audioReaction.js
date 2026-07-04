@@ -249,6 +249,9 @@ router.get('/progress/:jobId', (req, res) => {
 router.post('/generate-voiceovers', async (req, res) => {
   try {
     const { jobId, provider, voice, reactions } = req.body;
+    // Who is spending AI voiceover credit (Supabase user; frontend sends the header).
+    const userId = req.headers['x-user-id'] || null;
+    const userEmail = req.headers['x-user-email'] || null;
 
     // Validate
     if (!jobId) {
@@ -322,7 +325,7 @@ router.post('/generate-voiceovers', async (req, res) => {
     });
 
     // Run in background — poll /voiceover-progress/:jobId for results
-    audioReactionService.generateVoiceoversForJob(jobId, normalizedProvider, reactions, normalizedVoice)
+    audioReactionService.generateVoiceoversForJob(jobId, normalizedProvider, reactions, normalizedVoice, userId, userEmail)
       .then(result => {
         console.log(`[AudioReaction API] ✅ Voiceover gen done: ${result.totalGenerated} ok, ${result.totalFailed} failed`);
       })

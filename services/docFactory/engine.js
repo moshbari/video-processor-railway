@@ -242,7 +242,7 @@ function extractJson(text) {
 // One `claude` CLI pass (subscription) in stream-json mode, surfacing activity
 // ---------------------------------------------------------------------------
 
-function runClaudePass({ token, model, prompt, withTools, onActivity, timeoutMs }) {
+function runClaudePass({ token, model, prompt, withTools, onActivity, onUsage, timeoutMs }) {
   return new Promise((resolve, reject) => {
     const env = { ...process.env };
     const tok = sanitizeClaudeToken(token);
@@ -256,7 +256,7 @@ function runClaudePass({ token, model, prompt, withTools, onActivity, timeoutMs 
     // (local dev / testing only; gated by DOC_FACTORY_LOCAL_AUTH in makeRunner).
     const args = ['-p', '--model', model || 'sonnet', '--output-format', 'stream-json', '--verbose'];
     if (withTools) args.push('--allowedTools', 'WebSearch,WebFetch');
-    let child, buf = '', finalText = '', asstText = '', lastErr = '', settled = false;
+    let child, buf = '', finalText = '', asstText = '', lastErr = '', settled = false, usage = null;
     const finish = (fn, v) => {
       if (settled) return; settled = true; clearTimeout(timer);
       try { child && child.kill('SIGKILL'); } catch (_) {}
@@ -283,8 +283,19 @@ function runClaudePass({ token, model, prompt, withTools, onActivity, timeoutMs 
             asstText += block.text + '\n';
           }
         }
-      } else if (ev.type === 'result' && typeof ev.result === 'string') {
-        finalText = ev.result;
+      } else if (ev.type === 'result') {
+        if (typeof ev.result === 'string') finalText = ev.result;
+        // The CLI's final result event carries token usage + the API-equivalent
+        // dollar cost of this pass — the "AI credit" figure we want to track.
+        const u = ev.usage || {};
+        usage = {
+          input: u.input_tokens || 0,
+          output: u.output_tokens || 0,
+          cacheRead: u.cache_read_input_tokens || 0,
+          cacheCreate: u.cache_creation_input_tokens || 0,
+          costUsd: typeof ev.total_cost_usd === 'number' ? ev.total_cost_usd : null,
+          model,
+        };
       }
     };
 
@@ -307,6 +318,7 @@ function runClaudePass({ token, model, prompt, withTools, onActivity, timeoutMs 
       if (/invalid bearer token|failed to authenticate|unauthorized|\b401\b/.test(blob) && !out.includes('<json>')) {
         return finish(reject, new Error('Your Claude subscription token was rejected. Re-run `claude setup-token` and set CLAUDE_CODE_OAUTH_TOKEN.'));
       }
+      if (usage && onUsage) { try { onUsage(usage); } catch (_) {} }
       finish(resolve, out);
     });
     child.stdin.write(prompt);
@@ -327,23 +339,38 @@ async function runApiPass({ apiKey, model, system, prompt, maxTokens }) {
     system,
     messages: [{ role: 'user', content: prompt }],
   });
-  return msg.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+  const text = msg.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+  const u = msg.usage || {};
+  const usage = {
+    input: u.input_tokens || 0,
+    output: u.output_tokens || 0,
+    cacheRead: u.cache_read_input_tokens || 0,
+    cacheCreate: u.cache_creation_input_tokens || 0,
+    costUsd: null,
+  };
+  return { text, usage };
 }
 
 // A small adapter so the rest of the code calls ONE function regardless of mode.
-function makeRunner({ oauthToken, apiKey, subModel, apiModel, emit }) {
+// onUsage (optional) is fired once per Claude pass with token/cost usage so the
+// caller can tally per-user AI spend.
+function makeRunner({ oauthToken, apiKey, subModel, apiModel, emit, onUsage }) {
   if (oauthToken) {
     return ({ system, prompt, withTools, timeoutMs }) =>
       runClaudePass({
         token: oauthToken, model: subModel || 'sonnet',
         prompt: `${system}\n\n${prompt}`, withTools,
-        onActivity: (a) => emit && emit({ type: 'activity', ...a }), timeoutMs,
+        onActivity: (a) => emit && emit({ type: 'activity', ...a }), onUsage, timeoutMs,
       });
   }
   if (apiKey) {
     // The SDK fallback has no live tool stream; note it once.
-    return ({ system, prompt }) =>
-      runApiPass({ apiKey, model: apiModel || 'claude-opus-4-8', system, prompt, maxTokens: 8000 });
+    const apiM = apiModel || 'claude-opus-4-8';
+    return async ({ system, prompt }) => {
+      const { text, usage } = await runApiPass({ apiKey, model: apiM, system, prompt, maxTokens: 8000 });
+      if (usage && onUsage) { try { onUsage({ ...usage, model: apiM }); } catch (_) {} }
+      return text;
+    };
   }
   if (process.env.DOC_FACTORY_LOCAL_AUTH === '1') {
     // Local testing: use the machine's logged-in `claude` (no token, real HOME).
@@ -351,7 +378,7 @@ function makeRunner({ oauthToken, apiKey, subModel, apiModel, emit }) {
       runClaudePass({
         token: '', model: subModel || 'sonnet',
         prompt: `${system}\n\n${prompt}`, withTools,
-        onActivity: (a) => emit && emit({ type: 'activity', ...a }), timeoutMs,
+        onActivity: (a) => emit && emit({ type: 'activity', ...a }), onUsage, timeoutMs,
       });
   }
   throw new Error('No Claude connected. Set CLAUDE_CODE_OAUTH_TOKEN (your subscription) or ANTHROPIC_API_KEY on the server.');
@@ -367,9 +394,9 @@ function bgHex(bg) {
   return '#ffffff';
 }
 
-async function runDocFactory({ idea, minutes, oauthToken, apiKey, subModel, apiModel, emit, mode, hook, cta, directives, styleOverride }) {
+async function runDocFactory({ idea, minutes, oauthToken, apiKey, subModel, apiModel, emit, onUsage, mode, hook, cta, directives, styleOverride }) {
   const say = (e) => { try { emit && emit(e); } catch (_) {} };
-  const run = makeRunner({ oauthToken, apiKey, subModel, apiModel, emit });
+  const run = makeRunner({ oauthToken, apiKey, subModel, apiModel, emit, onUsage });
   const targetMinutes = Math.max(3, Math.min(20, Number(minutes) || 8));
   // The word-for-word CTA is honored in ALL modes (it's business-critical, so the
   // creator controls it everywhere). The hook, freeform directions and style
@@ -497,9 +524,9 @@ async function runDocFactory({ idea, minutes, oauthToken, apiKey, subModel, apiM
 // ---------------------------------------------------------------------------
 
 // Rewrite the full script on the creator's note (re-runs the writer's room).
-async function reviseScript({ project, instruction, oauthToken, apiKey, subModel, apiModel, emit }) {
+async function reviseScript({ project, instruction, oauthToken, apiKey, subModel, apiModel, emit, onUsage }) {
   const say = (e) => { try { emit && emit(e); } catch (_) {} };
-  const run = makeRunner({ oauthToken, apiKey, subModel, apiModel, emit });
+  const run = makeRunner({ oauthToken, apiKey, subModel, apiModel, emit, onUsage });
   const styleBible = project.style_bible || STYLE_BIBLE;
 
   say({ type: 'phase', key: 'scripting' });
@@ -552,9 +579,9 @@ const IMAGE_PROMPTS_SHAPE = `{
 
 // Refine the doodle (image) prompts on the creator's note. Narration is left
 // untouched; only the drawing each panel shows (and optionally its bold word).
-async function reviseImagePrompts({ project, instruction, oauthToken, apiKey, subModel, apiModel, emit }) {
+async function reviseImagePrompts({ project, instruction, oauthToken, apiKey, subModel, apiModel, emit, onUsage }) {
   const say = (e) => { try { emit && emit(e); } catch (_) {} };
-  const run = makeRunner({ oauthToken, apiKey, subModel, apiModel, emit });
+  const run = makeRunner({ oauthToken, apiKey, subModel, apiModel, emit, onUsage });
   const styleBible = project.style_bible || STYLE_BIBLE;
 
   say({ type: 'phase', key: 'scripting' });

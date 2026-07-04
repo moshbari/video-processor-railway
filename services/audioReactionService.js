@@ -20,6 +20,7 @@ const { v4: uuidv4 } = require('uuid');
 const r2Service = require('./r2Service');
 const voiceService = require('./voiceService');
 const captionService = require('./captionService');
+const usageService = require('./usageService');
 
 // Store render progress for polling
 const renderProgress = {};
@@ -584,12 +585,15 @@ class AudioReactionService {
    * @param {string|null} voice - optional voice override (for OpenAI: 'nova', 'onyx', etc.; for 11Labs: a voice ID). Null = use provider default.
    * @returns {object} { success, jobId, provider, voice, reactions: [...], totalGenerated, totalFailed }
    */
-  async generateVoiceoversForJob(jobId, provider, reactions, voice = null) {
+  async generateVoiceoversForJob(jobId, provider, reactions, voice = null, userId = null, email = null) {
     const workDir = path.join(this.tempDir, jobId, 'audio_reactions');
     await fs.ensureDir(workDir);
 
     const total = reactions.length;
     const normalizedProvider = (provider || 'openai').toLowerCase();
+    // Tally characters actually turned into speech so we can attribute the AI
+    // voiceover (TTS) cost to this user (see usageService).
+    let billedChars = 0;
 
     console.log(`\n${'='.repeat(60)}`);
     console.log(`[Voiceover] 🎙️ Generating ${total} voiceovers (${normalizedProvider}, voice=${voice || 'default'})`);
@@ -659,6 +663,8 @@ class AudioReactionService {
           console.warn(`[Voiceover] ⚠ R2 upload failed (non-fatal): ${r2Err.message}`);
         }
 
+        billedChars += text.length;
+
         results.push({
           clipIndex,
           text,
@@ -689,6 +695,17 @@ class AudioReactionService {
     const finalMessage = totalFailed === 0
       ? `All ${totalGenerated} voiceovers ready`
       : `${totalGenerated} of ${total} voiceovers ready (${totalFailed} failed)`;
+
+    // Record the AI voiceover spend for this user (non-fatal — never blocks).
+    if (billedChars > 0) {
+      usageService.record({
+        userId, email, feature: 'audio-rant',
+        provider: normalizedProvider === '11labs' ? 'elevenlabs' : normalizedProvider,
+        model: voice || 'default',
+        characters: billedChars,
+        meta: { jobId, voiceovers: totalGenerated, voice: voice || null },
+      });
+    }
 
     this.updateVoiceoverProgress(jobId, finalStatus, 100, finalMessage, {
       reactions: results,

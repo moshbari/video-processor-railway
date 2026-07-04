@@ -28,6 +28,7 @@ const store = require('../services/docFactory/store');
 const imageProvider = require('../services/docFactory/imageProvider');
 const assembleService = require('../services/docFactory/assembleService');
 const library = require('../services/docFactory/library');
+const usageService = require('../services/usageService');
 const voiceService = require('../services/voiceService');
 const { normalizeOrientation } = require('../services/docFactory/dims');
 
@@ -148,9 +149,23 @@ router.post('/generate', (req, res) => {
   const imageFill = body.imageFill === 'manual' ? 'manual' : (body.imageFill === 'api' ? 'api' : null);
 
   const userId = req.headers['x-user-id'] || null;
+  const userEmail = req.headers['x-user-email'] || null;
   const jobId = uuidv4();
   const job = { status: 'running', events: [], result: null, error: null, created: Date.now() };
   JOBS.set(jobId, job);
+
+  // Tally the AI cost of every Claude pass in this run so we can attribute
+  // spend to this user (see usageService). Fires once per pass.
+  const usageTally = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, costUsd: 0, hasCost: false, passes: 0, model: null };
+  const onUsage = (u) => {
+    usageTally.passes += 1;
+    usageTally.input += u.input || 0;
+    usageTally.output += u.output || 0;
+    usageTally.cacheRead += u.cacheRead || 0;
+    usageTally.cacheCreate += u.cacheCreate || 0;
+    if (typeof u.costUsd === 'number') { usageTally.costUsd += u.costUsd; usageTally.hasCost = true; }
+    if (u.model) usageTally.model = u.model;
+  };
 
   engine.runDocFactory({
     idea, minutes, mode, cta, ...semiCfg,
@@ -159,6 +174,7 @@ router.post('/generate', (req, res) => {
     subModel: process.env.DOC_FACTORY_SUB_MODEL || 'sonnet',
     apiModel: process.env.DOC_FACTORY_API_MODEL || 'claude-opus-4-8',
     emit: (ev) => pushEvent(job, ev),
+    onUsage,
   })
     .then(async (result) => {
       result.id = jobId;
@@ -174,6 +190,17 @@ router.post('/generate', (req, res) => {
       store.cacheProject(result);
       try { await store.saveProject(result); } catch (_) { /* R2 optional */ }
       try { await library.add(userId, result); } catch (_) { /* library optional */ }
+      // Record the AI spend for this run (non-fatal — never blocks the result).
+      if (usageTally.passes > 0) {
+        usageService.record({
+          userId, email: userEmail, feature: 'doc-factory',
+          provider: oauthToken ? 'anthropic (subscription)' : 'anthropic (api)',
+          model: usageTally.model,
+          tokens: { input: usageTally.input, output: usageTally.output, cacheRead: usageTally.cacheRead, cacheCreate: usageTally.cacheCreate },
+          costUsd: usageTally.hasCost ? usageTally.costUsd : undefined,
+          meta: { jobId, mode, minutes, passes: usageTally.passes },
+        });
+      }
       job.status = 'done';
     })
     .catch((err) => {
