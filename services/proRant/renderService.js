@@ -260,10 +260,15 @@ async function removeSilence(inputPath, outputPath, opts = {}) {
   if (!finalKeeps.length) { await fs.copy(inputPath, outputPath); return { removed: 0, before: duration, after: duration }; }
 
   const expr = finalKeeps.map(([a, b]) => `between(t\\,${a.toFixed(3)}\\,${b.toFixed(3)})`).join('+');
+  // IMPORTANT: force constant 30fps BEFORE selecting/renumbering. Webcam (webm)
+  // recordings are variable-frame-rate; without this, N/FRAME_RATE re-times the
+  // video against a bogus rate and it plays too fast while the audio stays
+  // correct. fps=${FPS} first + setpts=N/${FPS} keeps video and audio in step.
   await run([
     '-y', '-i', inputPath,
-    '-vf', `select=${expr},setpts=N/FRAME_RATE/TB`,
+    '-vf', `fps=${FPS},select=${expr},setpts=N/${FPS}/TB`,
     '-af', `aselect=${expr},asetpts=N/SR/TB`,
+    '-r', String(FPS),
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
     '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-b:a', '192k', outputPath,
   ], 'desilence');
