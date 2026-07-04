@@ -52,6 +52,7 @@ const adminRoutes = require('./routes/admin');
 const audioReactionRoutes = require('./routes/audioReaction');
 const combineRoutes = require('./routes/combine');
 const downloadRoutes = require('./routes/download');
+const proRantRoutes = require('./routes/proRant');
 const jobsRoutes = require('./routes/jobs');
 const renderRoutes = require('./routes/render');
 const singleReactionRoutes = require('./routes/singleReaction');
@@ -147,6 +148,7 @@ app.use('/api/clip-library', clipLibraryRoutes);  // 📚 CLIP LIBRARY
 app.use('/api/opus-clip', opusClipRoutes);        // 🎬 OPUS CLIP
 app.use('/api/manual-clip', manualClipRoutes);    // ✂️ MANUAL CLIP
 app.use('/api/doc-factory', docFactoryRoutes);    // 🎬 DOC FACTORY
+app.use('/api/pro-rant', proRantRoutes);          // 🎬 PRO-RANT
 app.use('/api/combine', combineRoutes);
 app.use('/api/download', downloadRoutes);
 app.use('/api/jobs', jobsRoutes);
