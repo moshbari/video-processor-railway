@@ -116,9 +116,25 @@ router.post('/reaction', upload.single('video'), async (req, res) => {
       localPath = req.file.path;
     }
 
-    const duration = await renderService.probeDuration(localPath);
-    const key = `pro-rant/reactions/${id}${path.extname(localPath) || '.mp4'}`;
-    const up = await r2Service.uploadFile(localPath, key, 'video/mp4');
+    // Re-encode to a browser-SAFE MP4 (H.264/AAC + faststart) before storing, so
+    // the reaction preview actually PLAYS. A raw webcam .webm / phone H.265 clip /
+    // non-faststart mp4 would otherwise load its duration but refuse to play in the
+    // <video> element. Falls back to the original file if the transcode ever fails,
+    // so a user is never fully blocked from attaching a reaction.
+    let uploadPath = localPath;
+    let ext = path.extname(localPath) || '.mp4';
+    try {
+      const safePath = path.join(uploadDir, `${id}-web.mp4`);
+      await renderService.webSafe(localPath, safePath);
+      uploadPath = safePath;
+      ext = '.mp4';
+    } catch (e) {
+      console.warn('[ProRant] reaction web-safe transcode failed, uploading original:', e.message);
+    }
+
+    const duration = await renderService.probeDuration(uploadPath);
+    const key = `pro-rant/reactions/${id}${ext}`;
+    const up = await r2Service.uploadFile(uploadPath, key, 'video/mp4');
     const r2Url = up.downloadUrl || r2Service.getPublicUrl(key);
 
     res.json({ success: true, reaction: { id, type: type || 'upload', r2Key: key, r2Url, url: r2Url, duration } });

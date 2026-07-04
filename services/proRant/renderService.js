@@ -105,6 +105,34 @@ async function normalizeClip(inPath, outPath, cw, ch, autoLevel = false) {
   return outPath;
 }
 
+// Re-encode any reaction/upload into a browser-SAFE MP4 so the <video> preview
+// actually plays back over an R2 URL. Webcam recordings (.webm / VP8-VP9), phone
+// clips (H.265/HEVC), and mp4s whose moov atom sits at the END all let a browser
+// read the DURATION but then refuse to PLAY. This forces H.264 (yuv420p) + AAC
+// and — critically — `-movflags +faststart` (moov atom at the front) for
+// progressive streaming. It preserves the clip's NATIVE size/shape (reactions
+// must keep their own aspect for the PiP box); it only rounds dimensions to even
+// numbers (required by yuv420p/H.264). A silent stereo track is injected when the
+// source has none, so playback and any later de-silence pass are uniform.
+async function webSafe(inPath, outPath) {
+  const audio = await hasAudio(inPath);
+  const vf = `scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,format=yuv420p`;
+  const args = ['-y'];
+  if (audio) {
+    args.push('-i', inPath, '-vf', vf,
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+      '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-b:a', '192k',
+      '-movflags', '+faststart', outPath);
+  } else {
+    args.push('-i', inPath, '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
+      '-vf', vf, '-shortest', '-map', '0:v:0', '-map', '1:a:0',
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-c:a', 'aac', '-b:a', '192k',
+      '-movflags', '+faststart', outPath);
+  }
+  await run(args, 'websafe');
+  return outPath;
+}
+
 // Build the freeze-frame + free-position/size PiP segment for one reaction.
 // pip = { xPct, yPct, wPct } as fractions of the canvas (top-left origin).
 async function buildFreezeWithReaction(sectionClip, reactionClip, outPath, cw, ch, pip, workDir, idx, autoLevel = false) {
@@ -293,10 +321,11 @@ async function removeSilence(inputPath, outputPath, opts = {}) {
     '-af', `aselect=${expr},asetpts=N/SR/TB`,
     '-r', String(FPS),
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-b:a', '192k', outputPath,
+    '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-b:a', '192k',
+    '-movflags', '+faststart', outputPath,
   ], 'desilence');
   const after = await probeDuration(outputPath);
   return { removed: Math.max(0, duration - after), before: duration, after };
 }
 
-module.exports = { render, probeDuration, probeDimensions, removeSilence };
+module.exports = { render, probeDuration, probeDimensions, removeSilence, webSafe };
