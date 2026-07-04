@@ -128,6 +128,31 @@ router.post('/reaction', upload.single('video'), async (req, res) => {
   }
 });
 
+// ===================== Remove silence from a reaction =====================
+// One click: trim the silent pauses out of a reaction clip and return a new one.
+router.post('/reaction/desilence', async (req, res) => {
+  try {
+    const url = (req.body && (req.body.url || req.body.r2Url) || '').trim();
+    const type = (req.body && req.body.type) || 'upload';
+    if (!url) return res.status(400).json({ success: false, error: 'No reaction to process.' });
+    const id = uuidv4();
+    const workDir = path.join(process.env.TEMP_DIR || os.tmpdir(), 'pro-rant', 'desilence', id);
+    await fs.ensureDir(workDir);
+    const inPath = path.join(workDir, 'in.mp4');
+    await r2Service.downloadFile(url, inPath);
+    const outPath = path.join(workDir, 'out.mp4');
+    const result = await renderService.removeSilence(inPath, outPath);
+    const key = `pro-rant/reactions/${id}-desilenced.mp4`;
+    const up = await r2Service.uploadFile(outPath, key, 'video/mp4');
+    const r2Url = up.downloadUrl || r2Service.getPublicUrl(key);
+    try { await fs.remove(workDir); } catch (_) {}
+    res.json({ success: true, reaction: { id, type, r2Key: key, r2Url, url: r2Url, duration: result.after }, removed: result.removed, before: result.before, after: result.after });
+  } catch (err) {
+    console.error('[ProRant] desilence error:', err.message);
+    res.status(500).json({ success: false, error: friendly(err.message, "Couldn't remove the silence. Please try again.") });
+  }
+});
+
 // ===================== Save / autosave a project =====================
 router.post('/project', async (req, res) => {
   try {

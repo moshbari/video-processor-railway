@@ -206,4 +206,69 @@ async function render(project, opts = {}) {
   return { outputPath };
 }
 
-module.exports = { render, probeDuration, probeDimensions };
+// ---------------------------------------------------------------------------
+// One-click silence removal for a reaction clip.
+// Detect silent gaps (silencedetect), keep only the speaking parts (with a
+// little padding) and concatenate them via the select/aselect filters so audio
+// and video stay in sync. Returns how much was trimmed.
+// ---------------------------------------------------------------------------
+function detectSilence(input, noise, minSil) {
+  return new Promise((resolve) => {
+    const child = spawn('ffmpeg', ['-i', input, '-af', `silencedetect=noise=${noise}:d=${minSil}`, '-f', 'null', '-']);
+    let err = '';
+    child.stderr.on('data', (d) => { err += d.toString(); });
+    child.on('error', () => resolve([]));
+    child.on('close', () => {
+      const starts = [], ends = [];
+      let m;
+      const reS = /silence_start:\s*(-?[0-9.]+)/g, reE = /silence_end:\s*([0-9.]+)/g;
+      while ((m = reS.exec(err))) starts.push(parseFloat(m[1]));
+      while ((m = reE.exec(err))) ends.push(parseFloat(m[1]));
+      const out = [];
+      for (let i = 0; i < starts.length; i++) out.push([Math.max(0, starts[i]), ends[i] != null ? ends[i] : null]);
+      resolve(out);
+    });
+  });
+}
+
+async function removeSilence(inputPath, outputPath, opts = {}) {
+  const noise = opts.noise || '-30dB';       // quieter than this counts as silence
+  const minSil = opts.minSilence || 0.5;     // only cut pauses at least this long
+  const pad = opts.pad != null ? opts.pad : 0.06; // keep a hair around speech
+  const duration = await probeDuration(inputPath);
+  const silences = await detectSilence(inputPath, noise, minSil);
+  if (!silences.length) { await fs.copy(inputPath, outputPath); return { removed: 0, before: duration, after: duration }; }
+
+  // Keep = the complement of the silent intervals.
+  let t = 0; const keeps = [];
+  for (const [s, e] of silences) {
+    const end = e == null ? duration : e;
+    if (s > t + 0.01) keeps.push([Math.max(0, t), Math.min(s, duration)]);
+    t = Math.max(t, end);
+  }
+  if (t < duration - 0.01) keeps.push([t, duration]);
+
+  // Pad, merge overlaps, drop slivers.
+  const padded = keeps.map(([a, b]) => [Math.max(0, a - pad), Math.min(duration, b + pad)]);
+  const merged = [];
+  for (const k of padded) {
+    const last = merged[merged.length - 1];
+    if (last && k[0] <= last[1]) last[1] = Math.max(last[1], k[1]);
+    else merged.push([k[0], k[1]]);
+  }
+  const finalKeeps = merged.filter(([a, b]) => b - a > 0.05);
+  if (!finalKeeps.length) { await fs.copy(inputPath, outputPath); return { removed: 0, before: duration, after: duration }; }
+
+  const expr = finalKeeps.map(([a, b]) => `between(t\\,${a.toFixed(3)}\\,${b.toFixed(3)})`).join('+');
+  await run([
+    '-y', '-i', inputPath,
+    '-vf', `select=${expr},setpts=N/FRAME_RATE/TB`,
+    '-af', `aselect=${expr},asetpts=N/SR/TB`,
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-b:a', '192k', outputPath,
+  ], 'desilence');
+  const after = await probeDuration(outputPath);
+  return { removed: Math.max(0, duration - after), before: duration, after };
+}
+
+module.exports = { render, probeDuration, probeDimensions, removeSilence };
