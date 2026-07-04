@@ -80,15 +80,21 @@ async function extractLastFrame(videoPath, outPath) {
   return outPath;
 }
 
+// Loudness normalization target (EBU R128) — gives every clip the same natural
+// perceived loudness so the main video and reactions don't jump in volume.
+const LOUDNORM = 'loudnorm=I=-16:TP=-1.5:LRA=11';
+
 // Normalize any clip to canvas dims + 30fps + yuv420p + stereo 48k audio
 // (silent audio injected if the clip has none) so concat is seamless.
-async function normalizeClip(inPath, outPath, cw, ch) {
+// autoLevel=true also loudness-normalizes the audio.
+async function normalizeClip(inPath, outPath, cw, ch, autoLevel = false) {
   const audio = await hasAudio(inPath);
   const vf = `scale=${cw}:${ch}:force_original_aspect_ratio=decrease,pad=${cw}:${ch}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${FPS},format=yuv420p`;
   const args = ['-y'];
   if (audio) {
-    args.push('-i', inPath, '-vf', vf, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-      '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-b:a', '192k', outPath);
+    args.push('-i', inPath, '-vf', vf, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20');
+    if (autoLevel) args.push('-af', LOUDNORM);
+    args.push('-c:a', 'aac', '-ar', '48000', '-ac', '2', '-b:a', '192k', outPath);
   } else {
     // No audio track -> add a silent one so every clip is uniform for concat.
     args.push('-i', inPath, '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
@@ -101,7 +107,7 @@ async function normalizeClip(inPath, outPath, cw, ch) {
 
 // Build the freeze-frame + free-position/size PiP segment for one reaction.
 // pip = { xPct, yPct, wPct } as fractions of the canvas (top-left origin).
-async function buildFreezeWithReaction(sectionClip, reactionClip, outPath, cw, ch, pip, workDir, idx) {
+async function buildFreezeWithReaction(sectionClip, reactionClip, outPath, cw, ch, pip, workDir, idx, autoLevel = false) {
   const framePath = path.join(workDir, `frame_${idx}.jpg`);
   await extractLastFrame(sectionClip, framePath);
 
@@ -118,8 +124,13 @@ async function buildFreezeWithReaction(sectionClip, reactionClip, outPath, cw, c
 
   const args = ['-y', '-loop', '1', '-t', String(dur), '-i', framePath, '-i', reactionClip,
     '-filter_complex', filter, '-map', '[v]'];
-  if (reactHasAudio) args.push('-map', '1:a:0', '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-b:a', '192k');
-  else args.push('-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000', '-map', '2:a:0', '-shortest', '-c:a', 'aac', '-b:a', '192k');
+  if (reactHasAudio) {
+    args.push('-map', '1:a:0');
+    if (autoLevel) args.push('-af', LOUDNORM);
+    args.push('-c:a', 'aac', '-ar', '48000', '-ac', '2', '-b:a', '192k');
+  } else {
+    args.push('-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000', '-map', '2:a:0', '-shortest', '-c:a', 'aac', '-b:a', '192k');
+  }
   args.push('-t', String(dur), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', outPath);
 
   await run(args, 'freeze+pip');
@@ -169,6 +180,7 @@ async function render(project, opts = {}) {
     : await probeDimensions(mainPath);
   const cw = even(dims.width);
   const ch = even(dims.height);
+  const autoLevel = !!project.autoLevel; // one-click audio leveling
 
   const pieces = [];
   for (let i = 0; i < total; i++) {
@@ -181,7 +193,7 @@ async function render(project, opts = {}) {
 
     // Normalize the section clip to canvas so concat is seamless.
     const sectionClip = path.join(workDir, `section_${i}.mp4`);
-    await normalizeClip(sectionRaw, sectionClip, cw, ch);
+    await normalizeClip(sectionRaw, sectionClip, cw, ch, autoLevel);
     pieces.push(sectionClip);
 
     // 3. If there's a reaction, add the freeze + PiP segment after it.
@@ -190,9 +202,20 @@ async function render(project, opts = {}) {
       const reactionPath = path.join(workDir, `reaction_${i}.mp4`);
       await r2Service.downloadFile(reactionUrl, reactionPath);
       const reactSeg = path.join(workDir, `reactseg_${i}.mp4`);
-      await buildFreezeWithReaction(sectionClip, reactionPath, reactSeg, cw, ch, s.pip, workDir, i);
+      await buildFreezeWithReaction(sectionClip, reactionPath, reactSeg, cw, ch, s.pip, workDir, i, autoLevel);
       pieces.push(reactSeg);
     }
+  }
+
+  // 4. Optional call-to-action clip — plays full-screen at the very end.
+  const ctaUrl = project.cta && (project.cta.r2Url || project.cta.url);
+  if (ctaUrl) {
+    onProgress({ text: 'Adding your call-to-action…', done: total, of: total });
+    const ctaPath = path.join(workDir, 'cta.mp4');
+    await r2Service.downloadFile(ctaUrl, ctaPath);
+    const ctaClip = path.join(workDir, 'cta_norm.mp4');
+    await normalizeClip(ctaPath, ctaClip, cw, ch, autoLevel);
+    pieces.push(ctaClip);
   }
 
   onProgress({ text: 'Joining everything together…', done: total, of: total });
