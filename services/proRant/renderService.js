@@ -195,17 +195,33 @@ async function render(project, opts = {}) {
   const total = sections.length;
   onProgress({ text: 'Fetching your main video…', done: 0, of: total });
 
-  // 1. Bring the main video local (from its R2 copy).
-  const mainPath = path.join(workDir, 'main.mp4');
-  const mainUrl = project.main && (project.main.r2Url || project.main.url);
-  if (!mainUrl) throw new Error('This project has no main video.');
-  await r2Service.downloadFile(mainUrl, mainPath);
+  // 1. The project can hold MANY main videos; each section is cut from one of
+  // them (section.mainId). Old single-main projects still work: fall back to
+  // project.main and treat every section as belonging to it. Download each
+  // distinct main only once, on demand.
+  const mainsArr = Array.isArray(project.mains) && project.mains.length
+    ? project.mains
+    : (project.main ? [project.main] : []);
+  if (!mainsArr.length) throw new Error('This project has no main video.');
+  const mainCache = new Map(); // main key -> local path
+  const fetchMain = async (mainId) => {
+    const m = (mainId && mainsArr.find((x) => x.id === mainId)) || mainsArr[0];
+    const url = m && (m.r2Url || m.url);
+    if (!url) throw new Error('A section points to a main video that is missing.');
+    const key = (m && m.id) || url;
+    if (mainCache.has(key)) return mainCache.get(key);
+    const p = path.join(workDir, `main_${mainCache.size}.mp4`);
+    await r2Service.downloadFile(url, p);
+    mainCache.set(key, p);
+    return p;
+  };
 
-  // Canvas = the main video's real pixels (even numbers), so the reaction box
+  // Canvas = the FIRST main's real pixels (even numbers); every section is
+  // normalized to it, so mixed-size mains letterbox cleanly and the reaction box
   // coordinates from the editor map 1:1.
   const dims = (project.canvas && project.canvas.width && project.canvas.height)
     ? project.canvas
-    : await probeDimensions(mainPath);
+    : await probeDimensions(await fetchMain(mainsArr[0] && mainsArr[0].id));
   const cw = even(dims.width);
   const ch = even(dims.height);
   const autoLevel = !!project.autoLevel; // one-click audio leveling
@@ -227,9 +243,10 @@ async function render(project, opts = {}) {
     const s = sections[i];
     onProgress({ text: `Building section ${i + 1} of ${total}…`, done: i, of: total });
 
-    // 2. Cut [startSec, endSec] from the main video (max quality).
+    // 2. Cut [startSec, endSec] from THIS section's main video (max quality).
+    const sectionMainPath = await fetchMain(s.mainId);
     const sectionRaw = path.join(workDir, `section_${i}_raw.mp4`);
-    await manualClipService.extractClipMaxQuality(mainPath, s.startSec, s.endSec, sectionRaw);
+    await manualClipService.extractClipMaxQuality(sectionMainPath, s.startSec, s.endSec, sectionRaw);
 
     // Normalize the section clip to canvas so concat is seamless.
     const sectionClip = path.join(workDir, `section_${i}.mp4`);
