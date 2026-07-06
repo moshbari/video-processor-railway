@@ -210,6 +210,18 @@ async function render(project, opts = {}) {
   const ch = even(dims.height);
   const autoLevel = !!project.autoLevel; // one-click audio leveling
 
+  // A "master reaction" is ONE uploaded clip that many sections each slice a
+  // piece out of (saves the user re-uploading per section). Cache each reaction
+  // source by URL so the shared master is downloaded only once.
+  const reactionCache = new Map(); // r2Url -> local path
+  const fetchReactionSource = async (url) => {
+    if (reactionCache.has(url)) return reactionCache.get(url);
+    const p = path.join(workDir, `reactsrc_${reactionCache.size}.mp4`);
+    await r2Service.downloadFile(url, p);
+    reactionCache.set(url, p);
+    return p;
+  };
+
   const pieces = [];
   for (let i = 0; i < total; i++) {
     const s = sections[i];
@@ -227,8 +239,15 @@ async function render(project, opts = {}) {
     // 3. If there's a reaction, add the freeze + PiP segment after it.
     const reactionUrl = s.reaction && (s.reaction.r2Url || s.reaction.url);
     if (reactionUrl) {
-      const reactionPath = path.join(workDir, `reaction_${i}.mp4`);
-      await r2Service.downloadFile(reactionUrl, reactionPath);
+      const src = await fetchReactionSource(reactionUrl);
+      // If this section uses a SLICE of a master reaction, cut [clipStart, clipEnd]
+      // out of the shared source first; otherwise use the whole clip as-is.
+      let reactionPath = src;
+      const cs = s.reaction.clipStart, ce = s.reaction.clipEnd;
+      if (typeof cs === 'number' && typeof ce === 'number' && ce > cs + 0.05) {
+        reactionPath = path.join(workDir, `reaction_${i}.mp4`);
+        await manualClipService.extractClipMaxQuality(src, cs, ce, reactionPath);
+      }
       const reactSeg = path.join(workDir, `reactseg_${i}.mp4`);
       await buildFreezeWithReaction(sectionClip, reactionPath, reactSeg, cw, ch, s.pip, workDir, i, autoLevel);
       pieces.push(reactSeg);
