@@ -55,7 +55,42 @@ class SplitService {
       }
 
       // Sort reactions by timestamp
-      const sortedReactions = reactions.sort((a, b) => a.timestamp - b.timestamp);
+      let sortedReactions = reactions.sort((a, b) => a.timestamp - b.timestamp);
+
+      // START→END normalization.
+      // Each timestamp below is treated as a clip END time. The file-upload
+      // audio-rant path converts START times → END times in the browser before
+      // sending, but the URL/download path sends raw START times where the FIRST
+      // reaction is at 0. A "0" END makes a zero-length first segment that gets
+      // skipped below, so N reactions yield only N-1 clips — and the frontend,
+      // which sizes itself to the returned clip count, then drops the LAST
+      // reaction ("the last audio reaction is always missing"). When we detect
+      // start-style input (first timestamp is 0), convert each reaction to the
+      // NEXT reaction's start (its END), giving the last one an END of
+      // last + average-gap. Result: exactly one clip per reaction. This exactly
+      // mirrors the browser conversion and is a no-op when the first timestamp
+      // is > 0, so other /api/split callers are unaffected.
+      if (sortedReactions.length > 0 && Number(sortedReactions[0].timestamp) === 0) {
+        const starts = sortedReactions.map(r => Number(r.timestamp) || 0);
+        const positive = starts.filter(t => t > 0).sort((a, b) => a - b);
+        if (positive.length > 0) {
+          const lastStart = positive[positive.length - 1];
+          const avgGap = positive.length > 1
+            ? (positive[positive.length - 1] - positive[0]) / (positive.length - 1)
+            : 6;
+          const fallbackEnd = lastStart + Math.round(avgGap);
+          sortedReactions = sortedReactions.map((r, i) => {
+            const myStart = Number(r.timestamp) || 0;
+            let end = 0;
+            for (let j = i + 1; j < sortedReactions.length; j++) {
+              const t = Number(sortedReactions[j].timestamp) || 0;
+              if (t > myStart) { end = t; break; }
+            }
+            return { ...r, timestamp: end > 0 ? end : fallbackEnd };
+          });
+          console.log(`Converted START timestamps to END timestamps: [${starts.join(', ')}] → [${sortedReactions.map(r => r.timestamp).join(', ')}]`);
+        }
+      }
 
       const clips = [];
       const reactionGuide = [];

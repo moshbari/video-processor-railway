@@ -239,10 +239,15 @@ class AudioReactionService {
         // clips the tail of the reaction) and is often missing/0 for browser webm
         // mic recordings (would make `-t 0` produce an empty reaction). Instead the
         // looping still image is the only endless input, so `-shortest` ends the
-        // output exactly when the (padded) audio ends. `apad` adds a short tail of
-        // silence so `-shortest`'s frame-boundary rounding can never chop the last
-        // word — the reaction always plays in full, followed by a tiny frozen hold.
-        const cmd = `ffmpeg -y -loop 1 -i "${framePath}" -i "${audioPath}" -vf "scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,fps=30" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -ar 44100 -af "${afilter},apad=pad_dur=0.35" -shortest -pix_fmt yuv420p "${outputPath}"`;
+        // output exactly when the audio ends.
+        //
+        // Do NOT chain `apad` after `loudnorm`: loudnorm has an internal lookahead
+        // buffer that it FLUSHES at end-of-stream, and `apad` then pads AFTER that
+        // flush — together they append ~1.5–2s of frozen, silent video to EVERY
+        // reaction (looked like "the frame freezes for a couple of seconds"). With
+        // `-shortest` and no apad the segment ends exactly on the last spoken frame
+        // (frame-boundary rounding is <1/30s — inaudible), so no dead-air freeze.
+        const cmd = `ffmpeg -y -loop 1 -i "${framePath}" -i "${audioPath}" -vf "scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,fps=30" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -ar 44100 -af "${afilter}" -shortest -pix_fmt yuv420p "${outputPath}"`;
 
         exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
           if (error) {
