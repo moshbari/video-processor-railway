@@ -145,13 +145,13 @@ WHAT MAKES THE FORMAT WORK (obey all of it):
   number. For those, the bold word/number is laid OVER the doodle as on-screen
   text; it is NEVER bare text on an empty card. There is always a drawing behind
   it, because a picture holds the viewer far better than a word alone.
-- Pace: a new panel roughly every 3 seconds. An 8-minute video is ~150 panels.`;
+- Pace: a new panel roughly every 3 seconds. A 1-minute video is ~18 panels.`;
 
 const BLUEPRINT_SHAPE = `{
   "title": "the ONE winning title — a curiosity-gap question/promise, concrete and simple, ideally 4-9 words. No clickbait lies.",
   "alt_titles": ["3-4 strong alternates in the same vein"],
   "angle": "1-2 sentences: the specific angle/hook this video takes and the promise it keeps.",
-  "target_minutes": 8,
+  "target_minutes": 1,
   "tone": "one line describing the narration voice for this specific topic.",
   "thumbnail_idea": "1 sentence: a simple doodle + 2-4 bold words that would make a high-CTR thumbnail.",
   "fact_bank": [
@@ -168,9 +168,9 @@ const BLUEPRINT_SYSTEM = `You are THE SCOUT, THE RESEARCHER and THE ARCHITECT of
 ${MISSION}
 
 YOUR JOB IN THIS PASS:
-- THE SCOUT: take the user's idea/keyword and find the most curiosity-driving ANGLE. Write the highest-tension TITLE (plus alternates). Pick a target length (default 8 minutes).
+- THE SCOUT: take the user's idea/keyword and find the most curiosity-driving ANGLE. Write the highest-tension TITLE (plus alternates). This is a SHORT ~1-minute video — keep the promise tight and immediately payable.
 - THE RESEARCHER: use WebSearch to gather real substance. Build a FACT BANK of specific facts and vivid details, each tagged "fact" or "speculation" with its source. 8-16 entries. Never fabricate; if uncertain, mark it speculation.
-- THE ARCHITECT: lay out the STORY as an ordered list of BEATS (sections/acts) — a strong hook, rising curiosity, immersive vivid scenes, a real reveal, a satisfying close. Use roughly 2 beats per minute of target length (e.g. ~16 beats for 8 minutes, ~8 beats for 4 minutes). Each beat is one line + its narrative purpose. The beats will later be expanded into the full narration.
+- THE ARCHITECT: lay out the STORY as an ordered list of BEATS (sections/acts) — a strong hook, rising curiosity, a vivid scene, a real reveal, a satisfying close. Use roughly 2 beats per minute of target length (e.g. ~2-3 beats for a 1-minute video). Each beat is one line + its narrative purpose. The beats will later be expanded into the full narration. Keep it tight — this is a ~1-minute video, so no filler.
 
 Output ONLY a JSON object wrapped in <json></json> tags, no other prose, of this shape:
 <json>
@@ -397,7 +397,11 @@ function bgHex(bg) {
 async function runDocFactory({ idea, minutes, oauthToken, apiKey, subModel, apiModel, emit, onUsage, mode, hook, cta, directives, styleOverride }) {
   const say = (e) => { try { emit && emit(e); } catch (_) {} };
   const run = makeRunner({ oauthToken, apiKey, subModel, apiModel, emit, onUsage });
-  const targetMinutes = Math.max(3, Math.min(20, Number(minutes) || 8));
+  // Doc Factory is capped at a 1-minute maximum. The frontend only offers the
+  // 1-minute option; this clamp is the backstop so any request (including the
+  // old default of 8) collapses to 1 minute.
+  const MAX_MINUTES = 1;
+  const targetMinutes = Math.max(1, Math.min(MAX_MINUTES, Number(minutes) || 1));
   // The word-for-word CTA is honored in ALL modes (it's business-critical, so the
   // creator controls it everywhere). The hook, freeform directions and style
   // override stay a Semi-only nicety — in 'auto'/'manual' those remain empty.
