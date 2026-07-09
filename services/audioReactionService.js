@@ -73,6 +73,34 @@ class AudioReactionService {
   }
 
   /**
+   * Get the EXACT audio content duration by DECODING and counting samples.
+   *
+   * Why not `format.duration`? For VBR MP3 the header value is only an estimate
+   * (often reads short) and for browser webm mic recordings it is frequently 0 —
+   * so it can't be trusted to cap a reaction segment. Counting the actually
+   * decoded samples (nb_read_samples / sample_rate) is exact for every format,
+   * including webm. Returns 0 if it can't be determined (caller then skips the
+   * cap and relies on `-shortest`).
+   */
+  async getAccurateAudioDuration(filePath) {
+    return new Promise((resolve) => {
+      const cmd = `ffprobe -v error -select_streams a:0 -count_samples -show_entries stream=nb_read_samples,sample_rate -of json "${filePath}"`;
+      exec(cmd, { maxBuffer: 10 * 1024 * 1024 }, (error, stdout) => {
+        if (error) return resolve(0);
+        try {
+          const s = JSON.parse(stdout).streams?.[0] || {};
+          const samples = parseInt(s.nb_read_samples, 10);
+          const rate = parseInt(s.sample_rate, 10);
+          if (Number.isFinite(samples) && Number.isFinite(rate) && rate > 0 && samples > 0) {
+            return resolve(samples / rate);
+          }
+        } catch (_) { /* fall through */ }
+        resolve(0);
+      });
+    });
+  }
+
+  /**
    * Get video dimensions
    */
   async getVideoDimensions(videoPath) {
@@ -229,25 +257,23 @@ class AudioReactionService {
     const afilter = this.buildLoudnormFilter(measured);
     return new Promise(async (resolve, reject) => {
       try {
-        const audioDuration = await this.getMediaDuration(audioPath);
-        console.log(`[AudioReaction] Creating frozen frame video (~${(audioDuration || 0).toFixed(2)}s reported) with normalized audio (${measured ? 'two-pass' : 'one-pass fallback'})...`);
+        // Use the DECODE-accurate content duration (not the ffprobe estimate) to
+        // cap the segment. This is the fix for "the frame freezes for a couple of
+        // seconds after every reaction": `loudnorm` flushes its internal true-peak
+        // limiter lookahead at end-of-stream as ~1.5–2s of extra SILENT samples,
+        // which `-shortest` would otherwise include — adding dead, frozen video to
+        // every reaction. Capping the output at the real spoken length drops that
+        // flushed silence. (`apad` used to sit after loudnorm and made this worse.)
+        const accurate = await this.getAccurateAudioDuration(audioPath);
+        const audioDuration = accurate > 0 ? accurate : await this.getMediaDuration(audioPath);
+        // Small tail so frame-boundary rounding can never clip the last word.
+        const HOLD = 0.15;
+        // Only cap when we trust the length (>0). If it is unknown (0), fall back
+        // to `-shortest` alone so we never produce an empty/truncated reaction.
+        const capArg = audioDuration > 0 ? `-t ${(audioDuration + HOLD).toFixed(3)}` : '';
+        console.log(`[AudioReaction] Creating frozen frame video (${audioDuration.toFixed(2)}s ${accurate > 0 ? 'exact' : 'estimated'}${capArg ? `, capped +${HOLD}s` : ', -shortest'}) with normalized audio (${measured ? 'two-pass' : 'one-pass fallback'})...`);
 
-        // Create frozen video from image + add audio with normalization.
-        //
-        // IMPORTANT: we do NOT cap the output with `-t <ffprobe duration>`.
-        // ffprobe's format.duration is only an ESTIMATE for VBR MP3 (reads short →
-        // clips the tail of the reaction) and is often missing/0 for browser webm
-        // mic recordings (would make `-t 0` produce an empty reaction). Instead the
-        // looping still image is the only endless input, so `-shortest` ends the
-        // output exactly when the audio ends.
-        //
-        // Do NOT chain `apad` after `loudnorm`: loudnorm has an internal lookahead
-        // buffer that it FLUSHES at end-of-stream, and `apad` then pads AFTER that
-        // flush — together they append ~1.5–2s of frozen, silent video to EVERY
-        // reaction (looked like "the frame freezes for a couple of seconds"). With
-        // `-shortest` and no apad the segment ends exactly on the last spoken frame
-        // (frame-boundary rounding is <1/30s — inaudible), so no dead-air freeze.
-        const cmd = `ffmpeg -y -loop 1 -i "${framePath}" -i "${audioPath}" -vf "scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,fps=30" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -ar 44100 -af "${afilter}" -shortest -pix_fmt yuv420p "${outputPath}"`;
+        const cmd = `ffmpeg -y -loop 1 -i "${framePath}" -i "${audioPath}" -vf "scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,fps=30" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -ar 44100 -af "${afilter}" ${capArg} -shortest -pix_fmt yuv420p "${outputPath}"`;
 
         exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
           if (error) {
