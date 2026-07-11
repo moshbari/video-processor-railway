@@ -787,9 +787,13 @@ class ManualClipService {
     let fullSeconds = videoDuration || 0;
     let cutsApplied = false;
     let removedSeconds = 0;
+    // Kept segments of the full video (source time). Lower-third CTA times are
+    // placed on the SOURCE timeline in the editor, so we map them through this.
+    let fullKeeps = null;
 
     if (cuts.length > 0) {
       const keeps = this.keepSegmentsFromRemovals(cuts, videoDuration);
+      fullKeeps = keeps;
       const keptSeconds = keeps.reduce((s, k) => s + (k.end - k.start), 0);
       removedSeconds = Math.max(0, videoDuration - keptSeconds);
 
@@ -817,6 +821,44 @@ class ManualClipService {
 
     const totalSeconds = hooksTotalSeconds + fullSeconds;
 
+    // Step 2b: 📺 Animated lower-third CTAs. These burn onto the FULL-video
+    // segment (the last input to the concat), timed on that segment's own
+    // timeline. The editor places them on the SOURCE timeline, so map each
+    // time through the kept segments (identity when there were no cuts). A
+    // CTA that lands entirely inside a removed gap is dropped.
+    let lowerThirdsAssPath = null;
+    const lowerThirdsIn = Array.isArray(options.lowerThirds) ? options.lowerThirds : [];
+    if (lowerThirdsIn.length > 0) {
+      const mapped = lowerThirdsIn.map(lt => {
+        const s0 = Math.max(0, Number(lt.startSec ?? lt.startTime) || 0);
+        const e0 = Number(lt.endSec ?? lt.endTime);
+        const stay = !!lt.stay;
+        const startSec = this.mapTimeThroughKeeps(s0, fullKeeps);
+        const endSec = stay ? fullSeconds
+          : this.mapTimeThroughKeeps(Number.isFinite(e0) ? e0 : s0 + 6, fullKeeps);
+        return {
+          style: lt.style || 'bar',
+          line1: lt.line1 || '',
+          line2: lt.line2 || '',
+          stay, startSec, endSec,
+        };
+      }).filter(lt => lt.stay || lt.endSec > lt.startSec + 0.2);
+
+      if (mapped.length > 0) {
+        try {
+          const assPath = path.join(seqDir, 'lowerthirds.ass');
+          const built = await this.buildLowerThirdsAss(mapped, assPath, fullSeconds);
+          if (built) {
+            lowerThirdsAssPath = built;
+            console.log(`  📺 ${mapped.length} lower-third CTA(s) will burn onto the full video`);
+          }
+        } catch (err) {
+          // A CTA-overlay failure must never kill the whole render.
+          console.error(`[ManualClip ${jobId}] Lower-thirds build failed (rendering without them):`, err.message);
+        }
+      }
+    }
+
     // Step 3: Concatenate everything into one 16:9 file.
     this.updateJob(jobId, {
       step: 'concatenating',
@@ -827,7 +869,7 @@ class ManualClipService {
     const outputPath = path.join(seqDir, 'podcast_sequence.mp4');
     await this.concatenateSequence16x9(segmentPaths, outputPath, totalSeconds, (pct) => {
       this.updateJob(jobId, { progress: Math.round(62 + (pct / 100) * 30) }); // 62 -> 92
-    });
+    }, { lastInputSubtitles: lowerThirdsAssPath });
 
     // Guard: never report "complete" if the stitch produced no file (e.g. ffmpeg
     // ran out of memory). Fail loudly instead of handing back a dead link.
@@ -978,15 +1020,24 @@ class ManualClipService {
    * audio is loudness-normalized so the joins are seamless even when the hook
    * sections and the full video have slightly different specs.
    */
-  concatenateSequence16x9(inputPaths, outputPath, totalSeconds, onProgress) {
+  concatenateSequence16x9(inputPaths, outputPath, totalSeconds, onProgress, extra = {}) {
     return new Promise((resolve, reject) => {
       const n = inputPaths.length;
       const inputArgs = inputPaths.flatMap(p => ['-i', p]);
 
+      // 📺 Optional: burn animated lower-third CTAs onto the LAST input (the
+      // full podcast video). libass reads the .ass; ':' and '\' in the path
+      // must be escaped for the filtergraph.
+      const subPath = extra.lastInputSubtitles;
+      const subChain = subPath
+        ? `,subtitles=filename='${String(subPath).replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'")}'`
+        : '';
+
       const filterParts = [];
       let concatInputs = '';
       for (let i = 0; i < n; i++) {
-        filterParts.push(`[${i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v${i}]`);
+        const lt = (subChain && i === n - 1) ? subChain : '';
+        filterParts.push(`[${i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p${lt}[v${i}]`);
         filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
         concatInputs += `[v${i}][a${i}]`;
       }
@@ -2061,6 +2112,158 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     }
 
     await fs.writeFile(outputPath, assContent, 'utf8');
+    return outputPath;
+  }
+
+  // ============================================================
+  // 📺 ANIMATED LOWER THIRDS (news-style CTA overlays)
+  // ------------------------------------------------------------
+  // Burned into the FULL-video portion of the podcast render via libass
+  // (the same subtitle engine captions use). Each overlay flies in, holds,
+  // and either slides away or stays pinned. Six broadcast styles, matching
+  // the preview: Broadcast Bar, Glass Pill, Wipe Reveal, Kinetic Brackets,
+  // Underline Draw, Neon Brand Bar.
+  // ============================================================
+
+  /**
+   * Map a SOURCE-video timestamp onto the "kept" timeline (what's left after
+   * Danger-Zone / silence cuts are removed). If the time lands inside a removed
+   * gap it snaps to the nearest kept boundary. With no cuts this is identity.
+   * @param {number} t        - source seconds
+   * @param {Array}  keeps    - [{start,end}] kept segments in source time (sorted)
+   * @returns {number} seconds on the kept (final full-video segment) timeline
+   */
+  mapTimeThroughKeeps(t, keeps) {
+    if (!Array.isArray(keeps) || keeps.length === 0) return Math.max(0, t);
+    let acc = 0;
+    for (const k of keeps) {
+      if (t >= k.end) { acc += (k.end - k.start); continue; }
+      if (t <= k.start) return acc;                 // inside a gap before this keep
+      return acc + (t - k.start);                   // inside this keep
+    }
+    return acc;                                      // past the end
+  }
+
+  /**
+   * Build an ASS subtitle file describing the animated lower thirds, timed on
+   * the full-video SEGMENT's own timeline (0 = start of the full video that
+   * gets appended after the hooks). Returns the file path, or null if there is
+   * nothing to draw.
+   * @param {Array}  items      - [{ style, startSec, endSec, line1, line2, stay }]
+   * @param {string} outputPath - where to write the .ass
+   * @param {number} segDur     - full-video segment duration (for "stay" end)
+   */
+  async buildLowerThirdsAss(items, outputPath, segDur) {
+    const list = (Array.isArray(items) ? items : []).filter(Boolean);
+    if (list.length === 0) return null;
+
+    const PLAY_W = 1920, PLAY_H = 1080;
+    // Palette in ASS &HBBGGRR& order.
+    const C = {
+      cyan: 'CDE624', cyanB: 'E6FB6F', pink: 'A05BFF',
+      ink: 'FFF8F3', amber: '38B6FF', darkTxt: '0A0A0A',
+    };
+    const X0 = 130;                 // left safe margin
+    const FIN = 400, FOUT = 340;    // fly-in / fly-out (ms)
+
+    // ---- ASS header + one Style per visual role -------------------------
+    // BorderStyle=3 => an opaque box auto-fitted around the text (no width
+    // measuring needed). The box colour is the OutlineColour; its alpha (the
+    // AA in &HAABBGGRR&) sets transparency. BorderStyle=1 => outline+shadow.
+    // Format: Name,Font,Size,Primary,Secondary,Outline,Back,Bold,Ital,Under,
+    //   Strike,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Align,ML,MR,MV,Enc
+    let ass = `[Script Info]
+Title: Lower Thirds
+ScriptType: v4.00+
+PlayResX: ${PLAY_W}
+PlayResY: ${PLAY_H}
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: LTMain,Arial,62,&H00${C.ink},&H000000FF,&HB4000000,&H96000000,1,0,0,0,100,100,0,0,1,0,4,7,0,0,0,1
+Style: LTKick,Arial,34,&H00${C.cyanB},&H000000FF,&HB4000000,&H96000000,1,0,0,0,100,100,4,0,1,0,3,7,0,0,0,1
+Style: LTBoxMain,Arial,58,&H00${C.ink},&H000000FF,&H1E0E0906,&H78000000,1,0,0,0,100,100,0,0,3,22,0,7,0,0,0,1
+Style: LTBoxKick,Arial,32,&H00${C.cyanB},&H000000FF,&H1E0E0906,&H78000000,1,0,0,0,100,100,3,0,3,16,0,7,0,0,0,1
+Style: LTPill,Arial,40,&H00${C.ink},&H000000FF,&H32120C0A,&H78000000,1,0,0,0,100,100,0,0,3,28,0,7,0,0,0,1
+Style: LTTag,Arial,34,&H00${C.darkTxt},&H000000FF,&H00${C.amber},&H96000000,1,0,0,0,100,100,3,0,3,18,0,7,0,0,0,1
+Style: LTDraw,Arial,40,&H00${C.cyan},&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+`;
+
+    const esc = (s) => String(s == null ? '' : s)
+      .replace(/\\/g, ' ').replace(/[\{\}]/g, '').replace(/\r?\n/g, ' ').trim();
+    const rect = (w, h) => `m 0 0 l ${w} 0 ${w} ${h} 0 ${h}`;
+    const dialogue = (layer, start, end, style, x, y, sx, sy, stay, body) => {
+      const move = (sx === x && sy === y) ? '' : `\\move(${sx},${sy},${x},${y},0,${FIN})`;
+      const fad = `\\fad(${FIN},${stay ? 0 : FOUT})`;
+      ass += `Dialogue: ${layer},${this.secondsToAssTime(start)},${this.secondsToAssTime(end)},${style},,0,0,0,,{\\an7\\pos(${x},${y})${move}${fad}}${body}\n`;
+    };
+
+    for (const it of list) {
+      const style = String(it.style || 'bar');
+      const stay = !!it.stay;
+      const start = Math.max(0, Number(it.startSec) || 0);
+      let end = stay ? (segDur || start + 8) : Math.max(start + 0.6, Number(it.endSec) || start + 6);
+      if (segDur) end = Math.min(end, segDur);
+      if (end <= start) continue;
+
+      const l1 = esc(it.line1);
+      const l2 = esc(it.line2);
+      const up = (s) => s.toUpperCase();
+
+      switch (style) {
+        case 'pill': {
+          const y = 902;
+          const dot = `{\\1c&H${C.cyanB}&}●{\\1c&H${C.ink}&} `;
+          const txt = l2 ? `${l1} · ${l2}` : (l1 || 'New this week');
+          dialogue(3, start, end, 'LTPill', X0, y, X0, y + 46, stay, `${dot}${txt}`);
+          break;
+        }
+        case 'wipe': {
+          const y = 900;
+          dialogue(3, start, end, 'LTTag', X0, y, X0 - 170, y, stay, up(l1 || 'FREE'));
+          if (l2) dialogue(3, start, end, 'LTBoxMain', X0 + 214, y + 2, X0 + 40, y + 2, stay, l2);
+          break;
+        }
+        case 'brackets': {
+          const y = 884, th = 10, h = 92, span = 780;
+          dialogue(2, start, end, 'LTDraw', X0, y, X0 + 34, y, stay, `{\\1c&H${C.cyanB}&\\p1}${rect(th, h)}{\\p0}`);
+          dialogue(2, start, end, 'LTDraw', X0 + span, y, X0 + span - 34, y, stay, `{\\1c&H${C.cyanB}&\\p1}${rect(th, h)}{\\p0}`);
+          dialogue(3, start, end, 'LTMain', X0 + 48, y + 12, X0 + 48, y + 58, stay, l1 || l2 || '');
+          break;
+        }
+        case 'draw': {
+          const ty = 838, uy = 918;
+          dialogue(3, start, end, 'LTMain', X0, ty, X0, ty + 40, stay, l1 || l2 || '');
+          // Two-tone underline (cyan -> pink) to echo the gradient preview.
+          dialogue(2, start, end, 'LTDraw', X0, uy, X0 - 40, uy, stay, `{\\1c&H${C.cyan}&\\p1}${rect(320, 10)}{\\p0}`);
+          dialogue(2, start, end, 'LTDraw', X0 + 320, uy, X0 + 280, uy, stay, `{\\1c&H${C.pink}&\\p1}${rect(260, 10)}{\\p0}`);
+          if (l2 && l1) dialogue(3, start, end, 'LTKick', X0, uy + 26, X0, uy + 26, stay, l2);
+          break;
+        }
+        case 'neon': {
+          const ky = 794, my = 846;
+          if (l1) dialogue(3, start, end, 'LTKick', X0 + 22, ky, X0 + 22, ky + 42, stay, `{\\blur3\\1c&H${C.pink}&}${up(l1)}`);
+          dialogue(2, start, end, 'LTDraw', X0, my, X0, my + 42, stay, `{\\1c&H${C.pink}&\\p1}${rect(10, 150)}{\\p0}`);
+          dialogue(3, start, end, 'LTBoxMain', X0 + 34, my, X0 + 34, my + 42, stay, l2 || l1 || '');
+          break;
+        }
+        case 'bar':
+        default: {
+          const ky = 792, my = 846;
+          dialogue(2, start, end, 'LTDraw', X0, ky, X0 - 180, ky, stay, `{\\1c&H${C.cyan}&\\p1}${rect(10, 158)}{\\p0}`);
+          if (l1) dialogue(3, start, end, 'LTBoxKick', X0 + 34, ky, X0 - 180 + 34, ky, stay, up(l1));
+          dialogue(3, start, end, 'LTBoxMain', X0 + 34, l1 ? my : ky + 8, X0 - 180 + 34, l1 ? my : ky + 8, stay, l2 || l1 || '');
+          break;
+        }
+      }
+    }
+
+    await fs.writeFile(outputPath, ass, 'utf8');
     return outputPath;
   }
 

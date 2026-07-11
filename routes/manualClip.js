@@ -261,7 +261,7 @@ router.post('/generate/:jobId', async (req, res) => {
 router.post('/render-sequence/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
-    const { hooks, cuts, disguise, title, levelAudio, removeSilences, inserts } = req.body;
+    const { hooks, cuts, disguise, title, levelAudio, removeSilences, inserts, lowerThirds } = req.body;
 
     const hookList = Array.isArray(hooks) ? hooks : [];
     const cutList = Array.isArray(cuts) ? cuts : [];
@@ -269,11 +269,22 @@ router.post('/render-sequence/:jobId', async (req, res) => {
     // ➕ Outside clips (CTAs) lined up in the editor to splice into the final video.
     const insertList = (Array.isArray(inserts) ? inserts : [])
       .filter(p => p && Array.isArray(p.clipUrls) && p.clipUrls.filter(Boolean).length > 0);
+    // 📺 Animated lower-third text CTAs to burn onto the full video.
+    const lowerThirdList = (Array.isArray(lowerThirds) ? lowerThirds : [])
+      .filter(lt => lt && (String(lt.line1 || '').trim() || String(lt.line2 || '').trim()))
+      .map(lt => ({
+        style: String(lt.style || 'bar'),
+        line1: String(lt.line1 || '').slice(0, 120),
+        line2: String(lt.line2 || '').slice(0, 120),
+        startSec: Math.max(0, Number(lt.startSec ?? lt.startTime) || 0),
+        endSec: Number(lt.endSec ?? lt.endTime),
+        stay: !!lt.stay,
+      }));
 
-    if (hookList.length === 0 && cutList.length === 0 && disguiseList.length === 0 && !removeSilences && insertList.length === 0) {
+    if (hookList.length === 0 && cutList.length === 0 && disguiseList.length === 0 && !removeSilences && insertList.length === 0 && lowerThirdList.length === 0) {
       return res.status(400).json({
         success: false,
-        error: 'Add at least one hook, a section to remove, a voice to disguise, or a clip to insert, first.'
+        error: 'Add at least one hook, a section to remove, a voice to disguise, a clip to insert, or a CTA overlay, first.'
       });
     }
 
@@ -333,7 +344,7 @@ router.post('/render-sequence/:jobId', async (req, res) => {
       message: `Building your video! Use the status endpoint to track progress.`
     });
 
-    manualClipService.renderPodcastSequence(jobId, hookList, { title, cuts: cutList, disguise: disguiseList, levelAudio: !!levelAudio, removeSilences: !!removeSilences, inserts: insertList, userId: req.headers['x-user-id'] || null })
+    manualClipService.renderPodcastSequence(jobId, hookList, { title, cuts: cutList, disguise: disguiseList, levelAudio: !!levelAudio, removeSilences: !!removeSilences, inserts: insertList, lowerThirds: lowerThirdList, userId: req.headers['x-user-id'] || null })
       .catch(error => {
         // Free the heavy intermediates a failed render left behind (don't fill the disk).
         manualClipService.cleanupRenderTemp(jobId).catch(() => {});
@@ -838,6 +849,7 @@ router.post('/restore/:jobId', async (req, res) => {
       cuts: record.cuts || [],
       disguise: record.disguise || [],
       inserts: record.inserts || [],
+      lowerThirds: record.lowerThirds || [],
       revoice: record.revoice || [],
     });
   } catch (error) {
@@ -936,6 +948,25 @@ router.put('/library/:jobId/inserts', async (req, res) => {
   } catch (error) {
     console.error('[ManualClip] Save inserts error:', error);
     res.status(500).json({ success: false, error: 'Could not save your added clips.' });
+  }
+});
+
+// ============================================================
+// PUT /api/manual-clip/library/:jobId/lowerthirds
+// Auto-save the user's animated lower-third CTA overlays for a saved video,
+// so reopening the project brings them back like hooks/cuts.
+// Body: { lowerThirds: [{ style, line1, line2, startSec, endSec, stay }] }
+// ============================================================
+router.put('/library/:jobId/lowerthirds', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const { lowerThirds } = req.body;
+    await manualVideoLibraryService.updateLowerThirds(userId, jobId, lowerThirds || []);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[ManualClip] Save lower thirds error:', error);
+    res.status(500).json({ success: false, error: 'Could not save your CTA overlays.' });
   }
 });
 

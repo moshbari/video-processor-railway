@@ -158,6 +158,33 @@ class ManualVideoLibraryService {
   }
 
   /**
+   * 📺 Save the user's animated lower-third CTA overlays for one video
+   * (auto-save from the editor), so reopening the project brings them back.
+   * Stored lean: { style, line1, line2, startSec, endSec, stay }.
+   */
+  async updateLowerThirds(userId, jobId, lowerThirds) {
+    const lean = (Array.isArray(lowerThirds) ? lowerThirds : [])
+      .map(lt => ({
+        style: String(lt.style || 'bar'),
+        line1: String(lt.line1 || '').slice(0, 120),
+        line2: String(lt.line2 || '').slice(0, 120),
+        startSec: Math.max(0, Number(lt.startSec ?? lt.startTime) || 0),
+        endSec: (lt.endSec === null || lt.endSec === undefined) ? null : Number(lt.endSec),
+        stay: !!lt.stay,
+      }))
+      .filter(lt => lt.line1.trim() || lt.line2.trim());
+    for (const owner of [userId, null]) {
+      const data = await this.load(owner);
+      const v = data.videos.find(x => x.jobId === jobId);
+      if (v) {
+        v.lowerThirds = lean;
+        await this.save(owner, data);
+        return;
+      }
+    }
+  }
+
+  /**
    * 🎙️ Save the user's ReVoice sections for one video (auto-save from the
    * editor), so a refresh/reopen brings back every marked section AND its
    * recorded clip. The recordings already live in R2, so we only store their
