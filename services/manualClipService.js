@@ -2182,8 +2182,8 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: LTMain,Arial,62,&H00${C.ink},&H000000FF,&HB4000000,&H96000000,1,0,0,0,100,100,0,0,1,0,4,7,0,0,0,1
-Style: LTKick,Arial,34,&H00${C.cyanB},&H000000FF,&HB4000000,&H96000000,1,0,0,0,100,100,4,0,1,0,3,7,0,0,0,1
+Style: LTMain,Arial,62,&H00${C.ink},&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,4,3,7,0,0,0,1
+Style: LTKick,Arial,34,&H00${C.cyanB},&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,4,0,1,4,2,7,0,0,0,1
 Style: LTBoxMain,Arial,58,&H00${C.ink},&H000000FF,&H1E0E0906,&H78000000,1,0,0,0,100,100,0,0,3,22,0,7,0,0,0,1
 Style: LTBoxKick,Arial,32,&H00${C.cyanB},&H000000FF,&H1E0E0906,&H78000000,1,0,0,0,100,100,3,0,3,16,0,7,0,0,0,1
 Style: LTPill,Arial,40,&H00${C.ink},&H000000FF,&H32120C0A,&H78000000,1,0,0,0,100,100,0,0,3,28,0,7,0,0,0,1
@@ -2247,7 +2247,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         }
         case 'neon': {
           const ky = 794, my = 846;
-          if (l1) dialogue(3, start, end, 'LTKick', X0 + 22, ky, X0 + 22, ky + 42, stay, `{\\blur3\\1c&H${C.pink}&}${up(l1)}`);
+          if (l1) dialogue(3, start, end, 'LTKick', X0 + 22, ky, X0 + 22, ky + 42, stay, `{\\1c&H${C.pink}&}${up(l1)}`);
           dialogue(2, start, end, 'LTDraw', X0, my, X0, my + 42, stay, `{\\1c&H${C.pink}&\\p1}${rect(10, 150)}{\\p0}`);
           dialogue(3, start, end, 'LTBoxMain', X0 + 34, my, X0 + 34, my + 42, stay, l2 || l1 || '');
           break;
