@@ -821,36 +821,29 @@ class ManualClipService {
 
     const totalSeconds = hooksTotalSeconds + fullSeconds;
 
-    // Step 2b: 📺 Animated lower-third CTAs. These burn onto the FULL-video
-    // segment (the last input to the concat), timed on that segment's own
-    // timeline. The editor places them on the SOURCE timeline, so map each
-    // time through the kept segments (identity when there were no cuts). A
-    // CTA that lands entirely inside a removed gap is dropped.
+    // Step 2b: 📺 Animated lower-third CTAs. Times are on the FINAL rendered
+    // video's timeline (what the viewer sees), used directly — so "10:00" lands
+    // at 10:00 in the delivered video, after any intro/hooks. They're burned
+    // onto the FINISHED video below (during the concat, or during insert-weaving
+    // when there are inserts — whichever produces the final file).
     let lowerThirdsAssPath = null;
     const lowerThirdsIn = Array.isArray(options.lowerThirds) ? options.lowerThirds : [];
     if (lowerThirdsIn.length > 0) {
       const mapped = lowerThirdsIn.map(lt => {
-        const s0 = Math.max(0, Number(lt.startSec ?? lt.startTime) || 0);
-        const e0 = Number(lt.endSec ?? lt.endTime);
         const stay = !!lt.stay;
-        const startSec = this.mapTimeThroughKeeps(s0, fullKeeps);
-        const endSec = stay ? fullSeconds
-          : this.mapTimeThroughKeeps(Number.isFinite(e0) ? e0 : s0 + 6, fullKeeps);
-        return {
-          style: lt.style || 'bar',
-          line1: lt.line1 || '',
-          line2: lt.line2 || '',
-          stay, startSec, endSec,
-        };
-      }).filter(lt => lt.stay || lt.endSec > lt.startSec + 0.2);
+        const startSec = Math.max(0, Number(lt.startSec ?? lt.startTime) || 0);
+        const e0 = Number(lt.endSec ?? lt.endTime);
+        const endSec = stay ? null : (Number.isFinite(e0) ? e0 : startSec + 6);
+        return { style: lt.style || 'bar', line1: lt.line1 || '', line2: lt.line2 || '', stay, startSec, endSec };
+      }).filter(lt => lt.stay || (lt.endSec !== null && lt.endSec > lt.startSec + 0.2));
 
       if (mapped.length > 0) {
         try {
           const assPath = path.join(seqDir, 'lowerthirds.ass');
-          const built = await this.buildLowerThirdsAss(mapped, assPath, fullSeconds);
+          const built = await this.buildLowerThirdsAss(mapped, assPath);
           if (built) {
             lowerThirdsAssPath = built;
-            console.log(`  📺 ${mapped.length} lower-third CTA(s) will burn onto the full video`);
+            console.log(`  📺 ${mapped.length} lower-third CTA(s) at final-video times`);
           }
         } catch (err) {
           // A CTA-overlay failure must never kill the whole render.
@@ -858,6 +851,12 @@ class ManualClipService {
         }
       }
     }
+
+    // Will we weave outside clips in afterwards? If so, the concat isn't the
+    // final file — the overlays must burn during the weave so their final-video
+    // times stay correct once inserts shift the timeline.
+    const willWeaveInserts = (Array.isArray(options.inserts) ? options.inserts : [])
+      .reduce((n, p) => n + (Array.isArray(p.clipUrls) ? p.clipUrls.filter(Boolean).length : 0), 0) > 0;
 
     // Step 2c: 🎬 Intro clip — an outside clip that plays at the VERY START of
     // the final video, before the hooks. Fetched to R2 in the editor (any
@@ -889,7 +888,7 @@ class ManualClipService {
     const outputPath = path.join(seqDir, 'podcast_sequence.mp4');
     await this.concatenateSequence16x9(segmentPaths, outputPath, totalSeconds, (pct) => {
       this.updateJob(jobId, { progress: Math.round(62 + (pct / 100) * 30) }); // 62 -> 92
-    }, { lastInputSubtitles: lowerThirdsAssPath });
+    }, { finalSubtitles: willWeaveInserts ? null : lowerThirdsAssPath });
 
     // Guard: never report "complete" if the stitch produced no file (e.g. ffmpeg
     // ran out of memory). Fail loudly instead of handing back a dead link.
@@ -909,7 +908,7 @@ class ManualClipService {
       this.updateJob(jobId, { step: 'adding_clips', progress: 90, currentClip: 'Adding your extra clips…' });
       const woven = await this.weaveInsertsIntoFile(outputPath, inserts, seqDir, jobId, (pct) => {
         this.updateJob(jobId, { progress: Math.round(90 + (pct / 100) * 3) }); // 90 -> 93
-      }).catch((err) => {
+      }, lowerThirdsAssPath).catch((err) => {
         console.error(`[ManualClip ${jobId}] Weaving extra clips failed:`, err.message);
         throw new Error('Built the video, but could not add your extra clips. Please check the links and try again.');
       });
@@ -1045,23 +1044,24 @@ class ManualClipService {
       const n = inputPaths.length;
       const inputArgs = inputPaths.flatMap(p => ['-i', p]);
 
-      // 📺 Optional: burn animated lower-third CTAs onto the LAST input (the
-      // full podcast video). libass reads the .ass; ':' and '\' in the path
-      // must be escaped for the filtergraph.
-      const subPath = extra.lastInputSubtitles;
-      const subChain = subPath
-        ? `,subtitles=filename='${String(subPath).replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'")}'`
+      // 📺 Optional: burn animated lower-third CTAs onto the FINAL (concatenated)
+      // video, so their times line up with the delivered video's timeline.
+      // libass reads the .ass; ':' \\ and ' in the path must be escaped.
+      const subPath = extra.finalSubtitles;
+      const subFilter = subPath
+        ? `subtitles=filename='${String(subPath).replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'")}'`
         : '';
 
       const filterParts = [];
       let concatInputs = '';
       for (let i = 0; i < n; i++) {
-        const lt = (subChain && i === n - 1) ? subChain : '';
-        filterParts.push(`[${i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p${lt}[v${i}]`);
+        filterParts.push(`[${i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v${i}]`);
         filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
         concatInputs += `[v${i}][a${i}]`;
       }
-      filterParts.push(`${concatInputs}concat=n=${n}:v=1:a=1[outv][preAudio]`);
+      // Concat, then (optionally) burn the overlays onto the joined video stream.
+      filterParts.push(`${concatInputs}concat=n=${n}:v=1:a=1[${subFilter ? 'cv' : 'outv'}][preAudio]`);
+      if (subFilter) filterParts.push(`[cv]${subFilter}[outv]`);
       filterParts.push(`[preAudio]loudnorm=I=-16:TP=-1.5:LRA=11[outa]`);
 
       const args = [
@@ -1112,10 +1112,15 @@ class ManualClipService {
    * is split+trimmed inside the same graph instead of being pre-cut to disk
    * first (which would re-encode it a second time).
    */
-  concatRenderWithInserts(inputPaths, items, outputPath, totalSeconds, onProgress) {
+  concatRenderWithInserts(inputPaths, items, outputPath, totalSeconds, onProgress, subtitlesPath = null) {
     return new Promise((resolve, reject) => {
       (async () => {
         const inputArgs = inputPaths.flatMap(p => ['-i', p]);
+        // 📺 Optional: burn lower-third CTAs onto the final woven video at their
+        // final-video times (this output IS the delivered video).
+        const subFilter = subtitlesPath
+          ? `subtitles=filename='${String(subtitlesPath).replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'")}'`
+          : '';
         const baseItems = items.filter(it => it.type === 'base');
         const baseCount = baseItems.length;
 
@@ -1145,7 +1150,8 @@ class ManualClipService {
           }
           concatLabels.push(`[v${j}][a${j}]`);
         });
-        parts.push(`${concatLabels.join('')}concat=n=${items.length}:v=1:a=1[outv][preAudio]`);
+        parts.push(`${concatLabels.join('')}concat=n=${items.length}:v=1:a=1[${subFilter ? 'cv' : 'outv'}][preAudio]`);
+        if (subFilter) parts.push(`[cv]${subFilter}[outv]`);
         parts.push(`[preAudio]loudnorm=I=-16:TP=-1.5:LRA=11[outa]`);
 
         // Pass the (potentially large) graph via a script file — no arg-length limit.
@@ -1198,7 +1204,7 @@ class ManualClipService {
    * the same flow. `inserts` is [{ atTime:Number|null, clipUrls:[String] }] where
    * atTime is seconds into the FINAL video (null / past-the-end = at the end).
    */
-  async weaveInsertsIntoFile(basePath, inserts, workDir, jobId, onProgress) {
+  async weaveInsertsIntoFile(basePath, inserts, workDir, jobId, onProgress, subtitlesPath = null) {
     const baseDuration = await this.getVideoDuration(basePath).catch(() => 0);
 
     // Download every clip to weave (dedupe by URL).
@@ -1249,7 +1255,7 @@ class ManualClipService {
     }
 
     const output = path.join(workDir, 'woven_with_inserts.mp4');
-    await this.concatRenderWithInserts(inputPaths, items, output, baseDuration + clipsTotalSeconds, onProgress);
+    await this.concatRenderWithInserts(inputPaths, items, output, baseDuration + clipsTotalSeconds, onProgress, subtitlesPath);
     for (const lp of localByUrl.values()) await fs.remove(lp).catch(() => {});
     console.log(`[ManualClip ${jobId}] ✓ Wove ${items.filter(it => it.type === 'clip').length} extra clip(s) into the final video`);
     return output;
@@ -2227,9 +2233,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       const style = String(it.style || 'bar');
       const stay = !!it.stay;
       const start = Math.max(0, Number(it.startSec) || 0);
-      let end = stay ? (segDur || start + 8) : Math.max(start + 0.6, Number(it.endSec) || start + 6);
-      if (segDur) end = Math.min(end, segDur);
-      if (end <= start) continue;
+      // Times are FINAL-video seconds. "Stay" → a very large end so libass keeps
+      // it on screen until the real end of the video (whatever its length).
+      const end = stay ? 359999 : Math.max(start + 0.6, Number(it.endSec) || start + 6);
+      if (!stay && end <= start) continue;
 
       const l1 = esc(it.line1);
       const l2 = esc(it.line2);
