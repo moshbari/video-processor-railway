@@ -158,6 +158,25 @@ class ManualVideoLibraryService {
   }
 
   /**
+   * 🎬 Save the user's intro clip (a fetched R2 url that plays at the very start
+   * of the final video) for one video, so reopening the project brings it back.
+   */
+  async updateIntro(userId, jobId, introUrl, introLabel) {
+    const url = introUrl ? String(introUrl) : null;
+    const label = String(introLabel || '').slice(0, 200);
+    for (const owner of [userId, null]) {
+      const data = await this.load(owner);
+      const v = data.videos.find(x => x.jobId === jobId);
+      if (v) {
+        v.introUrl = url;
+        v.introLabel = url ? label : '';
+        await this.save(owner, data);
+        return;
+      }
+    }
+  }
+
+  /**
    * 📺 Save the user's animated lower-third CTA overlays for one video
    * (auto-save from the editor), so reopening the project brings them back.
    * Stored lean: { style, line1, line2, startSec, endSec, stay }.

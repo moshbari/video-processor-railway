@@ -859,6 +859,26 @@ class ManualClipService {
       }
     }
 
+    // Step 2c: 🎬 Intro clip — an outside clip that plays at the VERY START of
+    // the final video, before the hooks. Fetched to R2 in the editor (any
+    // source), so we just download it and unshift it to the front. The user
+    // explicitly added it, so if it can't be fetched we fail loudly rather than
+    // hand back a video missing their intro. The full video stays the LAST
+    // input, so the lower-thirds burn above is unaffected.
+    const introUrl = options.introUrl ? String(options.introUrl) : null;
+    if (introUrl) {
+      this.updateJob(jobId, { step: 'adding_intro', progress: 61, currentClip: 'Adding your intro…' });
+      console.log(`  🎬 Intro clip prepended to the front`);
+      const introPath = path.join(seqDir, 'intro.mp4');
+      try {
+        await r2Service.downloadFile(introUrl, introPath);
+      } catch (err) {
+        console.error(`[ManualClip ${jobId}] Intro download failed:`, err.message);
+        throw new Error('Could not add your intro clip. Please check it and try again.');
+      }
+      segmentPaths.unshift(introPath);
+    }
+
     // Step 3: Concatenate everything into one 16:9 file.
     this.updateJob(jobId, {
       step: 'concatenating',

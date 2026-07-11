@@ -261,7 +261,9 @@ router.post('/generate/:jobId', async (req, res) => {
 router.post('/render-sequence/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
-    const { hooks, cuts, disguise, title, levelAudio, removeSilences, inserts, lowerThirds } = req.body;
+    const { hooks, cuts, disguise, title, levelAudio, removeSilences, inserts, lowerThirds, introUrl } = req.body;
+    // 🎬 Intro clip that plays at the very start (before the hooks).
+    const introClipUrl = (introUrl && String(introUrl).trim()) ? String(introUrl).trim() : null;
 
     const hookList = Array.isArray(hooks) ? hooks : [];
     const cutList = Array.isArray(cuts) ? cuts : [];
@@ -281,10 +283,10 @@ router.post('/render-sequence/:jobId', async (req, res) => {
         stay: !!lt.stay,
       }));
 
-    if (hookList.length === 0 && cutList.length === 0 && disguiseList.length === 0 && !removeSilences && insertList.length === 0 && lowerThirdList.length === 0) {
+    if (hookList.length === 0 && cutList.length === 0 && disguiseList.length === 0 && !removeSilences && insertList.length === 0 && lowerThirdList.length === 0 && !introClipUrl) {
       return res.status(400).json({
         success: false,
-        error: 'Add at least one hook, a section to remove, a voice to disguise, a clip to insert, or a CTA overlay, first.'
+        error: 'Add at least one hook, an intro, a section to remove, a voice to disguise, a clip to insert, or a CTA overlay, first.'
       });
     }
 
@@ -344,7 +346,7 @@ router.post('/render-sequence/:jobId', async (req, res) => {
       message: `Building your video! Use the status endpoint to track progress.`
     });
 
-    manualClipService.renderPodcastSequence(jobId, hookList, { title, cuts: cutList, disguise: disguiseList, levelAudio: !!levelAudio, removeSilences: !!removeSilences, inserts: insertList, lowerThirds: lowerThirdList, userId: req.headers['x-user-id'] || null })
+    manualClipService.renderPodcastSequence(jobId, hookList, { title, cuts: cutList, disguise: disguiseList, levelAudio: !!levelAudio, removeSilences: !!removeSilences, inserts: insertList, lowerThirds: lowerThirdList, introUrl: introClipUrl, userId: req.headers['x-user-id'] || null })
       .catch(error => {
         // Free the heavy intermediates a failed render left behind (don't fill the disk).
         manualClipService.cleanupRenderTemp(jobId).catch(() => {});
@@ -850,6 +852,8 @@ router.post('/restore/:jobId', async (req, res) => {
       disguise: record.disguise || [],
       inserts: record.inserts || [],
       lowerThirds: record.lowerThirds || [],
+      introUrl: record.introUrl || null,
+      introLabel: record.introLabel || '',
       revoice: record.revoice || [],
     });
   } catch (error) {
@@ -948,6 +952,24 @@ router.put('/library/:jobId/inserts', async (req, res) => {
   } catch (error) {
     console.error('[ManualClip] Save inserts error:', error);
     res.status(500).json({ success: false, error: 'Could not save your added clips.' });
+  }
+});
+
+// ============================================================
+// PUT /api/manual-clip/library/:jobId/intro
+// Auto-save the intro clip (a fetched R2 url) for a saved video, so reopening
+// the project brings it back. Body: { introUrl: String|null, introLabel?: String }
+// ============================================================
+router.put('/library/:jobId/intro', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const { introUrl, introLabel } = req.body;
+    await manualVideoLibraryService.updateIntro(userId, jobId, introUrl || null, introLabel || '');
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[ManualClip] Save intro error:', error);
+    res.status(500).json({ success: false, error: 'Could not save your intro clip.' });
   }
 });
 
