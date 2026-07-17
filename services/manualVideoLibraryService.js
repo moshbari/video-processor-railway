@@ -179,7 +179,9 @@ class ManualVideoLibraryService {
   /**
    * 📺 Save the user's animated lower-third CTA overlays for one video
    * (auto-save from the editor), so reopening the project brings them back.
-   * Stored lean: { style, line1, line2, startSec, endSec, stay }.
+   * Stored lean: { style, line1, line2, startSec, endSec, stay, auto }.
+   * `auto` marks the ones Auto-place dropped, so reopening the project lets the
+   * editor re-space that batch instead of piling a second set on top.
    */
   async updateLowerThirds(userId, jobId, lowerThirds) {
     const lean = (Array.isArray(lowerThirds) ? lowerThirds : [])
@@ -190,6 +192,7 @@ class ManualVideoLibraryService {
         startSec: Math.max(0, Number(lt.startSec ?? lt.startTime) || 0),
         endSec: (lt.endSec === null || lt.endSec === undefined) ? null : Number(lt.endSec),
         stay: !!lt.stay,
+        auto: !!lt.auto,
       }))
       .filter(lt => lt.line1.trim() || lt.line2.trim());
     for (const owner of [userId, null]) {
