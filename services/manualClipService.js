@@ -2251,16 +2251,30 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
           break;
         }
         case 'wipe': {
+          // Tag + message. The message box sat at a fixed X0+214, so any tag
+          // longer than a short word ran underneath it and the two overlapped
+          // into mush. Push the box past the tag's actual width instead; short
+          // tags ("FREE") keep the original 214 spacing exactly.
           const y = 900;
-          dialogue(3, start, end, 'LTTag', X0, y, X0 - 170, y, stay, up(l1 || 'FREE'));
-          if (l2) dialogue(3, start, end, 'LTBoxMain', X0 + 214, y + 2, X0 + 40, y + 2, stay, l2);
+          const tag = up(l1 || 'FREE');
+          const tagW = Math.round(tag.length * 34 * 0.58) + 36; // Arial 34 bold + box padding
+          const mainX = X0 + Math.max(214, tagW + 30);
+          dialogue(3, start, end, 'LTTag', X0, y, X0 - 170, y, stay, tag);
+          if (l2) dialogue(3, start, end, 'LTBoxMain', mainX, y + 2, mainX - 174, y + 2, stay, l2);
           break;
         }
         case 'brackets': {
-          const y = 884, th = 10, h = 92, span = 780;
+          // A framed single row. It used to draw `l1 || l2`, which silently ate
+          // line 2 whenever both were filled — a CTA would lose its domain. Join
+          // them instead, and size the frame to the text: `span` was a fixed 780
+          // so anything longer than ~22 characters ran straight through the
+          // right bracket.
+          const y = 884, th = 10, h = 92;
+          const txt = (l1 && l2) ? `${l1} · ${l2}` : (l1 || l2 || '');
+          const span = Math.max(400, Math.min(1660, 96 + Math.round(txt.length * 62 * 0.55)));
           dialogue(2, start, end, 'LTDraw', X0, y, X0 + 34, y, stay, `{\\1c&H${C.cyanB}&\\p1}${rect(th, h)}{\\p0}`);
           dialogue(2, start, end, 'LTDraw', X0 + span, y, X0 + span - 34, y, stay, `{\\1c&H${C.cyanB}&\\p1}${rect(th, h)}{\\p0}`);
-          dialogue(3, start, end, 'LTMain', X0 + 48, y + 12, X0 + 48, y + 58, stay, l1 || l2 || '');
+          dialogue(3, start, end, 'LTMain', X0 + 48, y + 12, X0 + 48, y + 58, stay, txt);
           break;
         }
         case 'draw': {
