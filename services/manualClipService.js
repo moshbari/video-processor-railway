@@ -1806,12 +1806,94 @@ class ManualClipService {
     return keeps.filter(k => k.end - k.start > 0.05);
   }
 
+  // Max kept segments to put in one FFmpeg select expression. A very long
+  // podcast with the silence remover on can produce hundreds of tiny gaps;
+  // cramming them all into one `select=expr='between(t,..)+..'` builds a
+  // filtergraph so big FFmpeg dies with "Cannot allocate memory". We cap the
+  // expression size and stitch batches together instead.
+  static DESILENCE_BATCH = 40;
+
   /**
-   * Re-encode only the kept segments into one continuous file using a single
-   * select/aselect pass, so audio and video are cut at exactly the same points
-   * and stay perfectly in sync. Quality matches the rest of Clip Maker.
+   * Re-encode only the kept segments into one continuous file, so audio and
+   * video are cut at exactly the same points and stay perfectly in sync.
+   * Quality matches the rest of Clip Maker.
+   *
+   * For a handful of segments this is a single select/aselect pass. For many
+   * segments (hundreds of silence gaps) we process them in batches — each batch
+   * is its own small, memory-safe pass — then concat the batch files losslessly.
    */
-  renderKeptSegments(videoPath, keeps, totalSeconds, outputPath, onProgress) {
+  async renderKeptSegments(videoPath, keeps, totalSeconds, outputPath, onProgress) {
+    const BATCH = this.constructor.DESILENCE_BATCH;
+
+    // Small case: one pass, exactly as before.
+    if (keeps.length <= BATCH) {
+      console.log(`  [Desilence] ${keeps.length} kept segments -> one continuous file`);
+      return this._renderKeptSegmentsPass(videoPath, keeps, totalSeconds, outputPath, onProgress);
+    }
+
+    // Large case: split into batches, render each into a part file, then concat.
+    const batches = [];
+    for (let i = 0; i < keeps.length; i += BATCH) batches.push(keeps.slice(i, i + BATCH));
+    console.log(`  [Desilence] ${keeps.length} kept segments in ${batches.length} batch(es) of up to ${BATCH} -> stitched (memory-safe)`);
+
+    const dir = path.dirname(outputPath);
+    const base = path.basename(outputPath, path.extname(outputPath));
+    const partPaths = [];
+    let doneSeconds = 0; // kept seconds finished by previous batches (for progress)
+
+    for (let bi = 0; bi < batches.length; bi++) {
+      const batch = batches[bi];
+      const batchSeconds = batch.reduce((s, k) => s + (k.end - k.start), 0);
+      const partPath = path.join(dir, `${base}_part_${String(bi + 1).padStart(3, '0')}.mp4`);
+      const before = doneSeconds;
+      await this._renderKeptSegmentsPass(videoPath, batch, batchSeconds, partPath, (pct) => {
+        if (onProgress && totalSeconds > 0) {
+          const cur = before + (pct / 100) * batchSeconds;
+          onProgress(Math.min(100, (cur / totalSeconds) * 100));
+        }
+      });
+      partPaths.push(partPath);
+      doneSeconds += batchSeconds;
+    }
+
+    // Concat the part files. They share identical encode settings, so a
+    // stream-copy concat is safe and lossless.
+    const listPath = path.join(dir, `${base}_concat.txt`);
+    const listBody = partPaths.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join('\n');
+    await fs.writeFile(listPath, listBody);
+
+    await new Promise((resolve, reject) => {
+      const proc = spawn('ffmpeg', [
+        '-y',
+        '-f', 'concat', '-safe', '0',
+        '-i', listPath,
+        '-c', 'copy',
+        '-movflags', '+faststart',
+        outputPath
+      ]);
+      let stderr = '';
+      proc.stderr.on('data', (d) => {
+        stderr += d.toString();
+        if (stderr.length > 20000) stderr = stderr.slice(-10000);
+      });
+      proc.on('close', (code) => {
+        if (code === 0) resolve();
+        else { console.error(stderr.slice(-800)); reject(new Error('Could not remove the silences. Please try again.')); }
+      });
+      proc.on('error', (err) => reject(err));
+    });
+
+    // Best-effort cleanup of the intermediate part files + list.
+    await Promise.all(partPaths.map(p => fs.remove(p).catch(() => {})));
+    await fs.remove(listPath).catch(() => {});
+
+    console.log('  [Desilence] ✓ done');
+    return outputPath;
+  }
+
+  // One memory-bounded select/aselect pass over `keeps`. Used directly for a
+  // small number of segments, and once per batch for large ones.
+  _renderKeptSegmentsPass(videoPath, keeps, totalSeconds, outputPath, onProgress) {
     return new Promise((resolve, reject) => {
       // between(t,a,b) summed with '+' — exactly one term is 1 inside a kept range.
       // Wrapped in expr='...' single quotes so the commas stay literal in the graph.
@@ -1835,7 +1917,6 @@ class ManualClipService {
         outputPath
       ];
 
-      console.log(`  [Desilence] ${keeps.length} kept segments -> one continuous file`);
       const proc = spawn('ffmpeg', args);
       let stderr = '';
       proc.stderr.on('data', (d) => {
@@ -1849,7 +1930,7 @@ class ManualClipService {
         }
       });
       proc.on('close', (code) => {
-        if (code === 0) { console.log('  [Desilence] ✓ done'); resolve(outputPath); }
+        if (code === 0) { resolve(outputPath); }
         else { console.error(stderr.slice(-800)); reject(new Error('Could not remove the silences. Please try again.')); }
       });
       proc.on('error', (err) => reject(err));
