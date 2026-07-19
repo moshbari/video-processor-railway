@@ -855,6 +855,8 @@ router.post('/restore/:jobId', async (req, res) => {
       introUrl: record.introUrl || null,
       introLabel: record.introLabel || '',
       revoice: record.revoice || [],
+      removeSilences: !!record.removeSilences,
+      levelAudio: !!record.levelAudio,
     });
   } catch (error) {
     console.error('[ManualClip] Restore error:', error);
@@ -877,6 +879,29 @@ router.put('/library/:jobId/hooks', async (req, res) => {
   } catch (error) {
     console.error('[ManualClip] Save hooks error:', error);
     res.status(500).json({ success: false, error: 'Could not save your hooks.' });
+  }
+});
+
+// ============================================================
+// PUT /api/manual-clip/library/:jobId/settings
+// Auto-save the editor's on/off toggles (removeSilences, levelAudio) for a
+// saved video, so reopening the project brings them back. Send only the
+// toggle(s) that changed.
+// Body: { removeSilences?: boolean, levelAudio?: boolean }
+// ============================================================
+router.put('/library/:jobId/settings', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const { removeSilences, levelAudio } = req.body || {};
+    const settings = {};
+    if (removeSilences !== undefined) settings.removeSilences = !!removeSilences;
+    if (levelAudio !== undefined) settings.levelAudio = !!levelAudio;
+    await manualVideoLibraryService.updateSettings(userId, jobId, settings);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[ManualClip] Save settings error:', error);
+    res.status(500).json({ success: false, error: 'Could not save your settings.' });
   }
 });
 

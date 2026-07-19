@@ -242,6 +242,28 @@ class ManualVideoLibraryService {
   }
 
   /**
+   * 🔧 Save the editor's on/off toggles for one video (auto-save), so reopening
+   * the project brings them back like every other setting. Currently the two
+   * booleans that live outside the segment lists: `removeSilences` (auto-cut
+   * quiet gaps) and `levelAudio` (even out speaker volumes). Only the keys that
+   * are actually provided are written, so saving one toggle never clobbers the
+   * other.
+   */
+  async updateSettings(userId, jobId, settings) {
+    const s = settings && typeof settings === 'object' ? settings : {};
+    for (const owner of [userId, null]) {
+      const data = await this.load(owner);
+      const v = data.videos.find(x => x.jobId === jobId);
+      if (v) {
+        if ('removeSilences' in s) v.removeSilences = !!s.removeSilences;
+        if ('levelAudio' in s) v.levelAudio = !!s.levelAudio;
+        await this.save(owner, data);
+        return;
+      }
+    }
+  }
+
+  /**
    * Merge a patch into one saved video record (e.g. after re-encoding it to
    * match YouTube timestamps: new sourceKey/playbackUrl/duration/waveform +
    * a `normalized` flag). Looks in the user's library first, then the public
