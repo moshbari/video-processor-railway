@@ -915,6 +915,21 @@ class ManualClipService {
       if (woven) await fs.move(woven, outputPath, { overwrite: true });
     }
 
+    // 🖼️ Composite any background-image sections onto the finished video, at their
+    // chosen times on the FINAL timeline (image full-frame + the video shrunk into
+    // the overlay the user positioned). Done last so it sits on top of everything.
+    const backgroundSections = Array.isArray(options.backgroundSections) ? options.backgroundSections : [];
+    if (backgroundSections.length > 0) {
+      this.updateJob(jobId, { step: 'adding_backgrounds', progress: 93, currentClip: 'Adding your background sections…' });
+      const withBg = await this.compositeBackgroundSections(outputPath, backgroundSections, seqDir, jobId, (pct) => {
+        this.updateJob(jobId, { progress: Math.round(93 + (pct / 100) * 2) }); // 93 -> 95
+      }).catch((err) => {
+        console.error(`[ManualClip ${jobId}] Background sections failed:`, err.message);
+        throw new Error('Built the video, but could not add your background sections. Please try again.');
+      });
+      if (withBg) await fs.move(withBg, outputPath, { overwrite: true });
+    }
+
     // Step 4: The finished render is on local disk now. Make it downloadable
     // straight from THIS server immediately — so the user can grab it without
     // waiting for the (sometimes slow) cloud upload. R2 is still the durable
@@ -1259,6 +1274,155 @@ class ManualClipService {
     for (const lp of localByUrl.values()) await fs.remove(lp).catch(() => {});
     console.log(`[ManualClip ${jobId}] ✓ Wove ${items.filter(it => it.type === 'clip').length} extra clip(s) into the final video`);
     return output;
+  }
+
+  // ============================================================
+  // 🖼️ BACKGROUND IMAGE SECTIONS
+  // ============================================================
+  /**
+   * Park one uploaded background image in R2 under the SAME project prefix as the
+   * source video (manual-clip/{jobId}/backgrounds/…), so it shares the project's
+   * lifespan and gets swept away with it. Returns the public URL + key the editor
+   * keeps in the section and auto-saves.
+   */
+  async saveBackgroundImage(jobId, filePath, originalName) {
+    let ext = (path.extname(originalName || '') || '').toLowerCase();
+    if (!['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext)) ext = '.jpg';
+    const mime = ext === '.png' ? 'image/png'
+      : ext === '.webp' ? 'image/webp'
+      : ext === '.gif' ? 'image/gif'
+      : 'image/jpeg';
+    const imgId = require('crypto').randomBytes(8).toString('hex');
+    const key = `manual-clip/${jobId}/backgrounds/${imgId}${ext}`;
+    const up = await r2Service.uploadFile(filePath, key, mime);
+    await fs.remove(filePath).catch(() => {});
+    return { imageId: imgId, imageUrl: up.downloadUrl, imageKey: key };
+  }
+
+  /**
+   * Composite background-image sections onto a FINISHED render, in ONE pass.
+   * For each section, during its time window on the final video we replace the
+   * whole frame with the uploaded image (full-canvas, aspect preserved — either
+   * "fit" = scaled to fit & letterboxed, or "original" = native pixels centered
+   * & cropped/padded) and lay the video back on top as a smaller overlay the user
+   * positioned/sized in the editor (pip = canvas fractions, top-left origin).
+   * Sections that fail to download are skipped rather than failing the render.
+   *
+   * @param {string} basePath  the just-built final render
+   * @param {Array}  sections  [{ startSec, endSec, imageUrl, fitMode, pip:{xPct,yPct,wPct} }]
+   * @returns {Promise<string|null>} path to the composited file, or null if nothing applied
+   */
+  async compositeBackgroundSections(basePath, sections, workDir, jobId, onProgress) {
+    const CW = 1920, CH = 1080;
+    const even = (n) => { const v = Math.round(n); return v % 2 === 0 ? v : v - 1; };
+    const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+
+    const list = (Array.isArray(sections) ? sections : [])
+      .filter(s => s && s.imageUrl && Number(s.endSec) > Number(s.startSec))
+      .slice(0, 30); // guard against an absurd filtergraph
+    if (list.length === 0) return null;
+
+    const baseDuration = await this.getVideoDuration(basePath).catch(() => 0);
+    if (!baseDuration) return null;
+
+    // Download each section's image (dedupe identical URLs).
+    const localByUrl = new Map();
+    const usable = [];
+    for (const s of list) {
+      let local = localByUrl.get(s.imageUrl);
+      if (!local) {
+        let ext = (path.extname((s.imageUrl.split('?')[0]) || '') || '.jpg').toLowerCase();
+        if (!['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext)) ext = '.jpg';
+        local = path.join(workDir, `bg_src_${usable.length}${ext}`);
+        try {
+          await r2Service.downloadFile(s.imageUrl, local);
+          localByUrl.set(s.imageUrl, local);
+        } catch (err) {
+          console.error(`[ManualClip ${jobId}] Background image download failed (${s.imageUrl}):`, err.message);
+          continue; // skip this section, keep the render
+        }
+      }
+      usable.push({ ...s, local });
+    }
+    if (usable.length === 0) return null;
+
+    // Build the filtergraph. Input 0 = base render; inputs 1..K = images.
+    const inputArgs = ['-i', basePath];
+    for (const u of usable) inputArgs.push('-loop', '1', '-t', String(baseDuration.toFixed(3)), '-i', u.local);
+
+    const parts = [];
+    const K = usable.length;
+    // One split branch feeds the final base; the rest feed each section's overlay.
+    parts.push(`[0:v]split=${K + 1}[base]${usable.map((_, i) => `[p${i}]`).join('')}`);
+
+    let prev = 'base';
+    usable.forEach((s, i) => {
+      const inIdx = i + 1;
+      const s0 = Number(s.startSec).toFixed(3);
+      const e0 = Number(s.endSec).toFixed(3);
+
+      // Full-canvas background (aspect always preserved).
+      if (s.fitMode === 'original') {
+        // Native pixels, centered: crop the overflow, pad the shortfall.
+        parts.push(`[${inIdx}:v]crop=w='min(iw,${CW})':h='min(ih,${CH})',pad=${CW}:${CH}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p[bg${i}]`);
+      } else {
+        // Scaled to fit the canvas (up or down), then letterboxed & centered.
+        parts.push(`[${inIdx}:v]scale=${CW}:${CH}:force_original_aspect_ratio=decrease,pad=${CW}:${CH}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p[bg${i}]`);
+      }
+
+      // The video overlay, sized & positioned from the editor's canvas fractions.
+      const pw = even(clamp((s.pip?.wPct ?? 0.34) * CW, 40, CW));
+      const px = even(clamp((s.pip?.xPct ?? 0.62) * CW, 0, CW - pw));
+      const py = even(clamp((s.pip?.yPct ?? 0.6) * CH, 0, CH - 40));
+      parts.push(`[p${i}]scale=${pw}:-2,setsar=1,fps=30,format=yuv420p[pip${i}]`);
+
+      // During [start,end]: cover the frame with the image, then draw the video.
+      parts.push(`[${prev}][bg${i}]overlay=0:0:enable='between(t,${s0},${e0})'[bgo${i}]`);
+      parts.push(`[bgo${i}][pip${i}]overlay=${px}:${py}:enable='between(t,${s0},${e0})'[cx${i}]`);
+      prev = `cx${i}`;
+    });
+    parts.push(`[${prev}]format=yuv420p[outv]`);
+
+    const filterPath = `${basePath}.bgfilter.txt`;
+    await fs.writeFile(filterPath, parts.join(';'));
+
+    const outputPath = path.join(workDir, 'with_backgrounds.mp4');
+    await new Promise((resolve, reject) => {
+      const args = [
+        '-y',
+        ...inputArgs,
+        '-filter_complex_script', filterPath,
+        '-map', '[outv]',
+        '-map', '0:a?',
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', '20',
+        '-c:a', 'copy',
+        '-movflags', '+faststart',
+        outputPath,
+      ];
+      console.log(`  [Backgrounds] ${K} section(s) -> full-canvas image + video overlay`);
+      const proc = spawn('ffmpeg', args);
+      let stderr = '';
+      proc.stderr.on('data', (d) => {
+        const str = d.toString();
+        stderr += str;
+        if (stderr.length > 20000) stderr = stderr.slice(-10000);
+        const m = str.match(/time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})/);
+        if (m && onProgress && baseDuration > 0) {
+          const cur = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 100;
+          onProgress(Math.min(100, (cur / baseDuration) * 100));
+        }
+      });
+      proc.on('close', async (code) => {
+        await fs.remove(filterPath).catch(() => {});
+        if (code === 0) { console.log('  [Backgrounds] ✓ done'); resolve(); }
+        else { console.error(stderr.slice(-1200)); reject(new Error('Could not add your background sections. Please try again.')); }
+      });
+      proc.on('error', (err) => reject(err));
+    });
+
+    for (const lp of localByUrl.values()) await fs.remove(lp).catch(() => {});
+    console.log(`[ManualClip ${jobId}] ✓ Composited ${K} background section(s) into the final video`);
+    return outputPath;
   }
 
   // ============================================================

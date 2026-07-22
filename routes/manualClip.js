@@ -261,7 +261,7 @@ router.post('/generate/:jobId', async (req, res) => {
 router.post('/render-sequence/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
-    const { hooks, cuts, disguise, title, levelAudio, removeSilences, inserts, lowerThirds, introUrl } = req.body;
+    const { hooks, cuts, disguise, title, levelAudio, removeSilences, inserts, lowerThirds, introUrl, backgroundSections } = req.body;
     // 🎬 Intro clip that plays at the very start (before the hooks).
     const introClipUrl = (introUrl && String(introUrl).trim()) ? String(introUrl).trim() : null;
 
@@ -282,8 +282,28 @@ router.post('/render-sequence/:jobId', async (req, res) => {
         endSec: Number(lt.endSec ?? lt.endTime),
         stay: !!lt.stay,
       }));
+    // 🖼️ Per-section background images: during [startSec,endSec] on the FINAL
+    // video, show the uploaded image full-frame and shrink the video into a
+    // draggable overlay (position/size in canvas fractions).
+    const clamp01 = (n, d) => {
+      const x = Number(n);
+      return Number.isFinite(x) ? Math.min(1, Math.max(0, x)) : d;
+    };
+    const backgroundList = (Array.isArray(backgroundSections) ? backgroundSections : [])
+      .filter(b => b && b.imageUrl && Number(b.endSec ?? b.endTime) > Number(b.startSec ?? b.startTime))
+      .map(b => ({
+        startSec: Math.max(0, Number(b.startSec ?? b.startTime) || 0),
+        endSec: Number(b.endSec ?? b.endTime) || 0,
+        imageUrl: String(b.imageUrl),
+        fitMode: b.fitMode === 'original' ? 'original' : 'fit',
+        pip: {
+          xPct: clamp01(b.pip?.xPct, 0.62),
+          yPct: clamp01(b.pip?.yPct, 0.6),
+          wPct: clamp01(b.pip?.wPct, 0.34),
+        },
+      }));
 
-    if (hookList.length === 0 && cutList.length === 0 && disguiseList.length === 0 && !removeSilences && insertList.length === 0 && lowerThirdList.length === 0 && !introClipUrl) {
+    if (hookList.length === 0 && cutList.length === 0 && disguiseList.length === 0 && !removeSilences && insertList.length === 0 && lowerThirdList.length === 0 && !introClipUrl && backgroundList.length === 0) {
       return res.status(400).json({
         success: false,
         error: 'Add at least one hook, an intro, a section to remove, a voice to disguise, a clip to insert, or a CTA overlay, first.'
@@ -346,7 +366,7 @@ router.post('/render-sequence/:jobId', async (req, res) => {
       message: `Building your video! Use the status endpoint to track progress.`
     });
 
-    manualClipService.renderPodcastSequence(jobId, hookList, { title, cuts: cutList, disguise: disguiseList, levelAudio: !!levelAudio, removeSilences: !!removeSilences, inserts: insertList, lowerThirds: lowerThirdList, introUrl: introClipUrl, userId: req.headers['x-user-id'] || null })
+    manualClipService.renderPodcastSequence(jobId, hookList, { title, cuts: cutList, disguise: disguiseList, levelAudio: !!levelAudio, removeSilences: !!removeSilences, inserts: insertList, lowerThirds: lowerThirdList, introUrl: introClipUrl, backgroundSections: backgroundList, userId: req.headers['x-user-id'] || null })
       .catch(error => {
         // Free the heavy intermediates a failed render left behind (don't fill the disk).
         manualClipService.cleanupRenderTemp(jobId).catch(() => {});
@@ -855,6 +875,7 @@ router.post('/restore/:jobId', async (req, res) => {
       introUrl: record.introUrl || null,
       introLabel: record.introLabel || '',
       revoice: record.revoice || [],
+      backgroundSections: record.backgroundSections || [],
       removeSilences: !!record.removeSilences,
       levelAudio: !!record.levelAudio,
     });
@@ -1014,6 +1035,48 @@ router.put('/library/:jobId/lowerthirds', async (req, res) => {
   } catch (error) {
     console.error('[ManualClip] Save lower thirds error:', error);
     res.status(500).json({ success: false, error: 'Could not save your CTA overlays.' });
+  }
+});
+
+// ============================================================
+// POST /api/manual-clip/background-image/:jobId
+// 🖼️ Upload one background image for a section. Parked in R2 under the same
+// project prefix as the source video (manual-clip/{jobId}/backgrounds/…), so it
+// shares the project's lifespan and is swept away with it. Returns a public URL
+// the editor keeps in the section and auto-saves.
+// Field: image (multipart)
+// ============================================================
+router.post('/background-image/:jobId', upload.single('image'), async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: 'Please choose an image to upload.' });
+    }
+    const result = await manualClipService.saveBackgroundImage(jobId, req.file.path, req.file.originalname);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('[ManualClip] Background image upload error:', error);
+    res.status(500).json({ success: false, error: 'Could not upload that image. Please try again.' });
+  }
+});
+
+// ============================================================
+// PUT /api/manual-clip/library/:jobId/backgrounds
+// Auto-save the user's background-image sections for a saved video, so reopening
+// the project brings them back like hooks/cuts/CTAs.
+// Body: { backgroundSections: [{ title, startSec, endSec, imageUrl, imageKey,
+//         fitMode, pip: { xPct, yPct, wPct } }] }
+// ============================================================
+router.put('/library/:jobId/backgrounds', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const { backgroundSections } = req.body;
+    await manualVideoLibraryService.updateBackgroundSections(userId, jobId, backgroundSections || []);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[ManualClip] Save background sections error:', error);
+    res.status(500).json({ success: false, error: 'Could not save your background sections.' });
   }
 });
 

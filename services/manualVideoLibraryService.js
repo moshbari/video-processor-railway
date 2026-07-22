@@ -242,6 +242,46 @@ class ManualVideoLibraryService {
   }
 
   /**
+   * 🖼️ Save the user's background-image sections for one video (auto-save from
+   * the editor), so a refresh/reopen brings back every section: its time range,
+   * the uploaded background image (which already lives in R2 — we only store its
+   * URL + key), the fit mode, and where the user dragged/sized the video overlay.
+   * Stored lean: { title, startSec, endSec, imageUrl, imageKey, fitMode,
+   * pip: { xPct, yPct, wPct } }. We keep `imageKey` so deleting the project can
+   * sweep the images too.
+   */
+  async updateBackgroundSections(userId, jobId, sections) {
+    const clamp01 = (n, d) => {
+      const x = Number(n);
+      return Number.isFinite(x) ? Math.min(1, Math.max(0, x)) : d;
+    };
+    const lean = (Array.isArray(sections) ? sections : [])
+      .map(s => ({
+        title: String(s.title || '').slice(0, 120),
+        startSec: Math.max(0, Number(s.startSec ?? s.startTime) || 0),
+        endSec: Math.max(0, Number(s.endSec ?? s.endTime) || 0),
+        imageUrl: s.imageUrl ? String(s.imageUrl) : null,
+        imageKey: s.imageKey ? String(s.imageKey) : null,
+        fitMode: s.fitMode === 'original' ? 'original' : 'fit',
+        pip: {
+          xPct: clamp01(s.pip?.xPct, 0.62),
+          yPct: clamp01(s.pip?.yPct, 0.6),
+          wPct: clamp01(s.pip?.wPct, 0.34),
+        },
+      }))
+      .filter(s => s.imageUrl && s.endSec > s.startSec);
+    for (const owner of [userId, null]) {
+      const data = await this.load(owner);
+      const v = data.videos.find(x => x.jobId === jobId);
+      if (v) {
+        v.backgroundSections = lean;
+        await this.save(owner, data);
+        return;
+      }
+    }
+  }
+
+  /**
    * 🔧 Save the editor's on/off toggles for one video (auto-save), so reopening
    * the project brings them back like every other setting. Currently the two
    * booleans that live outside the segment lists: `removeSilences` (auto-cut
@@ -303,6 +343,16 @@ class ManualVideoLibraryService {
       await r2Service.deleteFile(target.sourceKey).catch(err =>
         console.error(`[VideoLibrary] Could not delete source ${target.sourceKey}:`, err.message)
       );
+      // Sweep any background images the user uploaded for this project too, so
+      // deleting the project frees them immediately (they'd expire via the R2
+      // lifecycle anyway, but don't wait for that).
+      for (const bg of (Array.isArray(target.backgroundSections) ? target.backgroundSections : [])) {
+        if (bg && bg.imageKey) {
+          await r2Service.deleteFile(bg.imageKey).catch(err =>
+            console.error(`[VideoLibrary] Could not delete background ${bg.imageKey}:`, err.message)
+          );
+        }
+      }
     }
     console.log(`[VideoLibrary] Removed ${jobId} for ${userId}`);
   }
