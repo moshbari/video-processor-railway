@@ -1091,8 +1091,11 @@ class ManualClipService {
       filterParts.push(`${concatInputs}concat=n=${n}:v=1:a=1[${subFilter ? 'cv' : 'outv'}][preAudio]`);
       if (subFilter) filterParts.push(`[cv]${subFilter}[outv]`);
       // loudnorm resamples internally and emits a high sample rate (96k) — pin it
-      // back to 48k so the delivered audio is standard and half the size.
-      filterParts.push(`[preAudio]loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[outa]`);
+      // back to 48k. Use aformat (not a bare aresample): the concat filter's
+      // audio output has an UNSPECIFIED channel layout on FFmpeg 5.1, and a bare
+      // aresample can't pick an output layout from that ("Cannot select channel
+      // layout") — aformat states stereo explicitly so it always resolves.
+      filterParts.push(`[preAudio]loudnorm=I=-16:TP=-1.5:LRA=11,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[outa]`);
 
       const args = [
         '-y',
@@ -1183,8 +1186,9 @@ class ManualClipService {
         });
         parts.push(`${concatLabels.join('')}concat=n=${items.length}:v=1:a=1[${subFilter ? 'cv' : 'outv'}][preAudio]`);
         if (subFilter) parts.push(`[cv]${subFilter}[outv]`);
-        // Pin loudnorm's internal high-rate output back to 48k (see concat above).
-        parts.push(`[preAudio]loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[outa]`);
+        // Pin loudnorm's high-rate output back to 48k via aformat (a bare
+        // aresample fails on the concat filter's unspecified layout on 5.1).
+        parts.push(`[preAudio]loudnorm=I=-16:TP=-1.5:LRA=11,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[outa]`);
 
         // Pass the (potentially large) graph via a script file — no arg-length limit.
         const filterPath = `${outputPath}.filter.txt`;
