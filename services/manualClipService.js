@@ -771,9 +771,11 @@ class ManualClipService {
         currentClip: `Cutting hook ${i + 1} of ${totalHooks}...`
       });
 
-      const segPath = path.join(seqDir, `hook_${String(i + 1).padStart(2, '0')}.mp4`);
+      // .mkv + FLAC: these hook files only feed the final concat, so we keep
+      // their audio padding-free to stay perfectly locked when stitched.
+      const segPath = path.join(seqDir, `hook_${String(i + 1).padStart(2, '0')}.mkv`);
       console.log(`  Hook ${i + 1}/${totalHooks} [order ${hook.order}]: ${this.formatTime(startTime)} → ${this.formatTime(endTime)}`);
-      await this.extractClipMaxQuality(videoPath, startTime, endTime, segPath);
+      await this.extractClipMaxQuality(videoPath, startTime, endTime, segPath, { losslessAudio: true });
       segmentPaths.push(segPath);
       hooksTotalSeconds += (endTime - startTime);
     }
@@ -1070,14 +1072,21 @@ class ManualClipService {
       const filterParts = [];
       let concatInputs = '';
       for (let i = 0; i < n; i++) {
-        filterParts.push(`[${i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v${i}]`);
-        filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
+        // setpts/asetpts=PTS-STARTPTS zeroes each input's start so the concat
+        // aligns cleanly — the extracted hooks can carry a small, DIFFERENT
+        // start offset on their video vs audio (a side effect of fast seeking),
+        // and without this reset those offsets pile up into the picture sliding
+        // ahead of the voice across many hooks.
+        filterParts.push(`[${i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,setpts=PTS-STARTPTS,format=yuv420p[v${i}]`);
+        filterParts.push(`[${i}:a]aresample=48000,asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
         concatInputs += `[v${i}][a${i}]`;
       }
       // Concat, then (optionally) burn the overlays onto the joined video stream.
       filterParts.push(`${concatInputs}concat=n=${n}:v=1:a=1[${subFilter ? 'cv' : 'outv'}][preAudio]`);
       if (subFilter) filterParts.push(`[cv]${subFilter}[outv]`);
-      filterParts.push(`[preAudio]loudnorm=I=-16:TP=-1.5:LRA=11[outa]`);
+      // loudnorm resamples internally and emits a high sample rate (96k) — pin it
+      // back to 48k so the delivered audio is standard and half the size.
+      filterParts.push(`[preAudio]loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[outa]`);
 
       const args = [
         '-y',
@@ -1089,6 +1098,7 @@ class ManualClipService {
         '-preset', 'medium',
         '-crf', '20',
         '-c:a', 'aac',
+        '-ar', '48000',
         '-b:a', '320k',
         '-movflags', '+faststart',
         outputPath
@@ -1167,7 +1177,8 @@ class ManualClipService {
         });
         parts.push(`${concatLabels.join('')}concat=n=${items.length}:v=1:a=1[${subFilter ? 'cv' : 'outv'}][preAudio]`);
         if (subFilter) parts.push(`[cv]${subFilter}[outv]`);
-        parts.push(`[preAudio]loudnorm=I=-16:TP=-1.5:LRA=11[outa]`);
+        // Pin loudnorm's internal high-rate output back to 48k (see concat above).
+        parts.push(`[preAudio]loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[outa]`);
 
         // Pass the (potentially large) graph via a script file — no arg-length limit.
         const filterPath = `${outputPath}.filter.txt`;
@@ -1183,6 +1194,7 @@ class ManualClipService {
           '-preset', 'medium',
           '-crf', '20',
           '-c:a', 'aac',
+          '-ar', '48000',
           '-b:a', '320k',
           '-movflags', '+faststart',
           outputPath
@@ -1970,11 +1982,10 @@ class ManualClipService {
     return keeps.filter(k => k.end - k.start > 0.05);
   }
 
-  // Max kept segments to put in one FFmpeg select expression. A very long
-  // podcast with the silence remover on can produce hundreds of tiny gaps;
-  // cramming them all into one `select=expr='between(t,..)+..'` builds a
-  // filtergraph so big FFmpeg dies with "Cannot allocate memory". We cap the
-  // expression size and stitch batches together instead.
+  // Max kept segments to trim+concat in one FFmpeg pass. A very long podcast
+  // with the silence remover on can produce hundreds of tiny gaps; feeding them
+  // all through one filtergraph makes FFmpeg buffer too much and die with
+  // "Cannot allocate memory". We cap each pass and stitch batches together.
   static DESILENCE_BATCH = 40;
 
   /**
@@ -1982,9 +1993,11 @@ class ManualClipService {
    * video are cut at exactly the same points and stay perfectly in sync.
    * Quality matches the rest of Clip Maker.
    *
-   * For a handful of segments this is a single select/aselect pass. For many
+   * For a handful of segments this is a single trim+concat pass. For many
    * segments (hundreds of silence gaps) we process them in batches — each batch
-   * is its own small, memory-safe pass — then concat the batch files losslessly.
+   * is its own small, memory-safe pass written as a lossless-audio part — then
+   * join the parts (video copied, audio re-encoded once) so the seams stay in
+   * sync too.
    */
   async renderKeptSegments(videoPath, keeps, totalSeconds, outputPath, onProgress) {
     const BATCH = this.constructor.DESILENCE_BATCH;
@@ -2008,7 +2021,11 @@ class ManualClipService {
     for (let bi = 0; bi < batches.length; bi++) {
       const batch = batches[bi];
       const batchSeconds = batch.reduce((s, k) => s + (k.end - k.start), 0);
-      const partPath = path.join(dir, `${base}_part_${String(bi + 1).padStart(3, '0')}.mp4`);
+      // Parts carry LOSSLESS FLAC audio in MKV — FLAC has no encoder-priming
+      // padding, so when the parts are joined the audio lines up sample-exact
+      // with no silence creeping in at the seams. The join below re-encodes to
+      // AAC once, continuously, keeping picture and voice perfectly locked.
+      const partPath = path.join(dir, `${base}_part_${String(bi + 1).padStart(3, '0')}.mkv`);
       const before = doneSeconds;
       await this._renderKeptSegmentsPass(videoPath, batch, batchSeconds, partPath, (pct) => {
         if (onProgress && totalSeconds > 0) {
@@ -2020,8 +2037,12 @@ class ManualClipService {
       doneSeconds += batchSeconds;
     }
 
-    // Concat the part files. They share identical encode settings, so a
-    // stream-copy concat is safe and lossless.
+    // Concat the part files. Video is copied (lossless, fast — every part is the
+    // same CFR 30 libx264), but audio is RE-ENCODED across the join. Stream-copied
+    // AAC leaves a few ms of encoder-priming silence at each part boundary, which
+    // would nudge the voice a hair behind the picture at every seam; decoding the
+    // audio straight through and re-encoding it welds the seams so the whole
+    // podcast stays perfectly in sync no matter how many batches it took.
     const listPath = path.join(dir, `${base}_concat.txt`);
     const listBody = partPaths.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join('\n');
     await fs.writeFile(listPath, listBody);
@@ -2031,7 +2052,11 @@ class ManualClipService {
         '-y',
         '-f', 'concat', '-safe', '0',
         '-i', listPath,
-        '-c', 'copy',
+        '-c:v', 'copy',
+        '-c:a', 'aac',
+        '-ar', '48000',
+        '-ac', '2',
+        '-b:a', '320k',
         '-movflags', '+faststart',
         outputPath
       ]);
@@ -2055,33 +2080,70 @@ class ManualClipService {
     return outputPath;
   }
 
-  // One memory-bounded select/aselect pass over `keeps`. Used directly for a
+  // One memory-bounded trim+concat pass over `keeps`. Used directly for a
   // small number of segments, and once per batch for large ones.
   _renderKeptSegmentsPass(videoPath, keeps, totalSeconds, outputPath, onProgress) {
     return new Promise((resolve, reject) => {
-      // between(t,a,b) summed with '+' — exactly one term is 1 inside a kept range.
-      // Wrapped in expr='...' single quotes so the commas stay literal in the graph.
-      const expr = keeps
-        .map(k => `between(t,${k.start.toFixed(3)},${k.end.toFixed(3)})`)
-        .join('+');
+      // 🔒 A/V-LOCKED cut. The old approach used select/aselect + setpts=N/FRAME_RATE:
+      // it renumbered the kept VIDEO by frame count and the kept AUDIO by sample
+      // count INDEPENDENTLY, so every cut left the picture and the voice a hair
+      // out of step — and across a long podcast with hundreds of silence cuts
+      // (plus the stream-copy seams between batches) it piled up into visible
+      // lip-sync drift. Instead we trim each kept piece with matching video/audio
+      // time ranges and concat them, which keeps each piece's picture and voice
+      // welded together.
+      //
+      // The key to ZERO drift: snap every boundary to the 30fps frame grid, so a
+      // cut always lands on a whole frame — and one frame at 30fps is EXACTLY
+      // 1600 samples at 48kHz, so the audio and video are cut at the very same
+      // instant every time. No rounding gap to accumulate.
+      const FPS = 30;
+      const snap = (t) => Math.round(t * FPS) / FPS;
+      const segs = keeps
+        .map(k => ({ s: Math.max(0, snap(k.start)), e: snap(k.end) }))
+        .filter(k => k.e - k.s > 0.001);
+      if (segs.length === 0) { reject(new Error('No sections left to keep.')); return; }
 
-      const args = [
-        '-y',
-        '-i', videoPath,
-        '-vf', `select=expr='${expr}',setpts=N/FRAME_RATE/TB`,
-        '-af', `aselect=expr='${expr}',asetpts=N/SR/TB`,
-        '-c:v', 'libx264',
-        '-preset', 'medium',
-        '-crf', '20',
-        '-c:a', 'aac',
-        '-ar', '48000',
-        '-ac', '2',
-        '-b:a', '320k',
-        '-movflags', '+faststart',
-        outputPath
-      ];
+      const parts = [];
+      let concatLabels = '';
+      segs.forEach((k, i) => {
+        parts.push(`[0:v]trim=start=${k.s.toFixed(5)}:end=${k.e.toFixed(5)},setpts=PTS-STARTPTS,fps=${FPS},format=yuv420p[v${i}]`);
+        parts.push(`[0:a]atrim=start=${k.s.toFixed(5)}:end=${k.e.toFixed(5)},asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
+        concatLabels += `[v${i}][a${i}]`;
+      });
+      parts.push(`${concatLabels}concat=n=${segs.length}:v=1:a=1[outv][outa]`);
 
-      const proc = spawn('ffmpeg', args);
+      // Written to a script file (not the command line) so a batch of up to 40
+      // segments never blows the argument-length limit.
+      const dir = path.dirname(outputPath);
+      const base = path.basename(outputPath, path.extname(outputPath));
+      const filterPath = path.join(dir, `${base}.desilence.filter.txt`);
+      try { require('fs').writeFileSync(filterPath, parts.join(';\n')); }
+      catch (err) { reject(err); return; }
+
+      // Batch parts are written as .mkv with LOSSLESS FLAC audio (no encoder
+      // priming → seam-perfect join). A single-pass render (small case) goes
+      // straight to .mp4 with AAC, which has no seam to worry about.
+      const argsFor = (out) => {
+        const flac = path.extname(out).toLowerCase() === '.mkv';
+        return [
+          '-y',
+          '-i', videoPath,
+          '-filter_complex_script', filterPath,
+          '-map', '[outv]',
+          '-map', '[outa]',
+          '-c:v', 'libx264',
+          '-preset', 'medium',
+          '-crf', '20',
+          ...(flac
+            ? ['-c:a', 'flac', '-ar', '48000', '-ac', '2']
+            : ['-c:a', 'aac', '-ar', '48000', '-ac', '2', '-b:a', '320k', '-movflags', '+faststart']),
+          out
+        ];
+      };
+
+      const cleanupFilter = () => fs.remove(filterPath).catch(() => {});
+      const proc = spawn('ffmpeg', argsFor(outputPath));
       let stderr = '';
       proc.stderr.on('data', (d) => {
         const s = d.toString();
@@ -2094,10 +2156,11 @@ class ManualClipService {
         }
       });
       proc.on('close', (code) => {
+        cleanupFilter();
         if (code === 0) { resolve(outputPath); }
         else { console.error(stderr.slice(-800)); reject(new Error('Could not remove the silences. Please try again.')); }
       });
-      proc.on('error', (err) => reject(err));
+      proc.on('error', (err) => { cleanupFilter(); reject(err); });
     });
   }
 
@@ -2110,8 +2173,17 @@ class ManualClipService {
    * CRF 18 = visually lossless
    * 192k AAC audio
    */
-  extractClipMaxQuality(videoPath, startTime, endTime, outputPath) {
+  extractClipMaxQuality(videoPath, startTime, endTime, outputPath, opts = {}) {
     const duration = endTime - startTime;
+    // losslessAudio → FLAC instead of AAC. AAC pads the last frame, so an
+    // AAC clip's audio runs a hair longer than its video; stack a dozen of
+    // those in the podcast concat and the voice slides behind the picture.
+    // FLAC has no such padding, so when hooks are stitched they stay locked.
+    // (Used for the throwaway hook segments that only feed the final concat —
+    // downloadable clips keep AAC.)
+    const audioOpts = opts.losslessAudio
+      ? ['-c:a', 'flac', '-ar', '48000', '-ac', '2']
+      : ['-c:a', 'aac', '-ar', '48000', '-ac', '2', '-b:a', '320k'];
 
     return new Promise((resolve, reject) => {
       ffmpeg(videoPath)
@@ -2121,10 +2193,7 @@ class ManualClipService {
           '-c:v', 'libx264',
           '-preset', 'medium',       // Better quality than 'fast' at cost of speed
           '-crf', '20',              // MAXIMUM visual quality (visually lossless)
-          '-c:a', 'aac',
-          '-ar', '48000',            // 48kHz audio (studio quality)
-          '-ac', '2',                // Stereo
-          '-b:a', '320k',            // High bitrate audio
+          ...audioOpts,
           '-avoid_negative_ts', 'make_zero',
           '-y'
         ])
