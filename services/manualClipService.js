@@ -771,11 +771,14 @@ class ManualClipService {
         currentClip: `Cutting hook ${i + 1} of ${totalHooks}...`
       });
 
-      // .mkv + FLAC: these hook files only feed the final concat, so we keep
-      // their audio padding-free to stay perfectly locked when stitched.
-      const segPath = path.join(seqDir, `hook_${String(i + 1).padStart(2, '0')}.mkv`);
+      // AAC/MP4 hooks — the known-good format for the final concat filter.
+      // (FLAC hooks would shave a little padding but Railway's FFmpeg 5.1 chokes
+      // on FLAC's unspecified channel layout inside the concat filter. The
+      // per-input setpts/asetpts reset in concatenateSequence16x9 keeps them
+      // aligned instead.)
+      const segPath = path.join(seqDir, `hook_${String(i + 1).padStart(2, '0')}.mp4`);
       console.log(`  Hook ${i + 1}/${totalHooks} [order ${hook.order}]: ${this.formatTime(startTime)} → ${this.formatTime(endTime)}`);
-      await this.extractClipMaxQuality(videoPath, startTime, endTime, segPath, { losslessAudio: true });
+      await this.extractClipMaxQuality(videoPath, startTime, endTime, segPath);
       segmentPaths.push(segPath);
       hooksTotalSeconds += (endTime - startTime);
     }
@@ -1078,7 +1081,10 @@ class ManualClipService {
         // and without this reset those offsets pile up into the picture sliding
         // ahead of the voice across many hooks.
         filterParts.push(`[${i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,setpts=PTS-STARTPTS,format=yuv420p[v${i}]`);
-        filterParts.push(`[${i}:a]aresample=48000,asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
+        // aformat (with sample_rates=48000) handles any resampling; no explicit
+        // aresample — that trips FFmpeg 5.1 on inputs with an unspecified
+        // channel layout. asetpts zeroes the start so the concat aligns cleanly.
+        filterParts.push(`[${i}:a]asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
         concatInputs += `[v${i}][a${i}]`;
       }
       // Concat, then (optionally) burn the overlays onto the joined video stream.
