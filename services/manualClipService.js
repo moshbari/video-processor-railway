@@ -666,6 +666,19 @@ class ManualClipService {
     const seqDir = path.join(workDir, 'sequence');
     await fs.ensureDir(seqDir);
 
+    // 🆔 Every render RUN gets its own output filename.
+    //
+    // Re-rendering a project reuses the same jobId, so the same folder. When a
+    // run finishes we leave a 15-minute timer to delete its finished file (the
+    // "download from this server" copy) once R2 has it. With a fixed filename
+    // that timer belongs to the PATH, not the run — so a re-render started
+    // inside that window had its still-being-written file deleted out from
+    // under ffmpeg. On Linux ffmpeg keeps writing to the now-unlinked file and
+    // exits 0, so the render "succeeded" with nothing on disk and the user got
+    // "The final video could not be created." A per-run name means a run's
+    // timer can only ever delete its own run's file.
+    const renderRunId = Date.now().toString(36);
+
     // Sort hooks by their sequence number (stable; ties keep insertion order).
     const ordered = hooks
       .map((h, i) => ({ ...h, _i: i, order: Number(h.order) || (i + 1) }))
@@ -890,7 +903,7 @@ class ManualClipService {
       currentClip: 'Stitching everything together...'
     });
 
-    const outputPath = path.join(seqDir, 'podcast_sequence.mp4');
+    const outputPath = path.join(seqDir, `podcast_sequence_${renderRunId}.mp4`);
     await this.concatenateSequence16x9(segmentPaths, outputPath, totalSeconds, (pct) => {
       this.updateJob(jobId, { progress: Math.round(62 + (pct / 100) * 30) }); // 62 -> 92
     }, { finalSubtitles: willWeaveInserts ? null : lowerThirdsAssPath });
