@@ -16,6 +16,7 @@ const fs = require('fs-extra');
 
 const manualClipService = require('../services/manualClipService');
 const manualVideoLibraryService = require('../services/manualVideoLibraryService');
+const ctaLibraryService = require('../services/ctaLibraryService');
 const voiceService = require('../services/voiceService');
 
 // Upload directory for manual clip videos
@@ -1273,6 +1274,70 @@ router.get('/download/:jobId', async (req, res) => {
   } catch (error) {
     console.error('[ManualClip] Download error:', error);
     res.status(500).json({ success: false, error: 'Could not download the video.' });
+  }
+});
+
+// ============================================================
+// ⭐ SAVED CTA LINKS — a per-user address book of the CTA clips they re-use in
+// every podcast (GoHighLevel media link, Tella link, any supported link). Only
+// LINKS are stored, never video files; picking one just feeds its link into the
+// normal /fetch-clip flow. Unlimited entries per user.
+//
+//   GET    /api/manual-clip/cta-library          → { ctas: [...] }
+//   POST   /api/manual-clip/cta-library          { name, url, note? }
+//   PUT    /api/manual-clip/cta-library/:id      { name?, url?, note? }
+//   POST   /api/manual-clip/cta-library/:id/used (bump usage stats)
+//   DELETE /api/manual-clip/cta-library/:id
+// ============================================================
+router.get('/cta-library', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    const ctas = await ctaLibraryService.list(userId);
+    res.json({ success: true, ctas });
+  } catch (error) {
+    console.error('[ManualClip] CTA library list error:', error);
+    res.json({ success: true, ctas: [] }); // never block the editor over this
+  }
+});
+
+router.post('/cta-library', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    const { name, url, note, durationFormatted } = req.body || {};
+    const cta = await ctaLibraryService.add(userId, { name, url, note, durationFormatted });
+    res.json({ success: true, cta });
+  } catch (error) {
+    console.error('[ManualClip] CTA library save error:', error.message);
+    res.status(400).json({ success: false, error: error.message || 'Could not save that CTA link.' });
+  }
+});
+
+router.put('/cta-library/:id', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    const { name, url, note } = req.body || {};
+    const cta = await ctaLibraryService.update(userId, req.params.id, { name, url, note });
+    res.json({ success: true, cta });
+  } catch (error) {
+    console.error('[ManualClip] CTA library update error:', error.message);
+    res.status(400).json({ success: false, error: error.message || 'Could not update that CTA link.' });
+  }
+});
+
+router.post('/cta-library/:id/used', async (req, res) => {
+  const userId = req.headers['x-user-id'] || null;
+  await ctaLibraryService.touch(userId, req.params.id);
+  res.json({ success: true });
+});
+
+router.delete('/cta-library/:id', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    const removed = await ctaLibraryService.remove(userId, req.params.id);
+    res.json({ success: true, removed });
+  } catch (error) {
+    console.error('[ManualClip] CTA library delete error:', error.message);
+    res.status(500).json({ success: false, error: 'Could not remove that CTA link.' });
   }
 });
 
