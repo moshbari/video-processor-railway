@@ -30,6 +30,20 @@ const voiceoverProgress = {};
 
 const TEMP_DIR = process.env.TEMP_DIR || '/app/temp';
 
+// The finished Audio RANT is always a 1080x1920 vertical video at 30fps.
+// EVERY segment (original clip + rant segment) is built to EXACTLY these
+// settings in its own single-input pass, so the final join is a plain
+// stitch — no giant multi-input filter graph. See concatenateSegments().
+const FINAL_W = 1080;
+const FINAL_H = 1920;
+const FINAL_FPS = 30;
+// Fit-inside-and-letterbox to the final frame, with a square pixel ratio.
+// Identical for every segment => the segments are byte-for-byte compatible.
+// out_range=tv matters for the rant segments: they are built from a JPEG still,
+// which decodes as FULL-range, and a full-range segment spliced between
+// limited-range clips shows up as a brightness/contrast jump at every reaction.
+const STANDARD_VF = `scale=${FINAL_W}:${FINAL_H}:force_original_aspect_ratio=decrease:out_range=tv,pad=${FINAL_W}:${FINAL_H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${FINAL_FPS},format=yuv420p`;
+
 class AudioReactionService {
   
   constructor() {
@@ -273,7 +287,7 @@ class AudioReactionService {
         const capArg = audioDuration > 0 ? `-t ${(audioDuration + HOLD).toFixed(3)}` : '';
         console.log(`[AudioReaction] Creating frozen frame video (${audioDuration.toFixed(2)}s ${accurate > 0 ? 'exact' : 'estimated'}${capArg ? `, capped +${HOLD}s` : ', -shortest'}) with normalized audio (${measured ? 'two-pass' : 'one-pass fallback'})...`);
 
-        const cmd = `ffmpeg -y -loop 1 -i "${framePath}" -i "${audioPath}" -vf "scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,fps=30" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -ar 44100 -af "${afilter}" ${capArg} -shortest -pix_fmt yuv420p "${outputPath}"`;
+        const cmd = `ffmpeg -y -loop 1 -i "${framePath}" -i "${audioPath}" -vf "${STANDARD_VF}" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -ar 44100 -ac 2 -af "${afilter}" ${capArg} -shortest -pix_fmt yuv420p -color_range tv "${outputPath}"`;
 
         exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
           if (error) {
@@ -300,7 +314,7 @@ class AudioReactionService {
     return new Promise((resolve, reject) => {
       console.log(`[AudioReaction] Normalizing clip (${measured ? 'two-pass' : 'one-pass fallback'}): ${path.basename(inputPath)}`);
 
-      const cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset fast -crf 23 -r 30 -c:a aac -b:a 192k -ar 44100 -af "${afilter}" -pix_fmt yuv420p "${outputPath}"`;
+      const cmd = `ffmpeg -y -i "${inputPath}" -vf "${STANDARD_VF}" -c:v libx264 -preset fast -crf 23 -r ${FINAL_FPS} -c:a aac -b:a 192k -ar 44100 -ac 2 -af "${afilter}" -pix_fmt yuv420p "${outputPath}"`;
 
       exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
         if (error) {
@@ -315,72 +329,80 @@ class AudioReactionService {
   }
 
   /**
-   * Concatenate all video segments using concat filter
+   * Join all finished segments into the final video.
+   *
+   * This used to open EVERY segment at once as a separate FFmpeg input and
+   * scale/pad each one inside one huge filter_complex. That graph grows with
+   * the number of reactions, and past ~13 inputs FFmpeg (5.1, as shipped in
+   * the container) fails while it is still WIRING the graph up:
+   *
+   *   [Parsed_scale_65] Failed to configure output pad on Parsed_scale_65
+   *   Error reinitializing filters!  ->  "FFmpeg concat failed with code 1"
+   *
+   * A 4-, 5- or 6-reaction rant rendered fine; an 8-reaction rant (17 inputs)
+   * failed every single time, at the same place. So the join is now the
+   * concat DEMUXER: it opens ONE segment at a time, which means the cost is
+   * flat no matter how many reactions there are. That is safe here because
+   * every segment was already built to identical settings (STANDARD_VF +
+   * 44100Hz stereo) by normalizeVideoClip() / createFrozenFrameWithAudio().
    */
   async concatenateSegments(segments, outputPath, jobId) {
+    console.log(`[AudioReaction] Joining ${segments.length} segments (one at a time)...`);
+    segments.forEach((s, i) => console.log(`  [${i}] ${path.basename(s)}`));
+
+    // Concat-demuxer list file. Paths are ours (temp dir, no quotes in names),
+    // but escape single quotes anyway so an odd filename can never break it.
+    const listPath = path.join(path.dirname(outputPath), 'concat_list.txt');
+    const listBody = segments
+      .map(s => `file '${path.resolve(s).replace(/'/g, "'\\''")}'`)
+      .join('\n');
+    await fs.writeFile(listPath, listBody + '\n');
+
     return new Promise((resolve, reject) => {
-      console.log(`[AudioReaction] Concatenating ${segments.length} segments...`);
-      segments.forEach((s, i) => console.log(`  [${i}] ${path.basename(s)}`));
-      
-      const numClips = segments.length;
-      
-      // Build input arguments
-      const inputArgs = segments.flatMap(p => ['-i', p]);
-      
-      // Build filter_complex - scale all to same size
-      let filterParts = [];
-      let concatInputs = '';
-      
-      for (let i = 0; i < numClips; i++) {
-        filterParts.push(`[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p[v${i}]`);
-        filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a${i}]`);
-        concatInputs += `[v${i}][a${i}]`;
-      }
-      
-      // Concat and final audio normalization
-      filterParts.push(`${concatInputs}concat=n=${numClips}:v=1:a=1[outv][outa]`);
-      
-      const filterComplex = filterParts.join(';');
-      
       const args = [
         '-y',
-        ...inputArgs,
-        '-filter_complex', filterComplex,
-        '-map', '[outv]',
-        '-map', '[outa]',
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', listPath,
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
+        '-pix_fmt', 'yuv420p',
+        '-r', String(FINAL_FPS),
         '-c:a', 'aac',
         '-b:a', '192k',
+        '-ar', '44100',
+        '-ac', '2',
         '-movflags', '+faststart',
         outputPath
       ];
-      
+
       const ffmpegProcess = spawn('ffmpeg', args);
-      
+
       let stderrOutput = '';
-      
+
       ffmpegProcess.stderr.on('data', (data) => {
         const str = data.toString();
         stderrOutput += str;
+        if (stderrOutput.length > 20000) stderrOutput = stderrOutput.slice(-10000);
         const timeMatch = str.match(/time=(\d{2}:\d{2}:\d{2}\.\d{2})/);
         if (timeMatch) {
-          this.updateProgress(jobId, 'rendering', 80, `Concatenating: ${timeMatch[1]}`);
+          this.updateProgress(jobId, 'rendering', 80, `Joining: ${timeMatch[1]}`);
         }
       });
-      
-      ffmpegProcess.on('close', (code) => {
+
+      ffmpegProcess.on('close', async (code) => {
+        await fs.remove(listPath).catch(() => {});
         if (code === 0) {
-          console.log('[AudioReaction] ✓ Concatenation complete');
+          console.log('[AudioReaction] ✓ Join complete');
           resolve(outputPath);
         } else {
           const lastLines = stderrOutput.split('\n').slice(-15).join('\n');
-          console.error(`[AudioReaction] FFmpeg concat failed:\n${lastLines}`);
+          console.error(`[AudioReaction] FFmpeg join failed:\n${lastLines}`);
           reject(new Error(`FFmpeg concat failed with code ${code}`));
         }
       });
-      
+
       ffmpegProcess.on('error', (err) => {
         reject(err);
       });
@@ -478,11 +500,14 @@ class AudioReactionService {
       
       this.updateProgress(jobId, 'loading', 20, `Found ${clipPaths.length} clips`);
       
-      // Get dimensions from first clip
+      // Every segment is built straight to the FINAL frame (1080x1920). The
+      // old code built segments at the source size and let the final join
+      // resize them — that meant two resizes, and captions were sized for the
+      // source frame and then shrunk with it.
       const dimensions = await this.getVideoDimensions(clipPaths[0]);
-      const targetWidth = dimensions.width;
-      const targetHeight = dimensions.height;
-      console.log(`[AudioReaction] Target dimensions: ${targetWidth}x${targetHeight}`);
+      const targetWidth = FINAL_W;
+      const targetHeight = FINAL_H;
+      console.log(`[AudioReaction] Source ${dimensions.width}x${dimensions.height} → final ${targetWidth}x${targetHeight}`);
       
       // Step 2: Create map of which clips have audio reactions.
       // Group by clipIndex into ARRAYS (not a single value) so that if two
