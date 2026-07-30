@@ -1062,6 +1062,29 @@ router.post('/background-image/:jobId', upload.single('image'), async (req, res)
 });
 
 // ============================================================
+// POST /api/manual-clip/background-image-url/:jobId
+// 🔗 Same as above, but from a LINK instead of a file — a GoHighLevel media
+// storage URL, any CDN/image URL, a Google Drive or Dropbox share link. The
+// server fetches it and copies it into R2 (links expire; the render happens
+// later), so the section keeps working. Body: { url }
+// ============================================================
+router.post('/background-image-url/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const { url } = req.body || {};
+    if (!url || !String(url).trim()) {
+      return res.status(400).json({ success: false, error: 'Please paste an image link.' });
+    }
+    const result = await manualClipService.fetchBackgroundImageFromUrl(jobId, String(url).trim());
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('[ManualClip] Background image link error:', error.message);
+    // These messages are written for the user — pass them straight through.
+    res.status(400).json({ success: false, error: error.message || 'Could not fetch that image link.' });
+  }
+});
+
+// ============================================================
 // PUT /api/manual-clip/library/:jobId/backgrounds
 // Auto-save the user's background-image sections for a saved video, so reopening
 // the project brings them back like hooks/cuts/CTAs.

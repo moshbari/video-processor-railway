@@ -1335,6 +1335,145 @@ class ManualClipService {
   }
 
   /**
+   * 🔗 Fetch a background image from a LINK (GHL media storage, a CDN, Drive,
+   * Dropbox, any public image URL) and park it in R2 exactly like an upload.
+   *
+   * Copying it to R2 — rather than pointing the render at the original link —
+   * matters: media-library links expire, get re-permissioned, or rate-limit,
+   * and the render happens later. Once it's in R2 the section keeps working.
+   *
+   * If the link is a PAGE rather than an image (someone pastes the media-library
+   * preview URL), we read its og:image / first <img> and fetch that instead.
+   */
+  async fetchBackgroundImageFromUrl(jobId, rawUrl) {
+    const direct = this._directImageUrl(rawUrl);
+    let { buffer, contentType, finalUrl } = await this._getRemote(direct);
+
+    // A page, not an image → dig the real image out of the HTML and retry once.
+    if (/^text\/html/i.test(contentType) || (!/^image\//i.test(contentType) && buffer.slice(0, 200).toString('utf8').trim().startsWith('<'))) {
+      const found = this._imageUrlFromHtml(buffer.toString('utf8'), finalUrl);
+      if (!found) throw new Error('That link is a web page, not an image. Right-click the image → "Copy image address" and paste that.');
+      ({ buffer, contentType, finalUrl } = await this._getRemote(this._directImageUrl(found)));
+    }
+
+    const type = String(contentType || '').toLowerCase();
+    const sniffed = this._sniffImageExt(buffer);
+    if (!/^image\//.test(type) && !sniffed) {
+      throw new Error('That link did not return an image. Please check it opens an image in your browser.');
+    }
+    if (/svg/.test(type)) throw new Error('SVG images are not supported — please use a JPG, PNG, WebP or GIF.');
+
+    const ext = sniffed
+      || (/png/.test(type) ? '.png' : /webp/.test(type) ? '.webp' : /gif/.test(type) ? '.gif'
+        : /avif/.test(type) ? '.avif' : /heic|heif/.test(type) ? '.heic' : '.jpg');
+    const stem = `bgfetch-${require('crypto').randomBytes(6).toString('hex')}`;
+    await fs.ensureDir(this.tempDir);
+    let tmp = path.join(this.tempDir, `${stem}${ext}`);
+    await fs.writeFile(tmp, buffer);
+
+    // Phone/modern-web formats the renderer can't rely on → transcode to PNG once
+    // here, so the section behaves like any other image from then on.
+    let finalExt = ext;
+    if (ext === '.avif' || ext === '.heic') {
+      const png = path.join(this.tempDir, `${stem}.png`);
+      try {
+        await execAsync(`ffmpeg -y -i "${tmp}" -frames:v 1 "${png}"`);
+        await fs.remove(tmp).catch(() => {});
+        tmp = png;
+        finalExt = '.png';
+      } catch {
+        await fs.remove(tmp).catch(() => {});
+        throw new Error('That image format is not supported. Please use a JPG, PNG, WebP or GIF link.');
+      }
+    }
+
+    console.log(`[ManualClip ${jobId}] 🖼️ Fetched background image from link (${(buffer.length / 1024).toFixed(0)} KB, ${finalExt})`);
+    return this.saveBackgroundImage(jobId, tmp, `link${finalExt}`);
+  }
+
+  // Turn common "share page" links into the direct-file link they stand for.
+  _directImageUrl(raw) {
+    const url = String(raw || '').trim().replace(/^<|>$/g, '');
+    if (!/^https?:\/\//i.test(url)) {
+      throw new Error('Please paste a full link that starts with http:// or https://');
+    }
+    let u;
+    try { u = new URL(url); } catch { throw new Error('That does not look like a valid link.'); }
+
+    // Never let a pasted link make the server talk to itself or the private network.
+    const host = u.hostname.toLowerCase();
+    if (host === 'localhost' || host === '::1' || /^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(host) ||
+        /^172\.(1[6-9]|2\d|3[01])\./.test(host) || host.endsWith('.internal') || host.endsWith('.local')) {
+      throw new Error('That link points to a private address and cannot be fetched.');
+    }
+
+    // Google Drive share link → direct download
+    const drive = url.match(/drive\.google\.com\/(?:file\/d\/|open\?id=|uc\?.*?id=)([\w-]{20,})/);
+    if (drive) return `https://drive.google.com/uc?export=download&id=${drive[1]}`;
+    // Dropbox share link → raw file
+    if (/dropbox\.com/i.test(host)) {
+      u.searchParams.delete('dl');
+      u.searchParams.set('raw', '1');
+      return u.toString();
+    }
+    return url;
+  }
+
+  // GET a URL as a Buffer, following redirects, with a browser-ish UA (some
+  // CDNs — GHL's included — refuse the default node agent) and a size cap.
+  async _getRemote(url) {
+    const MAX_BYTES = 25 * 1024 * 1024;
+    try {
+      const res = await axios.get(url, {
+        responseType: 'arraybuffer',
+        timeout: 45000,
+        maxRedirects: 5,
+        maxContentLength: MAX_BYTES,
+        maxBodyLength: MAX_BYTES,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36',
+          'Accept': 'image/avif,image/webp,image/apng,image/*,text/html;q=0.8,*/*;q=0.5',
+        },
+      });
+      return {
+        buffer: Buffer.from(res.data),
+        contentType: res.headers['content-type'] || '',
+        finalUrl: res.request?.res?.responseUrl || url,
+      };
+    } catch (err) {
+      const code = err.response?.status;
+      if (code === 401 || code === 403) throw new Error('That link is private — the image must be publicly viewable to fetch it.');
+      if (code === 404) throw new Error('That link could not be found (404). Please check it and try again.');
+      if (/maxContentLength|content-length/i.test(err.message || '')) throw new Error('That image is too big (over 25 MB).');
+      throw new Error('Could not fetch that link. Please check it opens in your browser.');
+    }
+  }
+
+  // Pull an image URL out of an HTML page (og:image → twitter:image → first <img>).
+  _imageUrlFromHtml(html, baseUrl) {
+    const meta = html.match(/<meta[^>]+(?:property|name)=["'](?:og:image(?::secure_url)?|twitter:image(?::src)?)["'][^>]+content=["']([^"']+)["']/i)
+      || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["'](?:og:image|twitter:image)["']/i);
+    const img = html.match(/<img[^>]+src=["']([^"']+)["']/i);
+    const found = meta?.[1] || img?.[1];
+    if (!found) return null;
+    try { return new URL(found, baseUrl).toString(); } catch { return null; }
+  }
+
+  // Trust the bytes over the header: figure out the real format from the magic
+  // numbers, since plenty of storage buckets serve images as octet-stream.
+  _sniffImageExt(buf) {
+    if (buf.length < 12) return null;
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return '.jpg';
+    if (buf.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return '.png';
+    if (buf.slice(0, 3).toString('ascii') === 'GIF') return '.gif';
+    if (buf.slice(0, 4).toString('ascii') === 'RIFF' && buf.slice(8, 12).toString('ascii') === 'WEBP') return '.webp';
+    const ftyp = buf.slice(4, 12).toString('ascii');
+    if (ftyp.startsWith('ftypavi')) return '.avif';
+    if (/^ftyp(heic|heix|hevc|mif1)/.test(ftyp)) return '.heic';
+    return null;
+  }
+
+  /**
    * Composite background-image sections onto a FINISHED render, in ONE pass.
    * For each section, during its time window on the final video we replace the
    * whole frame with the uploaded image (full-canvas, aspect preserved — either
