@@ -1431,8 +1431,9 @@ class ManualClipService {
         maxContentLength: MAX_BYTES,
         maxBodyLength: MAX_BYTES,
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36',
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
           'Accept': 'image/avif,image/webp,image/apng,image/*,text/html;q=0.8,*/*;q=0.5',
+          'Accept-Language': 'en-US,en;q=0.9',
         },
       });
       return {
@@ -1442,10 +1443,16 @@ class ManualClipService {
       };
     } catch (err) {
       const code = err.response?.status;
+      // Log the REAL reason — the user-facing message is deliberately vague, and
+      // without this a blocked host looks identical to a typo'd link.
+      console.error(`[ManualClip] Image link fetch failed (${code || err.code || 'no status'}): ${url} — ${err.message}`);
       if (code === 401 || code === 403) throw new Error('That link is private — the image must be publicly viewable to fetch it.');
       if (code === 404) throw new Error('That link could not be found (404). Please check it and try again.');
+      if (code === 429) throw new Error('That site is rate-limiting us. Wait a moment and try again, or upload the image instead.');
+      if (code) throw new Error(`That site refused the request (error ${code}). Try downloading the image and uploading it instead.`);
       if (/maxContentLength|content-length/i.test(err.message || '')) throw new Error('That image is too big (over 25 MB).');
-      throw new Error('Could not fetch that link. Please check it opens in your browser.');
+      if (err.code === 'ECONNABORTED') throw new Error('That link took too long to respond. Please try again.');
+      throw new Error('Could not reach that link. Please check it opens in your browser.');
     }
   }
 
