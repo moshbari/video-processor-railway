@@ -57,6 +57,17 @@ const { buildReport } = require('./report');
 const STRUCT_MODEL = process.env.PODCAST_BRAIN_MODEL || 'opus';
 const POST_MODEL = process.env.PODCAST_BRAIN_POST_MODEL || 'opus';
 
+// `opus` is an alias the Claude CLI resolves to the newest Opus, so the
+// subscription path is always on the best one without naming a version here.
+// The API-key fallback needs an explicit id, so it names the current best.
+const API_MODEL = process.env.PODCAST_BRAIN_API_MODEL || 'claude-opus-5';
+
+// Every pass writes a lot: the hooks table is 18-32 exact Bengali quotes, and
+// the post is ~3,000 Bengali words. Bengali runs 3-4x the tokens per character
+// of English, so the SDK default of 8,000 would cut both off mid-sentence.
+const STRUCT_MAX_TOKENS = Number(process.env.PODCAST_BRAIN_MAX_TOKENS) || 32000;
+const POST_MAX_TOKENS = Number(process.env.PODCAST_BRAIN_POST_MAX_TOKENS) || 64000;
+
 // Bengali costs roughly 3-4x the tokens per character of English. An hour-long
 // call is ~86k characters of it, and every pass reads all of them. Ten minutes
 // was sized against a toy transcript; these are sized against a real episode,
@@ -103,13 +114,13 @@ function parsePost(text) {
  * Run one pass. Never throws — returns { ok, data, error } so one bad pass can't
  * take the others down with it.
  */
-async function runPass({ runner, build, args, index, jobId, stamp, json, timeoutMs, system, onProgress }) {
+async function runPass({ runner, build, args, index, jobId, stamp, json, timeoutMs, maxTokens, system, onProgress }) {
   const { prompt, label } = build(args);
   const started = Date.now();
   onProgress?.({ type: 'pass-start', pass: label });
 
   try {
-    const text = await runner({ system, prompt, timeoutMs });
+    const text = await runner({ system, prompt, timeoutMs, maxTokens });
     await savePass(jobId, index, label, text, stamp);
 
     let data = text;
@@ -171,13 +182,11 @@ async function runBrain({
   // post needs its own runner. Passing a model per call would silently run the
   // 3,000-word Bengali post on the fast structural model.
   const structRunner = makeRunner({
-    oauthToken, apiKey, subModel: STRUCT_MODEL,
-    apiModel: process.env.PODCAST_BRAIN_API_MODEL,
+    oauthToken, apiKey, subModel: STRUCT_MODEL, apiModel: API_MODEL,
     emit: null, onUsage: usageFor(STRUCT_MODEL),
   });
   const postRunner = makeRunner({
-    oauthToken, apiKey, subModel: POST_MODEL,
-    apiModel: process.env.PODCAST_BRAIN_POST_API_MODEL || process.env.PODCAST_BRAIN_API_MODEL,
+    oauthToken, apiKey, subModel: POST_MODEL, apiModel: API_MODEL,
     emit: null, onUsage: usageFor(POST_MODEL),
   });
 
@@ -190,31 +199,31 @@ async function runBrain({
   // hooks land, rather than waiting for the slowest of the three.
   const hooksChain = runPass({
     ...common, build: passA.build, args: { transcript },
-    index: 1, json: true, timeoutMs: STRUCT_TIMEOUT_MS,
+    index: 1, json: true, timeoutMs: STRUCT_TIMEOUT_MS, maxTokens: STRUCT_MAX_TOKENS,
   }).then(async (hooksResult) => {
     if (!hooksResult.ok) return { hooksResult, coldOpenResult: { ok: false, error: 'skipped — the hooks pass failed', label: 'coldopen' } };
     const coldOpenResult = await runPass({
       ...common, build: passB.build,
       args: { transcript, hooksJson: JSON.stringify(hooksResult.data, null, 2) },
-      index: 2, json: true, timeoutMs: STRUCT_TIMEOUT_MS,
+      index: 2, json: true, timeoutMs: STRUCT_TIMEOUT_MS, maxTokens: STRUCT_MAX_TOKENS,
     });
     return { hooksResult, coldOpenResult };
   });
 
   const cutsChain = runPass({
     ...common, build: passC.build, args: { transcript },
-    index: 3, json: true, timeoutMs: STRUCT_TIMEOUT_MS,
+    index: 3, json: true, timeoutMs: STRUCT_TIMEOUT_MS, maxTokens: STRUCT_MAX_TOKENS,
   });
 
   const postChain = runPass({
     ...common, runner: postRunner, build: passD.build, args: { transcript },
-    index: 4, json: false, timeoutMs: POST_TIMEOUT_MS,
+    index: 4, json: false, timeoutMs: POST_TIMEOUT_MS, maxTokens: POST_MAX_TOKENS,
   }).then(async (postResult) => {
     if (!postResult.ok) return { postResult, momentMapResult: { ok: false, error: 'skipped — the post pass failed', label: 'momentmap' }, parsed: null };
     const parsed = parsePost(postResult.data);
     const momentMapResult = await runPass({
       ...common, build: passE.build, args: { transcript, post: parsed.body },
-      index: 5, json: true, timeoutMs: STRUCT_TIMEOUT_MS,
+      index: 5, json: true, timeoutMs: STRUCT_TIMEOUT_MS, maxTokens: STRUCT_MAX_TOKENS,
     });
     return { postResult, momentMapResult, parsed };
   });

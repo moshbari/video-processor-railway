@@ -365,9 +365,12 @@ function makeRunner({ oauthToken, apiKey, subModel, apiModel, emit, onUsage }) {
   }
   if (apiKey) {
     // The SDK fallback has no live tool stream; note it once.
-    const apiM = apiModel || 'claude-opus-4-8';
-    return async ({ system, prompt }) => {
-      const { text, usage } = await runApiPass({ apiKey, model: apiM, system, prompt, maxTokens: 8000 });
+    const apiM = apiModel || 'claude-opus-5';
+    return async ({ system, prompt, maxTokens }) => {
+      // maxTokens is per call. The old fixed 8,000 silently truncated anything
+      // long — 3,000 words of Bengali is well past it, because Bengali costs
+      // roughly 3-4x the tokens per character that English does.
+      const { text, usage } = await runApiPass({ apiKey, model: apiM, system, prompt, maxTokens: maxTokens || 8000 });
       if (usage && onUsage) { try { onUsage({ ...usage, model: apiM }); } catch (_) {} }
       return text;
     };
