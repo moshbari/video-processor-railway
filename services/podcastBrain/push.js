@@ -60,21 +60,40 @@ const WAIT_SCHEDULE_MS = [
 ];
 
 /**
- * Write the brain's output onto the saved project, then read it back and check.
+ * Wait until the project exists in the library, or give up.
  *
- * Returns { ok, wrote, error }. `ok:false` means Mosh will open an editor that
- * is missing something — the caller must surface that, never swallow it.
+ * Call this BEFORE running the brain, not after. A transcript aimed at a job id
+ * that does not exist — a typo, a stale extension entry, a project that was
+ * deleted — would otherwise spend five Claude passes producing a perfectly good
+ * analysis with nowhere to put it.
+ *
+ * In the normal flow this returns immediately: the video is prepared long before
+ * the transcript exists, because YouTube takes twenty minutes to three hours to
+ * caption. The waiting is for the abnormal case.
  */
-async function pushToLibrary({ userId, jobId, result, onProgress }) {
-  // 1. Wait for the project to exist.
+async function waitForProject({ userId, jobId, onProgress }) {
   let record = await manualVideoLibraryService.getAnywhere(userId, jobId);
   for (let i = 0; !record && i < WAIT_SCHEDULE_MS.length; i++) {
     onProgress?.({ type: 'waiting-for-project', attempt: i + 1 });
     await sleep(WAIT_SCHEDULE_MS[i]);
     record = await manualVideoLibraryService.getAnywhere(userId, jobId);
   }
+  return record || null;
+}
+
+/**
+ * Write the brain's output onto the saved project, then read it back and check.
+ *
+ * Returns { ok, wrote, error }. `ok:false` means Mosh will open an editor that
+ * is missing something — the caller must surface that, never swallow it.
+ */
+async function pushToLibrary({ userId, jobId, result, onProgress }) {
+  // 1. The project should already be here — the caller waited for it before
+  //    spending anything. Check again anyway; it could have been deleted during
+  //    the twenty minutes the analysis took.
+  const record = await waitForProject({ userId, jobId, onProgress });
   if (!record) {
-    return { ok: false, wrote: [], error: 'The video never appeared in the library, so there was nowhere to put the hooks and cuts.' };
+    return { ok: false, wrote: [], error: 'The video is no longer in the library, so there was nowhere to put the hooks and cuts.' };
   }
 
   // 2. Write each piece, keeping only what actually reported success.
@@ -129,4 +148,4 @@ async function deliver({ userId, jobId, result, onProgress }) {
   return pushToLibrary({ userId, jobId, result, onProgress });
 }
 
-module.exports = { deliver, pushToLibrary, saveResult, loadResult };
+module.exports = { deliver, pushToLibrary, waitForProject, saveResult, loadResult };

@@ -936,10 +936,6 @@ router.post('/podcast-auto/:jobId', async (req, res) => {
       });
     }
 
-    // The video may still be preparing — that is fine and expected. The brain
-    // reads the transcript, and push.js waits for the project before saving.
-    const record = await manualVideoLibraryService.getAnywhere(userId, jobId);
-
     podcastBrainJobs.start(jobId);
     res.json({ success: true, jobId, message: 'Working on the episode. Track progress via the status endpoint.' });
 
@@ -949,6 +945,19 @@ router.post('/podcast-auto/:jobId', async (req, res) => {
     (async () => {
       try {
         const onProgress = (evt) => podcastBrainJobs.emit(jobId, evt);
+
+        // Make sure there is somewhere to put the results BEFORE spending five
+        // Claude passes. Normally instant — the video is prepared long before
+        // YouTube finishes captioning. But a transcript aimed at a job id that
+        // does not exist (a typo, a deleted project, a stale extension entry)
+        // would otherwise produce a perfect analysis with nowhere to go.
+        const record = await podcastBrainPush.waitForProject({ userId, jobId, onProgress });
+        if (!record) {
+          podcastBrainJobs.finish(jobId, {
+            error: 'That episode is not in the editor, so there is nowhere to put the hooks and cuts. Nothing was analysed.',
+          });
+          return;
+        }
 
         const result = await podcastBrain.runBrain({
           transcript: text,
