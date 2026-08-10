@@ -1002,6 +1002,34 @@ router.post('/podcast-auto/:jobId', async (req, res) => {
 });
 
 // ============================================================
+// POST /api/manual-clip/library/:jobId/claim
+// 📥 Adopt a video that was prepared without a user id.
+//
+// Anything prepared anonymously lands in the shared "public" library. It keeps
+// working — every save looks there too — but it never appears in "Your Videos",
+// so a perfectly good upload looks lost. This moves it, with its hooks, cuts,
+// post and report intact, instead of re-uploading the file.
+// ============================================================
+router.post('/library/:jobId/claim', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || req.body?.userId || null;
+    if (!userId) {
+      return res.status(400).json({ success: false, error: 'No user was given, so there is nobody to give the video to.' });
+    }
+
+    const outcome = await manualVideoLibraryService.claim(userId, jobId);
+    if (outcome === 'not-found') {
+      return res.status(404).json({ success: false, error: 'That video is not in the shared library.' });
+    }
+    res.json({ success: true, outcome, alreadyYours: outcome === 'already-yours' });
+  } catch (error) {
+    console.error('[ManualClip] Claim error:', error);
+    res.status(500).json({ success: false, error: 'Could not move that video into your library.' });
+  }
+});
+
+// ============================================================
 // GET /api/manual-clip/podcast-summary/:jobId
 // 🎙️ "Is this episode ready?" in one small answer.
 //

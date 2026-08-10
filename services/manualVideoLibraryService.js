@@ -389,6 +389,39 @@ class ManualVideoLibraryService {
     return found ? found.video : null;
   }
 
+  /**
+   * Move a video out of the shared "public" library and into a user's own.
+   *
+   * A video prepared without a user id lands in the public library. Everything
+   * still WORKS — every update* method looks there too — but it never shows up
+   * in "Your Videos", so from the outside the upload looks lost. This adopts it,
+   * keeping all its marked-up work (hooks, cuts, post, report) intact.
+   *
+   * Returns 'claimed', 'already-yours', or 'not-found'.
+   */
+  async claim(userId, jobId) {
+    if (!userId) return 'not-found';
+
+    const mine = await this.load(userId);
+    if (mine.videos.some(v => v.jobId === jobId)) return 'already-yours';
+
+    const pub = await this.load(null);
+    const idx = pub.videos.findIndex(v => v.jobId === jobId);
+    if (idx === -1) return 'not-found';
+
+    const [record] = pub.videos.splice(idx, 1);
+    mine.videos.unshift(record);
+    mine.videos = mine.videos.slice(0, MAX_VIDEOS);
+
+    // Write the user's copy FIRST. If the second write fails the video is in
+    // both libraries, which is harmless; the other order could lose it entirely.
+    await this.save(userId, mine);
+    await this.save(null, pub);
+
+    console.log(`[VideoLibrary] ${jobId} moved from the public library to ${userId}`);
+    return 'claimed';
+  }
+
   async remove(userId, jobId, { deleteSource = false } = {}) {
     const data = await this.load(userId);
     const target = data.videos.find(v => v.jobId === jobId);
