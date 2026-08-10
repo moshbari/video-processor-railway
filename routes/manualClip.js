@@ -919,20 +919,15 @@ router.post('/podcast-auto/:jobId', async (req, res) => {
     const userId = req.headers['x-user-id'] || null;
     const { transcript, youtubeUrl, speakers, oauthToken } = req.body || {};
 
-    if (!transcript || !String(transcript).trim()) {
-      return res.status(400).json({ success: false, error: 'No transcript was sent, so there is nothing to work from.' });
-    }
-
-    if (podcastBrainJobs.isRunning(jobId)) {
-      return res.json({ success: true, jobId, alreadyRunning: true, message: 'That episode is already being worked on.' });
-    }
-
     // 🛟 Re-push a previous run instead of paying for a new one.
     //
-    // The editor auto-saves its queues, and an empty editor left open on a
-    // project that is being analysed will save its emptiness over the results.
-    // Every run is archived to R2 the moment it finishes, so getting the hooks
-    // back is a re-push, not a re-analysis — no Claude passes, no waiting.
+    // Checked FIRST, and deliberately before the transcript check — a re-push
+    // reads the archived result from R2 and needs no transcript at all.
+    //
+    // Why it exists: the editor auto-saves its queues, so an empty editor left
+    // open on a project that is being analysed can save its emptiness over the
+    // results. Every run is archived to R2 the moment it finishes, so getting
+    // the hooks back is a re-push, not a re-analysis — no Claude passes, no wait.
     if (req.body?.repush) {
       const saved = await podcastBrainPush.loadResult(jobId);
       if (!saved) {
@@ -947,6 +942,14 @@ router.post('/podcast-auto/:jobId', async (req, res) => {
         cuts: saved.cuts?.length || 0,
         error: push.error,
       });
+    }
+
+    if (!transcript || !String(transcript).trim()) {
+      return res.status(400).json({ success: false, error: 'No transcript was sent, so there is nothing to work from.' });
+    }
+
+    if (podcastBrainJobs.isRunning(jobId)) {
+      return res.json({ success: true, jobId, alreadyRunning: true, message: 'That episode is already being worked on.' });
     }
 
     const token = oauthToken || process.env.CLAUDE_CODE_OAUTH_TOKEN;
