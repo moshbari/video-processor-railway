@@ -43,15 +43,26 @@ const passE = require('./prompts/e-momentmap');
 const { buildHooks, buildCuts, buildSocialPost } = require('./assemble');
 const { buildReport } = require('./report');
 
-// Structural passes are fine on the faster model; the 3,000-word Bengali post is
-// the one that visibly benefits from the stronger one.
-const STRUCT_MODEL = process.env.PODCAST_BRAIN_MODEL || 'sonnet';
+// Measured on a real 1h55m Bengali call (839 cues, 86k characters):
+//
+//   post   on opus    → finished in 251s
+//   hooks  on sonnet  → still going at 600s, killed by the timeout
+//   cuts   on sonnet  → still going at 600s, killed by the timeout
+//
+// So the first guesses here were wrong in both directions. The hooks pass is not
+// the "cheap structural" job it looks like — it re-reads the whole call twice by
+// instruction and emits 18-32 exact Bengali quotes with timestamps, which is
+// comparable work to writing the post. Opus did the larger job in a fraction of
+// the time sonnet needed for a smaller one, so everything runs on it.
+const STRUCT_MODEL = process.env.PODCAST_BRAIN_MODEL || 'opus';
 const POST_MODEL = process.env.PODCAST_BRAIN_POST_MODEL || 'opus';
 
-// Bengali costs roughly 3-4x the tokens per character of English, and the post
-// pass writes ~3,000 words of it, so it gets a much longer leash than the rest.
-const STRUCT_TIMEOUT_MS = Number(process.env.PODCAST_BRAIN_TIMEOUT_MS) || 10 * 60 * 1000;
-const POST_TIMEOUT_MS = Number(process.env.PODCAST_BRAIN_POST_TIMEOUT_MS) || 20 * 60 * 1000;
+// Bengali costs roughly 3-4x the tokens per character of English. An hour-long
+// call is ~86k characters of it, and every pass reads all of them. Ten minutes
+// was sized against a toy transcript; these are sized against a real episode,
+// with room for one that runs long rather than a second wasted run.
+const STRUCT_TIMEOUT_MS = Number(process.env.PODCAST_BRAIN_TIMEOUT_MS) || 25 * 60 * 1000;
+const POST_TIMEOUT_MS = Number(process.env.PODCAST_BRAIN_POST_TIMEOUT_MS) || 30 * 60 * 1000;
 
 /**
  * Save one pass's raw output to R2.

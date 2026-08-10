@@ -32,6 +32,39 @@ const { toSeconds } = require('./timecode');
  * Lines that aren't cues (the title, the URL, blanks) are kept out of the cue
  * list but not thrown away — the header is useful context for the model.
  */
+/**
+ * Strip YouTube's spoken-duration prefix from a caption line.
+ *
+ * Scraped from the transcript panel, cues often arrive with the timestamp
+ * repeated as words before the actual speech:
+ *
+ *   "0:06 - 6 seconds আসসালামু আলাইকুম"
+ *   "1:55:27 - 1 hour, 55 minutes, 27 seconds যাক ভাই"
+ *
+ * That is an accessibility label, not something anyone said. Left in, it ends
+ * up inside the hook quotes.
+ *
+ * It is only removed when the phrase adds up to the SAME time as the cue — so a
+ * line where someone genuinely says "30 seconds" keeps its words.
+ */
+function stripSpokenDuration(text, cueSeconds) {
+  const m = String(text).match(
+    /^\s*(?:(\d+)\s*hours?)?[, ]*(?:(\d+)\s*minutes?)?[, ]*(?:(\d+)\s*seconds?)?[, ]*\s*/i
+  );
+  if (!m || !m[0].trim()) return text;
+
+  const h = m[1] ? parseInt(m[1], 10) : 0;
+  const mi = m[2] ? parseInt(m[2], 10) : 0;
+  const s = m[3] ? parseInt(m[3], 10) : 0;
+  if (!m[1] && !m[2] && !m[3]) return text;
+
+  const spoken = h * 3600 + mi * 60 + s;
+  if (Math.abs(spoken - cueSeconds) > 1) return text; // real speech, leave it
+
+  const rest = text.slice(m[0].length).trim();
+  return rest || text; // never blank a line out entirely
+}
+
 function parseTranscript(raw) {
   const lines = String(raw || '').split(/\r?\n/);
   const cues = [];
@@ -42,7 +75,7 @@ function parseTranscript(raw) {
     if (m) {
       const at = toSeconds(m[1]);
       if (at !== null) {
-        cues.push({ at, text: m[2].trim() });
+        cues.push({ at, text: stripSpokenDuration(m[2].trim(), at) });
         continue;
       }
     }
