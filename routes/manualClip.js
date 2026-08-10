@@ -1002,6 +1002,55 @@ router.post('/podcast-auto/:jobId', async (req, res) => {
 });
 
 // ============================================================
+// GET /api/manual-clip/podcast-summary/:jobId
+// 🎙️ "Is this episode ready?" in one small answer.
+//
+// Deliberately light and public-ish — it's polled from the tellatotube page so
+// Mosh can see, from where he pasted the link, whether an episode is still
+// waiting on YouTube's captions, being analysed, or done. Returns counts only,
+// never the post or the report.
+// ============================================================
+router.get('/podcast-summary/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || req.query.userId || null;
+    const record = await manualVideoLibraryService.getAnywhere(userId, jobId);
+
+    if (!record) {
+      return res.json({ success: true, exists: false, stage: 'missing' });
+    }
+
+    const run = podcastBrainJobs.read(jobId, 0);
+    const hooks = (record.hooks || []).length;
+    const cuts = (record.cuts || []).length;
+    const hasSocialPost = !!record.socialPost;
+
+    // What stage is this episode at, in the order Mosh experiences it?
+    let stage = 'editable';                       // video is in, nothing analysed yet
+    if (run?.status === 'running') stage = 'analysing';
+    else if (hooks || cuts || hasSocialPost) stage = 'ready';
+    else if (run?.status === 'error') stage = 'failed';
+
+    res.json({
+      success: true,
+      exists: true,
+      stage,
+      title: record.title || '',
+      durationFormatted: record.durationFormatted || '',
+      hooks,
+      cuts,
+      hasSocialPost,
+      error: run?.status === 'error' ? run.error : null,
+      // The newest progress line, so the page can say what it's working on.
+      message: run?.events?.length ? run.events[run.events.length - 1].message : null,
+    });
+  } catch (error) {
+    console.error('[PodcastBrain] Summary error:', error);
+    res.status(500).json({ success: false, error: 'Could not check that episode.' });
+  }
+});
+
+// ============================================================
 // GET /api/manual-clip/podcast-auto/:jobId/status?after=N
 // Poll a Podcast Brain run. `after` is how many events you have already seen,
 // so each call returns only what is new (same pattern as Pro-Rant renders).
