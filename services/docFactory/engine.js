@@ -644,6 +644,10 @@ module.exports = {
   rawScene,
   buildPanel,
   extractJson,
+  // makeRunner is shared with the Podcast Brain (services/podcastBrain) so both
+  // features talk to Claude the same way — subscription token first, API key as
+  // a fallback — instead of each growing its own copy of the auth logic.
+  makeRunner,
   sanitizeClaudeToken,
   bgHex,
 };

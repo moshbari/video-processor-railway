@@ -73,20 +73,44 @@ class ManualVideoLibraryService {
   }
 
   /**
+   * Find the video record for a jobId, checking the user's own library first and
+   * the shared "public" one second (a video may have been prepared before the
+   * user signed in). Returns { owner, data, video } or null when it's nowhere.
+   *
+   * Every update* method goes through this so they all agree on where a video
+   * lives. They used to disagree — updateHooks looked only in the user's library
+   * while updateCuts checked both — which meant a video prepared anonymously
+   * would silently keep its cuts and silently lose its hooks.
+   */
+  async _findVideo(userId, jobId) {
+    for (const owner of [userId, null]) {
+      const data = await this.load(owner);
+      const video = data.videos.find(x => x.jobId === jobId);
+      if (video) return { owner, data, video };
+    }
+    return null;
+  }
+
+  /**
    * Save the user's marked hooks for one video (auto-save from the editor).
    * Stored as a lean array: { title, startTime, endTime, order }.
+   *
+   * Returns true when the hooks were stored, false when the video isn't in the
+   * library yet. Anything writing hooks automatically (rather than from a person
+   * clicking in the editor) MUST check this — a false here is the difference
+   * between "saved" and "silently thrown away".
    */
   async updateHooks(userId, jobId, hooks) {
-    const data = await this.load(userId);
-    const v = data.videos.find(x => x.jobId === jobId);
-    if (!v) return; // video not in library (e.g. prepared before this feature)
-    v.hooks = (Array.isArray(hooks) ? hooks : []).map(h => ({
+    const found = await this._findVideo(userId, jobId);
+    if (!found) return false; // video not in library (e.g. still being prepared)
+    found.video.hooks = (Array.isArray(hooks) ? hooks : []).map(h => ({
       title: h.title || '',
       startTime: Number(h.startTime) || 0,
       endTime: Number(h.endTime) || 0,
       order: Number(h.order) || 0,
     }));
-    await this.save(userId, data);
+    await this.save(found.owner, found.data);
+    return true;
   }
 
   /**
@@ -96,20 +120,41 @@ class ManualVideoLibraryService {
    * one (a video may have been saved under either).
    */
   async updateCuts(userId, jobId, cuts) {
-    const lean = (Array.isArray(cuts) ? cuts : []).map(c => ({
+    const found = await this._findVideo(userId, jobId);
+    if (!found) return false;
+    found.video.cuts = (Array.isArray(cuts) ? cuts : []).map(c => ({
       title: c.title || '',
       startTime: Number(c.startTime) || 0,
       endTime: Number(c.endTime) || 0,
     }));
-    for (const owner of [userId, null]) {
-      const data = await this.load(owner);
-      const v = data.videos.find(x => x.jobId === jobId);
-      if (v) {
-        v.cuts = lean;
-        await this.save(owner, data);
-        return;
-      }
-    }
+    await this.save(found.owner, found.data);
+    return true;
+  }
+
+  /**
+   * Save the Facebook/social post the Podcast Brain wrote for this episode.
+   * Plain text (usually Bengali, ~3,000 words) — the editor shows it in a copy box.
+   */
+  async updateSocialPost(userId, jobId, socialPost) {
+    const found = await this._findVideo(userId, jobId);
+    if (!found) return false;
+    found.video.socialPost = typeof socialPost === 'string' ? socialPost : '';
+    await this.save(found.owner, found.data);
+    return true;
+  }
+
+  /**
+   * Save the full Podcast Brain report (markdown): the hooks table, the cold-open
+   * montage, the bench, USE WITH CARE flags and the moment map. Everything the
+   * brain produced that isn't directly a hook or a cut lives here so Mosh can
+   * read it beside the video and swap slots by hand.
+   */
+  async updateBrainReport(userId, jobId, report) {
+    const found = await this._findVideo(userId, jobId);
+    if (!found) return false;
+    found.video.brainReport = typeof report === 'string' ? report : '';
+    await this.save(found.owner, found.data);
+    return true;
   }
 
   /**
@@ -332,6 +377,16 @@ class ManualVideoLibraryService {
   async get(userId, jobId) {
     const data = await this.load(userId);
     return data.videos.find(v => v.jobId === jobId) || null;
+  }
+
+  /**
+   * Like get(), but falls back to the shared "public" library — the same
+   * user-then-public lookup every update* method does. Use this anywhere you
+   * need to READ a video that might have been prepared before the user signed in.
+   */
+  async getAnywhere(userId, jobId) {
+    const found = await this._findVideo(userId, jobId);
+    return found ? found.video : null;
   }
 
   async remove(userId, jobId, { deleteSource = false } = {}) {

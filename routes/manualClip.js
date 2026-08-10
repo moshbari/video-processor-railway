@@ -18,6 +18,10 @@ const manualClipService = require('../services/manualClipService');
 const manualVideoLibraryService = require('../services/manualVideoLibraryService');
 const ctaLibraryService = require('../services/ctaLibraryService');
 const voiceService = require('../services/voiceService');
+const podcastBrain = require('../services/podcastBrain');
+const podcastBrainJobs = require('../services/podcastBrain/jobs');
+const podcastBrainPush = require('../services/podcastBrain/push');
+const { buildTranscriptForModel } = require('../services/podcastBrain/speakers');
 
 // Upload directory for manual clip videos
 const uploadDir = path.join(process.env.TEMP_DIR || '/app/temp', 'manual-uploads');
@@ -879,10 +883,179 @@ router.post('/restore/:jobId', async (req, res) => {
       backgroundSections: record.backgroundSections || [],
       removeSilences: !!record.removeSilences,
       levelAudio: !!record.levelAudio,
+      // 🎙️ Podcast Brain output, when this episode has been analysed.
+      socialPost: record.socialPost || '',
+      brainReport: record.brainReport || '',
     });
   } catch (error) {
     console.error('[ManualClip] Restore error:', error);
     res.status(500).json({ success: false, error: 'Could not reopen that video.' });
+  }
+});
+
+// ============================================================
+// POST /api/manual-clip/podcast-auto/:jobId
+// 🎙️ PODCAST BRAIN — hand it the episode's transcript and it fills the editor.
+//
+// Runs Mosh's podcast-editing instructions as five Claude passes, then writes
+// the results straight onto the saved project: the hooks queue, the Danger Zone
+// cuts, the Facebook post and a report of everything else it found.
+//
+// Async: returns immediately, progress via GET /podcast-auto/:jobId/status.
+// A run can take twenty minutes, so nothing holds a request open.
+//
+// Body: {
+//   transcript   (required) timestamped transcript, "0:08 - text" per line
+//   youtubeUrl   (optional) where it came from, for the log
+//   speakers     (optional) detect-speakers output; without it the passes are
+//                told plainly that they cannot know who spoke, rather than
+//                being left to guess
+//   oauthToken   (optional) Claude subscription token; falls back to the server's
+// }
+// ============================================================
+router.post('/podcast-auto/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const { transcript, youtubeUrl, speakers, oauthToken } = req.body || {};
+
+    if (!transcript || !String(transcript).trim()) {
+      return res.status(400).json({ success: false, error: 'No transcript was sent, so there is nothing to work from.' });
+    }
+
+    if (podcastBrainJobs.isRunning(jobId)) {
+      return res.json({ success: true, jobId, alreadyRunning: true, message: 'That episode is already being worked on.' });
+    }
+
+    const token = oauthToken || process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!token && !apiKey && process.env.DOC_FACTORY_LOCAL_AUTH !== '1') {
+      return res.status(400).json({
+        success: false,
+        error: 'No Claude is connected to this server yet, so the episode cannot be analysed.',
+      });
+    }
+
+    // The video may still be preparing — that is fine and expected. The brain
+    // reads the transcript, and push.js waits for the project before saving.
+    const record = await manualVideoLibraryService.getAnywhere(userId, jobId);
+
+    podcastBrainJobs.start(jobId);
+    res.json({ success: true, jobId, message: 'Working on the episode. Track progress via the status endpoint.' });
+
+    const { text, hasSpeakers, cueCount } = buildTranscriptForModel(transcript, speakers);
+    console.log(`[PodcastBrain] ${jobId}: ${cueCount} cues, speakers=${hasSpeakers}, from ${youtubeUrl || 'unknown source'}`);
+
+    (async () => {
+      try {
+        const onProgress = (evt) => podcastBrainJobs.emit(jobId, evt);
+
+        const result = await podcastBrain.runBrain({
+          transcript: text,
+          hasSpeakers,
+          videoDuration: record?.duration || 0,
+          videoTitle: record?.title || '',
+          jobId,
+          userId,
+          oauthToken: token,
+          apiKey,
+          onProgress,
+        });
+
+        const push = await podcastBrainPush.deliver({ userId, jobId, result, onProgress });
+
+        if (!push.ok) {
+          // The analysis succeeded but the editor did not receive it. That must
+          // be visible — a quiet failure here looks exactly like an empty episode.
+          podcastBrainJobs.finish(jobId, {
+            error: `The episode was analysed but could not be saved to the editor: ${push.error}`,
+          });
+          return;
+        }
+
+        podcastBrainJobs.finish(jobId, {
+          result: {
+            hooks: result.hooks.length,
+            cuts: result.cuts.length,
+            hasSocialPost: !!result.socialPost,
+            failedPasses: result.failures.map(f => f.pass),
+          },
+        });
+      } catch (error) {
+        console.error('[PodcastBrain] Run failed:', error);
+        podcastBrainJobs.finish(jobId, { error: error.message || 'The episode could not be analysed.' });
+      }
+    })();
+  } catch (error) {
+    console.error('[PodcastBrain] Route error:', error);
+    res.status(500).json({ success: false, error: 'Could not start analysing that episode.' });
+  }
+});
+
+// ============================================================
+// GET /api/manual-clip/podcast-auto/:jobId/status?after=N
+// Poll a Podcast Brain run. `after` is how many events you have already seen,
+// so each call returns only what is new (same pattern as Pro-Rant renders).
+// ============================================================
+router.get('/podcast-auto/:jobId/status', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const state = podcastBrainJobs.read(jobId, req.query.after);
+
+    if (!state) {
+      // Not in memory. Either it never ran, or the server restarted — in which
+      // case the finished work is still in R2, so say so rather than "unknown".
+      const saved = await podcastBrainPush.loadResult(jobId);
+      if (saved) {
+        return res.json({
+          success: true, status: 'complete', events: [], nextCursor: 0,
+          result: { hooks: saved.hooks?.length || 0, cuts: saved.cuts?.length || 0, hasSocialPost: !!saved.socialPost },
+          note: 'This finished earlier — reopen the project to see it.',
+        });
+      }
+      return res.status(404).json({ success: false, error: 'No analysis has been run for that episode.' });
+    }
+
+    res.json({ success: true, ...state });
+  } catch (error) {
+    console.error('[PodcastBrain] Status error:', error);
+    res.status(500).json({ success: false, error: 'Could not check on that episode.' });
+  }
+});
+
+// ============================================================
+// PUT /api/manual-clip/library/:jobId/socialpost
+// Save the Facebook post for a saved video (Bengali, ~3,000 words).
+// Body: { socialPost: string }
+// ============================================================
+router.put('/library/:jobId/socialpost', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const stored = await manualVideoLibraryService.updateSocialPost(userId, jobId, req.body?.socialPost || '');
+    if (!stored) return res.status(404).json({ success: false, error: 'That video is no longer available.' });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[ManualClip] Save social post error:', error);
+    res.status(500).json({ success: false, error: 'Could not save your post.' });
+  }
+});
+
+// ============================================================
+// PUT /api/manual-clip/library/:jobId/brainreport
+// Save the Podcast Brain report (markdown) for a saved video.
+// Body: { brainReport: string }
+// ============================================================
+router.put('/library/:jobId/brainreport', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const stored = await manualVideoLibraryService.updateBrainReport(userId, jobId, req.body?.brainReport || '');
+    if (!stored) return res.status(404).json({ success: false, error: 'That video is no longer available.' });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[ManualClip] Save brain report error:', error);
+    res.status(500).json({ success: false, error: 'Could not save the report.' });
   }
 });
 
