@@ -927,6 +927,28 @@ router.post('/podcast-auto/:jobId', async (req, res) => {
       return res.json({ success: true, jobId, alreadyRunning: true, message: 'That episode is already being worked on.' });
     }
 
+    // 🛟 Re-push a previous run instead of paying for a new one.
+    //
+    // The editor auto-saves its queues, and an empty editor left open on a
+    // project that is being analysed will save its emptiness over the results.
+    // Every run is archived to R2 the moment it finishes, so getting the hooks
+    // back is a re-push, not a re-analysis — no Claude passes, no waiting.
+    if (req.body?.repush) {
+      const saved = await podcastBrainPush.loadResult(jobId);
+      if (!saved) {
+        return res.status(404).json({ success: false, error: 'There is no earlier analysis saved for that episode.' });
+      }
+      const push = await podcastBrainPush.pushToLibrary({ userId, jobId, result: saved });
+      return res.json({
+        success: push.ok,
+        jobId,
+        repushed: push.ok,
+        hooks: saved.hooks?.length || 0,
+        cuts: saved.cuts?.length || 0,
+        error: push.error,
+      });
+    }
+
     const token = oauthToken || process.env.CLAUDE_CODE_OAUTH_TOKEN;
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!token && !apiKey && process.env.DOC_FACTORY_LOCAL_AUTH !== '1') {
