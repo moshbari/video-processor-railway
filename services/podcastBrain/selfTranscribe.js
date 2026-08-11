@@ -98,19 +98,32 @@ async function transcribeEpisode({ jobId, userId, onProgress }) {
       // Long episode — same chunk-and-offset approach the AI Clip Maker uses.
       // Each chunk's timestamps are relative to itself, so they are shifted
       // back onto the episode's own clock before being joined.
-      const total = Math.max(1, Math.ceil((durationSec || CHUNK_SECONDS) / CHUNK_SECONDS));
-      for (let i = 0; i < total; i++) {
+      //
+      // The chunk count is NOT taken from the stored duration. A missing or
+      // zero duration would have silently produced a single chunk — the first
+      // ten minutes of a two-hour call transcribed, the rest thrown away, and a
+      // perfectly confident-looking result. Instead we keep cutting until a
+      // chunk comes back with no audio in it, which is the file actually
+      // telling us it has ended. The stored duration is used only to estimate
+      // how many parts to promise in the progress message.
+      const estimated = durationSec ? Math.ceil(durationSec / CHUNK_SECONDS) : 0;
+      const MAX_CHUNKS = 60;           // 10 hours; a backstop, never a real limit
+      for (let i = 0; i < MAX_CHUNKS; i++) {
         const offset = i * CHUNK_SECONDS;
         const chunkPath = path.join(workDir, `chunk_${i + 1}.mp3`);
         onProgress?.({
           type: 'transcribe-progress',
-          message: `Listening to the episode… part ${i + 1} of ${total}`,
+          message: estimated
+            ? `Listening to the episode… part ${i + 1} of ${estimated}`
+            : `Listening to the episode… part ${i + 1}`,
         });
         await extractAudio(videoPath, chunkPath, { seek: offset, duration: CHUNK_SECONDS });
 
-        // A final chunk can land past the end of the file and come back empty.
-        const chunkSize = (await fs.stat(chunkPath)).size;
-        if (chunkSize < 2048) { await fs.remove(chunkPath).catch(() => {}); continue; }
+        // An empty chunk means we have run off the end of the file. That is the
+        // end of the episode, so stop — don't skip and keep going, or a silent
+        // gap mid-call would look like the end.
+        const chunkSize = (await fs.stat(chunkPath).catch(() => ({ size: 0 }))).size;
+        if (chunkSize < 2048) { await fs.remove(chunkPath).catch(() => {}); break; }
 
         const out = await transcriptionService.transcribe(chunkPath, { response_format: 'verbose_json' });
         language = language || out.language;
@@ -118,6 +131,7 @@ async function transcribeEpisode({ jobId, userId, onProgress }) {
           segments.push({ ...seg, start: (seg.start || 0) + offset, end: (seg.end || 0) + offset });
         }
         await fs.remove(chunkPath).catch(() => {});
+        if (estimated && i + 1 >= estimated && durationSec && offset + CHUNK_SECONDS >= durationSec) break;
       }
     }
 
