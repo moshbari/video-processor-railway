@@ -21,6 +21,7 @@ const voiceService = require('../services/voiceService');
 const podcastBrain = require('../services/podcastBrain');
 const podcastBrainJobs = require('../services/podcastBrain/jobs');
 const podcastBrainPush = require('../services/podcastBrain/push');
+const podcastSelfTranscribe = require('../services/podcastBrain/selfTranscribe');
 const { buildTranscriptForModel } = require('../services/podcastBrain/speakers');
 
 // Upload directory for manual clip videos
@@ -1022,6 +1023,125 @@ router.post('/podcast-auto/:jobId', async (req, res) => {
     })();
   } catch (error) {
     console.error('[PodcastBrain] Route error:', error);
+    res.status(500).json({ success: false, error: 'Could not start analysing that episode.' });
+  }
+});
+
+// ============================================================
+// POST /api/manual-clip/podcast-analyze-self/:jobId
+// 🎧 THE SELF-SERVE PATH — analyse an episode with no browser involved.
+//
+// Identical to podcast-auto above, except nobody has to bring us a transcript:
+// the video is already in our own R2 bucket, so we listen to it ourselves.
+//
+// This is the path that should normally run. The transcript-in-the-body route
+// above is now the fallback, kept because it still works and costs nothing when
+// YouTube has already done the captioning.
+//
+// Why: the old route could only be reached through Mosh's browser — the upload
+// page had to hand the project id to a Chrome extension, which had to survive
+// up to three hours of polling YouTube with Chrome awake, then post the
+// transcript back. That chain broke three times in two days and never once said
+// so. Here there is no chain: prepare finishes, we transcribe, the Brain runs.
+//
+// Body: { oauthToken?, force? }  — nothing else is needed.
+// ============================================================
+router.post('/podcast-analyze-self/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const { oauthToken, force } = req.body || {};
+
+    if (podcastBrainJobs.isRunning(jobId)) {
+      return res.json({ success: true, jobId, alreadyRunning: true, message: 'That episode is already being worked on.' });
+    }
+
+    // Don't pay to analyse the same episode twice. `force` overrides, for a
+    // re-run after the transcript or the instructions have changed.
+    if (!force) {
+      const already = await podcastBrainPush.loadResult(jobId);
+      if (already) {
+        const push = await podcastBrainPush.pushToLibrary({ userId, jobId, result: already });
+        return res.json({
+          success: push.ok, jobId, repushed: push.ok,
+          hooks: already.hooks?.length || 0,
+          cuts: already.cuts?.length || 0,
+          message: 'This episode was already analysed — the saved results were put back in the editor.',
+          error: push.error,
+        });
+      }
+    }
+
+    const token = oauthToken || process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!token && !apiKey && process.env.DOC_FACTORY_LOCAL_AUTH !== '1') {
+      return res.status(400).json({
+        success: false,
+        error: 'No Claude is connected to this server yet, so the episode cannot be analysed.',
+      });
+    }
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(400).json({
+        success: false,
+        error: 'This server cannot listen to episodes yet — transcription is not configured.',
+      });
+    }
+
+    podcastBrainJobs.start(jobId);
+    res.json({ success: true, jobId, message: 'Listening to the episode. Track progress via the status endpoint.' });
+
+    (async () => {
+      try {
+        const onProgress = (evt) => podcastBrainJobs.emit(jobId, evt);
+
+        const record = await podcastBrainPush.waitForProject({ userId, jobId, onProgress });
+        if (!record) {
+          podcastBrainJobs.finish(jobId, {
+            error: 'That episode is not in the editor, so there is nowhere to put the hooks and cuts. Nothing was analysed.',
+          });
+          return;
+        }
+
+        // Listen first. If this fails, nothing has been spent on Claude.
+        const heard = await podcastSelfTranscribe.transcribeEpisode({ jobId, userId, onProgress });
+        const { text, hasSpeakers, cueCount } = buildTranscriptForModel(heard.transcript, null);
+        console.log(`[PodcastBrain] ${jobId}: ${cueCount} cues from our own copy (${heard.language || '?'})`);
+
+        const result = await podcastBrain.runBrain({
+          transcript: text,
+          hasSpeakers,
+          videoDuration: record?.duration || 0,
+          videoTitle: record?.title || '',
+          jobId,
+          userId,
+          oauthToken: token,
+          apiKey,
+          onProgress,
+        });
+
+        const push = await podcastBrainPush.deliver({ userId, jobId, result, onProgress });
+        if (!push.ok) {
+          podcastBrainJobs.finish(jobId, {
+            error: `The episode was analysed but could not be saved to the editor: ${push.error}`,
+          });
+          return;
+        }
+
+        podcastBrainJobs.finish(jobId, {
+          result: {
+            hooks: result.hooks.length,
+            cuts: result.cuts.length,
+            hasSocialPost: !!result.socialPost,
+            failedPasses: result.failures.map(f => f.pass),
+          },
+        });
+      } catch (error) {
+        console.error('[PodcastBrain] Self-analysis failed:', error);
+        podcastBrainJobs.finish(jobId, { error: error.message || 'The episode could not be analysed.' });
+      }
+    })();
+  } catch (error) {
+    console.error('[PodcastBrain] Self route error:', error);
     res.status(500).json({ success: false, error: 'Could not start analysing that episode.' });
   }
 });
