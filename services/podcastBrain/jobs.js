@@ -12,12 +12,18 @@
  * a twenty-minute run.
  */
 
+const notify = require('./notify');
+
 const JOBS = new Map();
 const TTL_MS = 6 * 60 * 60 * 1000; // keep finished runs readable for six hours
 
-function start(jobId) {
+function start(jobId, meta = {}) {
   JOBS.set(jobId, {
     jobId,
+    // Carried so the finish announcement can name the episode instead of
+    // reading a job id out to a person.
+    userId: meta.userId || null,
+    title: meta.title || '',
     status: 'running',
     startedAt: Date.now(),
     finishedAt: null,
@@ -26,6 +32,14 @@ function start(jobId) {
     error: null,
   });
   return JOBS.get(jobId);
+}
+
+/** Name the episode once we learn it — the title isn't known at start time. */
+function describeJob(jobId, meta = {}) {
+  const job = JOBS.get(jobId);
+  if (!job) return;
+  if (meta.title) job.title = meta.title;
+  if (meta.userId) job.userId = meta.userId;
 }
 
 /** Human-readable line for each machine event the brain emits. */
@@ -55,6 +69,18 @@ function finish(jobId, { result, error }) {
   job.error = error || null;
   job.result = result || null;
   job.finishedAt = Date.now();
+
+  // 📣 Every run ends here, whichever way it ended — so this is the one place
+  // the announcement belongs. Wiring it into each route's exit paths instead
+  // would mean four call sites and a fifth one added later that forgets.
+  //
+  // Not awaited: the caller is finishing a run, not waiting on a webhook. It
+  // cannot throw (see notify.js), and .catch is belt to that braces.
+  notify.episodeFinished({
+    jobId, userId: job.userId, title: job.title,
+    result: error ? null : result, error,
+  }).catch(() => {});
+
   setTimeout(() => JOBS.delete(jobId), TTL_MS).unref?.();
 }
 
@@ -78,4 +104,4 @@ function isRunning(jobId) {
   return JOBS.get(jobId)?.status === 'running';
 }
 
-module.exports = { start, emit, finish, read, isRunning };
+module.exports = { start, describeJob, emit, finish, read, isRunning };

@@ -984,6 +984,9 @@ router.post('/podcast-auto/:jobId', async (req, res) => {
           });
           return;
         }
+        // Now we know what it's called — so the finish announcement can say the
+        // episode's name rather than reading out a job id.
+        podcastBrainJobs.describeJob(jobId, { userId, title: record.title });
 
         const result = await podcastBrain.runBrain({
           transcript: text,
@@ -1101,6 +1104,9 @@ router.post('/podcast-analyze-self/:jobId', async (req, res) => {
           });
           return;
         }
+        // Now we know what it's called — so the finish announcement can say the
+        // episode's name rather than reading out a job id.
+        podcastBrainJobs.describeJob(jobId, { userId, title: record.title });
 
         // Listen first. If this fails, nothing has been spent on Claude.
         const heard = await podcastSelfTranscribe.transcribeEpisode({ jobId, userId, onProgress });
