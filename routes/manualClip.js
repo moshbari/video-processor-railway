@@ -828,6 +828,9 @@ router.get('/library', async (req, res) => {
       fileSize: v.fileSize,
       createdAt: v.createdAt,
       normalized: !!v.normalized,
+      // 🎙️ Ship the Podcast Brain's social post with the list so the library can
+      // offer "Copy Social Post" without opening the project first.
+      socialPost: typeof v.socialPost === 'string' ? v.socialPost : '',
     }));
     res.json({ success: true, videos: slim });
   } catch (error) {
