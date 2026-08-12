@@ -22,7 +22,7 @@ const podcastBrain = require('../services/podcastBrain');
 const podcastBrainJobs = require('../services/podcastBrain/jobs');
 const podcastBrainPush = require('../services/podcastBrain/push');
 const podcastSelfTranscribe = require('../services/podcastBrain/selfTranscribe');
-const { buildTranscriptForModel } = require('../services/podcastBrain/speakers');
+const { buildTranscriptForModel, parseTranscript } = require('../services/podcastBrain/speakers');
 
 // Upload directory for manual clip videos
 const uploadDir = path.join(process.env.TEMP_DIR || '/app/temp', 'manual-uploads');
@@ -1002,6 +1002,28 @@ router.post('/podcast-auto/:jobId', async (req, res) => {
         // Now we know what it's called — so the finish announcement can say the
         // episode's name rather than reading out a job id.
         podcastBrainJobs.describeJob(jobId, { userId, title: record.title });
+
+        // ⛔ Does this transcript even belong to this video?
+        //
+        // A transcript that runs well past the end of the episode cannot be of
+        // the episode — it is another recording. That happened for real: a
+        // 42-minute transcript of the WRONG call was analysed against a
+        // 31-minute video, and produced a flawless report full of quotes that
+        // are nowhere in it. Wrong is far more expensive than late here, so this
+        // stops rather than warns. (Short transcripts are NOT rejected: silence
+        // and music legitimately produce no cues.)
+        //
+        // Uses the transcript parser rather than a regex of its own, so speaker
+        // labels, H:MM:SS and every other shape it already handles keep working.
+        const cues = parseTranscript(transcript).cues;
+        const lastCue = cues.length ? Math.max(...cues.map(c => c.at)) : 0;
+        const episodeLength = Number(record?.duration) || 0;
+        if (episodeLength && lastCue > episodeLength + 120) {
+          podcastBrainJobs.finish(jobId, {
+            error: `This transcript is not for this episode. It runs to ${Math.round(lastCue / 60)} minutes, but "${record.title}" is only ${Math.round(episodeLength / 60)} minutes long — so it belongs to a different, longer recording. Nothing was analysed and nothing in your editor was changed. Check the YouTube link on this project.`,
+          });
+          return;
+        }
 
         const result = await podcastBrain.runBrain({
           transcript: text,
