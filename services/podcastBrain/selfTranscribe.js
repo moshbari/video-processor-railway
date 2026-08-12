@@ -153,15 +153,34 @@ function looksLooped(segments) {
  */
 async function transcribeChunkWithRetries(chunkPath, { language, onProgress, label }) {
   let last = { segments: [], language: null };
+  let hint = language || null;
+  let languageRejected = false;
 
   for (let i = 0; i < CHUNK_ATTEMPT_TEMPERATURES.length; i++) {
-    const out = await transcriptionService.transcribe(chunkPath, {
-      response_format: 'verbose_json',
-      temperature: CHUNK_ATTEMPT_TEMPERATURES[i],
-      language: language || undefined,
-    });
+    let out;
+    try {
+      out = await transcriptionService.transcribe(chunkPath, {
+        response_format: 'verbose_json',
+        temperature: CHUNK_ATTEMPT_TEMPERATURES[i],
+        language: hint || undefined,
+      });
+    } catch (err) {
+      // Whisper will happily WORK OUT that an episode is Bengali, but it refuses
+      // to be TOLD so: the language parameter only accepts the languages it is
+      // formally supported in, and Bangla is not one of them. That is not a
+      // reason to abandon a two-hour call — drop the hint and carry on letting
+      // it work the language out for itself, as it did before we asked.
+      if (hint && /language/i.test(err.message || '') && /not supported/i.test(err.message || '')) {
+        console.log(`[PodcastBrain] ${label}: '${hint}' refused as a hint — carrying on without one`);
+        hint = null;
+        languageRejected = true;
+        i--;                    // this attempt never happened
+        continue;
+      }
+      throw err;
+    }
     const segments = out.segments || [];
-    last = { segments, language: out.language || null };
+    last = { segments, language: out.language || null, languageRejected };
 
     const verdict = looksLooped(segments);
     if (!verdict.looped) return { ...last, attempts: i + 1, looped: false };
@@ -204,6 +223,7 @@ async function transcribeEpisode({ jobId, userId, onProgress, language: askedLan
     // it heard, later chunks are given that hint so one noisy stretch mid-call
     // cannot be mistaken for a different language entirely.
     let hint = languageCode(askedLanguage);
+    let hintAccepted = true;      // cleared the first time Whisper refuses one
     let language = askedLanguage || null;   // what we REPORT, for the log
     let unheardSeconds = 0;      // stretches Whisper only ever returned noise for
     const unheard = [];          // and where they were, for the message
@@ -237,12 +257,24 @@ async function transcribeEpisode({ jobId, userId, onProgress, language: askedLan
       const chunkSize = (await fs.stat(chunkPath).catch(() => ({ size: 0 }))).size;
       if (chunkSize < 2048) { await fs.remove(chunkPath).catch(() => {}); break; }
 
-      const heard = await transcribeChunkWithRetries(chunkPath, {
-        language: hint,
-        onProgress,
-        label: `${stamp(offset)}–${stamp(offset + CHUNK_SECONDS)}`,
-      });
+      let heard;
+      try {
+        heard = await transcribeChunkWithRetries(chunkPath, {
+          language: hint,
+          onProgress,
+          label: `${stamp(offset)}–${stamp(offset + CHUNK_SECONDS)}`,
+        });
+      } catch (err) {
+        // Whatever went wrong here is between us and the transcription service.
+        // The person reading this is holding a video, not a stack trace.
+        console.error(`[PodcastBrain] ${jobId}: transcription failed —`, err.message);
+        throw new Error('I could not listen to this episode just now — the transcription service would not answer. Nothing was analysed and nothing in your editor was changed. Please try again in a minute.');
+      }
       await fs.remove(chunkPath).catch(() => {});
+
+      // Refused once, refused every time — stop offering it, for this episode
+      // and for every chunk left in it.
+      if (heard.languageRejected) { hintAccepted = false; hint = null; }
 
       if (heard.looped) {
         // Three goes and it is still repeating itself. Throw these lines away
@@ -254,7 +286,7 @@ async function transcribeEpisode({ jobId, userId, onProgress, language: askedLan
         console.log(`[PodcastBrain] ${jobId}: gave up on ${stamp(offset)}–${stamp(offset + CHUNK_SECONDS)}`);
       } else {
         language = language || heard.language;
-        hint = hint || languageCode(heard.language);
+        if (hintAccepted) hint = hint || languageCode(heard.language);
         for (const seg of heard.segments) {
           segments.push({ ...seg, start: (seg.start || 0) + offset, end: (seg.end || 0) + offset });
         }
