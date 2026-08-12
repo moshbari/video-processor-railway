@@ -1050,13 +1050,17 @@ router.post('/podcast-auto/:jobId', async (req, res) => {
 // transcript back. That chain broke three times in two days and never once said
 // so. Here there is no chain: prepare finishes, we transcribe, the Brain runs.
 //
-// Body: { oauthToken?, force? }  — nothing else is needed.
+// Body: { oauthToken?, force?, language? }  — nothing else is needed.
+//
+// `language` is an optional two-letter hint ('bn', 'en') for the transcriber.
+// Left out, it works the language out on its own; given, it stops it guessing
+// wrongly on a call that switches between Bangla and English mid-sentence.
 // ============================================================
 router.post('/podcast-analyze-self/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
     const userId = req.headers['x-user-id'] || null;
-    const { oauthToken, force } = req.body || {};
+    const { oauthToken, force, language } = req.body || {};
 
     if (podcastBrainJobs.isRunning(jobId)) {
       return res.json({ success: true, jobId, alreadyRunning: true, message: 'That episode is already being worked on.' });
@@ -1112,7 +1116,10 @@ router.post('/podcast-analyze-self/:jobId', async (req, res) => {
         podcastBrainJobs.describeJob(jobId, { userId, title: record.title });
 
         // Listen first. If this fails, nothing has been spent on Claude.
-        const heard = await podcastSelfTranscribe.transcribeEpisode({ jobId, userId, onProgress });
+        const heard = await podcastSelfTranscribe.transcribeEpisode({
+          jobId, userId, onProgress,
+          language: typeof language === 'string' && language.trim() ? language.trim() : null,
+        });
         const { text, hasSpeakers, cueCount } = buildTranscriptForModel(heard.transcript, null);
         console.log(`[PodcastBrain] ${jobId}: ${cueCount} cues from our own copy (${heard.language || '?'})`);
 
