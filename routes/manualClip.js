@@ -1315,13 +1315,17 @@ router.put('/library/:jobId/youtube', async (req, res) => {
   try {
     const { jobId } = req.params;
     const userId = req.headers['x-user-id'] || null;
-    const youtubeUrl = String(req.body?.youtubeUrl || '').trim();
-    if (!youtubeUrl) {
+    // An empty string means "forget the link" — the way a wrong one gets undone.
+    // Only a MISSING field is an error, because that is a caller bug.
+    if (typeof req.body?.youtubeUrl !== 'string') {
       return res.status(400).json({ success: false, error: 'No YouTube link was given.' });
     }
+    const youtubeUrl = req.body.youtubeUrl.trim();
     const stored = await manualVideoLibraryService.updateYoutubeUrl(userId, jobId, youtubeUrl);
     if (!stored) return res.status(404).json({ success: false, error: 'That video is no longer available.' });
-    console.log(`[ManualClip] ${jobId} is on YouTube at ${youtubeUrl}`);
+    console.log(youtubeUrl
+      ? `[ManualClip] ${jobId} is on YouTube at ${youtubeUrl}`
+      : `[ManualClip] ${jobId} no longer has a YouTube link`);
     res.json({ success: true, youtubeUrl });
   } catch (error) {
     console.error('[ManualClip] Save YouTube link error:', error);
