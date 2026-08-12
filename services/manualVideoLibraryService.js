@@ -144,6 +144,22 @@ class ManualVideoLibraryService {
   }
 
   /**
+   * 📺 Remember which YouTube video this episode became.
+   *
+   * The uploader knows it the moment the upload finishes, and the editor needs
+   * it to ask the Chrome extension for that video's captions. Without it stored
+   * here, fetching the transcript again means finding the link by hand — which
+   * is exactly the step that kept going wrong.
+   */
+  async updateYoutubeUrl(userId, jobId, youtubeUrl) {
+    const found = await this._findVideo(userId, jobId);
+    if (!found) return false;
+    found.video.youtubeUrl = typeof youtubeUrl === 'string' ? youtubeUrl.trim() : '';
+    await this.save(found.owner, found.data);
+    return true;
+  }
+
+  /**
    * Save the full Podcast Brain report (markdown): the hooks table, the cold-open
    * montage, the bench, USE WITH CARE flags and the moment map. Everything the
    * brain produced that isn't directly a hook or a cut lives here so Mosh can

@@ -831,6 +831,9 @@ router.get('/library', async (req, res) => {
       // 🎙️ Ship the Podcast Brain's social post with the list so the library can
       // offer "Copy Social Post" without opening the project first.
       socialPost: typeof v.socialPost === 'string' ? v.socialPost : '',
+      // 📺 And where the episode lives on YouTube, so anything showing this list
+      // can fetch its captions without opening the project either.
+      youtubeUrl: v.youtubeUrl || '',
     }));
     res.json({ success: true, videos: slim });
   } catch (error) {
@@ -890,6 +893,9 @@ router.post('/restore/:jobId', async (req, res) => {
       // 🎙️ Podcast Brain output, when this episode has been analysed.
       socialPost: record.socialPost || '',
       brainReport: record.brainReport || '',
+      // 📺 Where this episode lives on YouTube — the editor asks the extension
+      // for THIS video's captions when the transcript is fetched again.
+      youtubeUrl: record.youtubeUrl || '',
     });
   } catch (error) {
     console.error('[ManualClip] Restore error:', error);
@@ -970,6 +976,12 @@ router.post('/podcast-auto/:jobId', async (req, res) => {
 
     const { text, hasSpeakers, cueCount } = buildTranscriptForModel(transcript, speakers);
     console.log(`[PodcastBrain] ${jobId}: ${cueCount} cues, speakers=${hasSpeakers}, from ${youtubeUrl || 'unknown source'}`);
+
+    // Remember where the transcript came from. Whoever sent it knew the video;
+    // storing it means the editor can fetch it again on its own next time.
+    if (youtubeUrl) {
+      manualVideoLibraryService.updateYoutubeUrl(userId, jobId, youtubeUrl).catch(() => {});
+    }
 
     (async () => {
       try {
@@ -1213,6 +1225,7 @@ router.get('/podcast-summary/:jobId', async (req, res) => {
     const hooks = (record.hooks || []).length;
     const cuts = (record.cuts || []).length;
     const hasSocialPost = !!record.socialPost;
+    const youtubeUrl = record.youtubeUrl || '';
 
     // What stage is this episode at, in the order Mosh experiences it?
     let stage = 'editable';                       // video is in, nothing analysed yet
@@ -1229,6 +1242,9 @@ router.get('/podcast-summary/:jobId', async (req, res) => {
       hooks,
       cuts,
       hasSocialPost,
+      // 📺 So a control page can offer "fetch this episode's captions" without
+      // anyone going to look the video up.
+      youtubeUrl,
       error: run?.status === 'error' ? run.error : null,
       // The newest progress line, so the page can say what it's working on.
       message: run?.events?.length ? run.events[run.events.length - 1].message : null,
@@ -1285,6 +1301,31 @@ router.put('/library/:jobId/socialpost', async (req, res) => {
   } catch (error) {
     console.error('[ManualClip] Save social post error:', error);
     res.status(500).json({ success: false, error: 'Could not save your post.' });
+  }
+});
+
+// ============================================================
+// PUT /api/manual-clip/library/:jobId/youtube
+// 📺 Attach the YouTube video this episode became, so the editor can ask the
+// Chrome extension for its captions later without anyone hunting for the link.
+// Called by the uploader the moment the upload finishes.
+// Body: { youtubeUrl: string }
+// ============================================================
+router.put('/library/:jobId/youtube', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const youtubeUrl = String(req.body?.youtubeUrl || '').trim();
+    if (!youtubeUrl) {
+      return res.status(400).json({ success: false, error: 'No YouTube link was given.' });
+    }
+    const stored = await manualVideoLibraryService.updateYoutubeUrl(userId, jobId, youtubeUrl);
+    if (!stored) return res.status(404).json({ success: false, error: 'That video is no longer available.' });
+    console.log(`[ManualClip] ${jobId} is on YouTube at ${youtubeUrl}`);
+    res.json({ success: true, youtubeUrl });
+  } catch (error) {
+    console.error('[ManualClip] Save YouTube link error:', error);
+    res.status(500).json({ success: false, error: 'Could not save the YouTube link.' });
   }
 });
 
