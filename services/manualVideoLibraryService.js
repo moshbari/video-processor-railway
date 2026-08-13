@@ -160,6 +160,27 @@ class ManualVideoLibraryService {
   }
 
   /**
+   * ⏸ Mark that something is waiting to analyse this episode as soon as YouTube
+   * finishes captioning it.
+   *
+   * The wait happens in a browser (the Chrome extension checks every three
+   * minutes), so without this the server has no idea an episode is spoken for —
+   * and the video list would show it as untouched for the whole hour, which
+   * reads as "nothing is happening" when in fact something is.
+   *
+   * Stored beside the video rather than in memory because the wait outlives any
+   * one page, and often outlives a redeploy.
+   */
+  async updatePodcastQueued(userId, jobId, queuedAt) {
+    const found = await this._findVideo(userId, jobId);
+    if (!found) return false;
+    if (queuedAt === null) delete found.video.podcastQueuedAt;
+    else found.video.podcastQueuedAt = queuedAt || new Date().toISOString();
+    await this.save(found.owner, found.data);
+    return true;
+  }
+
+  /**
    * Save the full Podcast Brain report (markdown): the hooks table, the cold-open
    * montage, the bench, USE WITH CARE flags and the moment map. Everything the
    * brain produced that isn't directly a hook or a cut lives here so Mosh can

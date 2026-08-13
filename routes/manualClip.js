@@ -851,6 +851,35 @@ router.get('/library', async (req, res) => {
 // Same stages as /podcast-summary/:jobId, and just as light: one read of the
 // library index plus the in-memory run log. Never returns the post or report.
 // ============================================================
+// ============================================================
+// POST /api/manual-clip/library/:jobId/podcast-queued
+// ⏸ "Something is waiting to analyse this episode."
+//
+// The wait for YouTube's captions happens in a browser — the Chrome extension
+// checks every three minutes, for as long as an hour on a long recording — and
+// none of that reaches this server. So the uploader says so here the moment it
+// hands the link over, and the video list can show the episode as spoken for
+// instead of looking untouched the whole time.
+//
+// Body: { waiting: boolean } — false clears it (nobody is coming after all).
+// ============================================================
+router.post('/library/:jobId/podcast-queued', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const waiting = req.body?.waiting !== false;
+    const stored = await manualVideoLibraryService.updatePodcastQueued(
+      userId, jobId, waiting ? new Date().toISOString() : null,
+    );
+    if (!stored) return res.status(404).json({ success: false, error: 'That video is no longer available.' });
+    console.log(`[PodcastBrain] ${jobId} is ${waiting ? 'waiting for YouTube captions' : 'no longer waiting'}`);
+    res.json({ success: true, waiting });
+  } catch (error) {
+    console.error('[PodcastBrain] Queued flag error:', error);
+    res.status(500).json({ success: false, error: 'Could not mark that episode.' });
+  }
+});
+
 router.get('/library/podcast-status', async (req, res) => {
   try {
     const userId = req.headers['x-user-id'] || req.query.userId || null;
@@ -866,6 +895,10 @@ router.get('/library/podcast-status', async (req, res) => {
       if (run?.status === 'running') stage = 'analysing';
       else if (hooks || cuts || hasSocialPost) stage = 'ready';
       else if (run?.status === 'error') stage = 'failed';
+      // ⏸ Nothing has reached us yet, but something is out there waiting for
+      // YouTube to finish captioning this one. Ranked last: any real run, result
+      // or failure is a truer answer than "still waiting".
+      else if (v.podcastQueuedAt) stage = 'waiting';
 
       return {
         jobId: v.jobId,
@@ -874,6 +907,7 @@ router.get('/library/podcast-status', async (req, res) => {
         cuts,
         hasSocialPost,
         youtubeUrl: v.youtubeUrl || '',
+        queuedAt: v.podcastQueuedAt || null,
         startedAt: run?.startedAt || null,
         finishedAt: run?.finishedAt || null,
         error: run?.status === 'error' ? run.error : null,
