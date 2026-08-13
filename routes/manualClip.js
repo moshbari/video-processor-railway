@@ -843,6 +843,53 @@ router.get('/library', async (req, res) => {
 });
 
 // ============================================================
+// GET /api/manual-clip/library/podcast-status
+// 🎙️ "Which of my episodes are still being analysed?" — the whole library in
+// one answer, so the video list can show a live badge on every row without
+// asking about each episode separately (fifty videos = fifty requests).
+//
+// Same stages as /podcast-summary/:jobId, and just as light: one read of the
+// library index plus the in-memory run log. Never returns the post or report.
+// ============================================================
+router.get('/library/podcast-status', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'] || req.query.userId || null;
+    const videos = await manualVideoLibraryService.list(userId);
+
+    const episodes = videos.map(v => {
+      const run = podcastBrainJobs.read(v.jobId, 0);
+      const hooks = (v.hooks || []).length;
+      const cuts = (v.cuts || []).length;
+      const hasSocialPost = !!v.socialPost;
+
+      let stage = 'editable';                        // in the library, never analysed
+      if (run?.status === 'running') stage = 'analysing';
+      else if (hooks || cuts || hasSocialPost) stage = 'ready';
+      else if (run?.status === 'error') stage = 'failed';
+
+      return {
+        jobId: v.jobId,
+        stage,
+        hooks,
+        cuts,
+        hasSocialPost,
+        youtubeUrl: v.youtubeUrl || '',
+        startedAt: run?.startedAt || null,
+        finishedAt: run?.finishedAt || null,
+        error: run?.status === 'error' ? run.error : null,
+        // Newest progress line, so a row can say what the brain is working on.
+        message: run?.events?.length ? run.events[run.events.length - 1].message : null,
+      };
+    });
+
+    res.json({ success: true, episodes });
+  } catch (error) {
+    console.error('[PodcastBrain] Library status error:', error);
+    res.status(500).json({ success: false, error: 'Could not check your episodes.' });
+  }
+});
+
+// ============================================================
 // POST /api/manual-clip/restore/:jobId
 // Reopen a saved video in the editor without re-uploading. Lightweight —
 // returns playback URL + waveform; the source MP4 is re-fetched from R2
