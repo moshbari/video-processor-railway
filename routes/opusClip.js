@@ -39,6 +39,43 @@ const upload = multer({
   limits: { fileSize: 5 * 1024 * 1024 * 1024 } // 5GB
 });
 
+/**
+ * Shape one analysis request into the service's input.
+ *
+ * A request can now carry THREE things, and each has its own job:
+ *   - `transcript`  the YouTube captions the user's browser extension scraped.
+ *                   These are the words. Without it the server has to pay
+ *                   Whisper to guess them off the audio.
+ *   - an uploaded file, or `url`  where the frames come from.
+ *   - `youtubeUrl`  which YouTube video the captions belong to, recorded so the
+ *                   job can say what it was cut against.
+ *
+ * The uploaded file wins as the video source when both are present: it is the
+ * high-quality download of the same YouTube video, and YouTube blocks the
+ * server's own download often enough that the file is the reliable half.
+ */
+function buildAnalysisInput(body, file) {
+  const input = {
+    clipCount: parseInt(body.clipCount) || 10,
+    clipLength: {
+      min: parseInt(body.minLength) || 15,
+      max: parseInt(body.maxLength) || 60
+    },
+    contentType: body.contentType || 'general'
+  };
+
+  if (body.transcript && String(body.transcript).trim()) input.transcript = body.transcript;
+  if (body.youtubeUrl) input.youtubeUrl = String(body.youtubeUrl).trim();
+
+  if (file) {
+    input.videoPath = file.path;
+  } else if (body.url) {
+    input.url = body.url;
+  }
+
+  return input;
+}
+
 // ============================================================
 // POST /api/opus-clip/analyze
 // Analyze a video and find viral moments
@@ -46,7 +83,7 @@ const upload = multer({
 // ============================================================
 router.post('/analyze', upload.single('video'), async (req, res) => {
   try {
-    const { url, clipCount, minLength, maxLength, contentType } = req.body;
+    const { url, clipCount, minLength, maxLength, contentType, transcript, youtubeUrl } = req.body;
 
     // Must provide either a URL or file upload
     if (!url && !req.file) {
@@ -60,23 +97,11 @@ router.post('/analyze', upload.single('video'), async (req, res) => {
     console.log('[OpusClip] New analysis request');
     if (url) console.log(`  URL: ${url}`);
     if (req.file) console.log(`  File: ${req.file.originalname} (${(req.file.size / 1024 / 1024).toFixed(1)}MB)`);
+    if (transcript) console.log(`  Captions supplied by the browser extension: ${String(transcript).length} chars`);
     console.log('🎬'.repeat(30));
 
     // Build input object
-    const input = {
-      clipCount: parseInt(clipCount) || 10,
-      clipLength: {
-        min: parseInt(minLength) || 15,
-        max: parseInt(maxLength) || 60
-      },
-      contentType: contentType || 'general'
-    };
-
-    if (url) {
-      input.url = url;
-    } else if (req.file) {
-      input.videoPath = req.file.path;
-    }
+    const input = buildAnalysisInput({ url, clipCount, minLength, maxLength, contentType, transcript, youtubeUrl }, req.file);
 
     // Start analysis (this runs synchronously but returns suggestions)
     // For very long videos this could take a few minutes
@@ -89,8 +114,20 @@ router.post('/analyze', upload.single('video'), async (req, res) => {
 
     // Friendly error messages
     let friendlyMessage = 'Something went wrong while analyzing your video. Please try again.';
+    const msg = error.message || '';
 
-    if (error.message.includes('Unsupported')) {
+    // 📺 YouTube refuses downloads from datacenter IPs often enough that this is
+    // the single most common failure here — and the fix is not "try again", it
+    // is "download the video yourself and upload the file".
+    const looksLikeYouTubeBlock = /sign in to confirm|bot|403|429|unable to download|video unavailable|Download failed/i.test(msg);
+
+    if (msg.includes('captions do not belong') || msg.includes('no timestamped lines')) {
+      friendlyMessage = msg;
+    } else if (looksLikeYouTubeBlock) {
+      friendlyMessage = 'YouTube would not let our server download this video (it blocks servers, not people). ' +
+        'Download the video to your computer with a YouTube downloader, then upload that file here and paste the YouTube link as well — ' +
+        'the link is only used to read the captions. See the setup guide for the downloaders we recommend.';
+    } else if (error.message.includes('Unsupported')) {
       friendlyMessage = 'This URL is not supported. Please try a YouTube, TikTok, Instagram, or other supported platform link.';
     } else if (error.message.includes('too long')) {
       friendlyMessage = error.message;
@@ -116,7 +153,7 @@ router.post('/analyze', upload.single('video'), async (req, res) => {
 // ============================================================
 router.post('/analyze-async', upload.single('video'), async (req, res) => {
   try {
-    const { url, clipCount, minLength, maxLength, contentType } = req.body;
+    const { url, clipCount, minLength, maxLength, contentType, transcript, youtubeUrl } = req.body;
 
     if (!url && !req.file) {
       return res.status(400).json({
@@ -140,20 +177,7 @@ router.post('/analyze-async', upload.single('video'), async (req, res) => {
     });
 
     // Build input and run in background
-    const input = {
-      clipCount: parseInt(clipCount) || 10,
-      clipLength: {
-        min: parseInt(minLength) || 15,
-        max: parseInt(maxLength) || 60
-      },
-      contentType: contentType || 'general'
-    };
-
-    if (url) {
-      input.url = url;
-    } else if (req.file) {
-      input.videoPath = req.file.path;
-    }
+    const input = buildAnalysisInput({ url, clipCount, minLength, maxLength, contentType, transcript, youtubeUrl }, req.file);
 
     // Run analysis in background (don't await)
     opusClipService.analyzeVideo(input)

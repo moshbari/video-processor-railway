@@ -22,6 +22,7 @@ const execAsync = promisify(exec);
 const r2Service = require('./r2Service');
 const downloadService = require('./downloadService');
 const transcriptionService = require('./transcriptionService');
+const { transcriptionFromCaptions } = require('./opusClipCaptions');
 
 class OpusClipService {
   constructor() {
@@ -82,38 +83,59 @@ class OpusClipService {
 
       console.log(`[OpusClip ${jobId}] Video: "${videoTitle}" (${this.formatTime(videoDuration)})`);
 
-      // --- STEP 1B: Extract audio for transcription ---
-      this.updateJob(jobId, { step: 'extracting_audio', progress: 15 });
-
-      const audioPath = path.join(workDir, 'audio.mp3');
-      console.log(`[OpusClip ${jobId}] Extracting audio for transcription...`);
-      await this.extractAudioForTranscription(videoPath, audioPath);
-
-      // Check audio file size - Whisper has 25MB limit
-      const audioStats = await fs.stat(audioPath);
-      const audioSizeMB = audioStats.size / (1024 * 1024);
-      console.log(`[OpusClip ${jobId}] Audio size: ${audioSizeMB.toFixed(1)}MB`);
-
-      if (audioSizeMB > 25) {
-        // For very long videos, we need to split audio and transcribe in chunks
-        console.log(`[OpusClip ${jobId}] Audio too large, splitting into chunks...`);
-      }
-
-      // --- STEP 1C: Transcribe with Whisper ---
-      this.updateJob(jobId, { step: 'transcribing', progress: 30 });
-      console.log(`[OpusClip ${jobId}] Transcribing with Whisper...`);
-
+      // --- STEP 1B/1C: Get the words ---
+      //
+      // 📺 Best route: YouTube's own captions, scraped in the user's browser by
+      // the Chrome extension and posted here. They are free, they are what was
+      // actually said (nothing is invented), and their timestamps come from the
+      // same source as the video. Whisper stays as the fallback for videos that
+      // are not on YouTube — it costs money per minute and it loops on long
+      // mixed Bengali/English audio.
       let transcription;
-      if (audioSizeMB <= 25) {
-        transcription = await transcriptionService.transcribe(audioPath, {
-          response_format: 'verbose_json'
-        });
+      let transcriptSource = 'whisper';
+      let transcriptNote = '';
+
+      if (input.transcript && String(input.transcript).trim()) {
+        this.updateJob(jobId, { step: 'reading_captions', progress: 30 });
+        console.log(`[OpusClip ${jobId}] Using YouTube captions supplied by the browser extension`);
+
+        transcription = transcriptionFromCaptions(input.transcript, videoDuration);
+        transcriptSource = 'youtube-captions';
+        transcriptNote = transcription.note || '';
+
+        console.log(`[OpusClip ${jobId}] Captions: ${transcription.cueCount} cues` +
+          (transcription.droppedCues ? ` (${transcription.droppedCues} past the end of the video, dropped)` : ''));
       } else {
-        // Split audio into 10-minute chunks and transcribe each
-        transcription = await this.transcribeLongAudio(audioPath, workDir, jobId);
+        this.updateJob(jobId, { step: 'extracting_audio', progress: 15 });
+
+        const audioPath = path.join(workDir, 'audio.mp3');
+        console.log(`[OpusClip ${jobId}] No captions supplied — extracting audio for transcription...`);
+        await this.extractAudioForTranscription(videoPath, audioPath);
+
+        // Check audio file size - Whisper has 25MB limit
+        const audioStats = await fs.stat(audioPath);
+        const audioSizeMB = audioStats.size / (1024 * 1024);
+        console.log(`[OpusClip ${jobId}] Audio size: ${audioSizeMB.toFixed(1)}MB`);
+
+        if (audioSizeMB > 25) {
+          // For very long videos, we need to split audio and transcribe in chunks
+          console.log(`[OpusClip ${jobId}] Audio too large, splitting into chunks...`);
+        }
+
+        this.updateJob(jobId, { step: 'transcribing', progress: 30 });
+        console.log(`[OpusClip ${jobId}] Transcribing with Whisper...`);
+
+        if (audioSizeMB <= 25) {
+          transcription = await transcriptionService.transcribe(audioPath, {
+            response_format: 'verbose_json'
+          });
+        } else {
+          // Split audio into 10-minute chunks and transcribe each
+          transcription = await this.transcribeLongAudio(audioPath, workDir, jobId);
+        }
       }
 
-      console.log(`[OpusClip ${jobId}] Transcription complete: ${transcription.segments.length} segments`);
+      console.log(`[OpusClip ${jobId}] Transcription complete: ${transcription.segments.length} segments (${transcriptSource})`);
 
       // --- STEP 1D: AI finds viral moments ---
       this.updateJob(jobId, { step: 'finding_moments', progress: 60 });
@@ -145,7 +167,9 @@ class OpusClipService {
         videoDuration,
         transcription,
         clipSuggestions,
-        workDir
+        workDir,
+        transcriptSource,
+        youtubeUrl: input.youtubeUrl || ''
       };
 
       // Save analysis to disk so we can use it later
@@ -163,7 +187,11 @@ class OpusClipService {
         videoDuration: this.formatTime(videoDuration),
         videoDurationSeconds: videoDuration,
         totalSuggestions: clipSuggestions.length,
-        clips: clipSuggestions
+        clips: clipSuggestions,
+        // Where the words came from, so the app can say so rather than leaving
+        // people guessing whether the AI transcribed (and possibly invented) them.
+        transcriptSource,
+        transcriptNote
       };
 
     } catch (error) {
