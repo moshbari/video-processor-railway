@@ -12,20 +12,59 @@ const isTikTok = (url) => /tiktok\.com|vm\.tiktok|vt\.tiktok/i.test(url);
 
 // Login cookies (Instagram/Facebook + YouTube bot-check) come from YTDLP_COOKIES_B64
 // — a base64 of a Netscape cookies.txt. Written once to /tmp and passed to yt-dlp.
-let cookiesWritten = false;
+
+/**
+ * Does this text actually look like a Netscape cookies.txt?
+ *
+ * Netscape format is tab-separated with seven fields per row:
+ *   domain  includeSubdomains  path  secure  expiry  name  value
+ *
+ * Worth checking, because whatever is in that variable gets handed to yt-dlp as
+ * the browser session for every download. When it was once replaced with the
+ * wrong file entirely, yt-dlp did not refuse it — it warned "skipping cookie
+ * file entry due to invalid length" on every single line and carried on
+ * logged-out, so the only symptom was downloads mysteriously failing the
+ * bot check. Better to notice here, say so once, and run without cookies.
+ */
+function looksLikeCookieJar(text) {
+  let rows = 0;
+  for (const line of String(text).split('\n')) {
+    if (!line || line.startsWith('#')) continue;
+    if (line.split('\t').length >= 7) rows++;
+    if (rows >= 3) return true;
+  }
+  return false;
+}
+
+let cookieState = null; // null = not decided yet, then 'ok' | 'unusable' | 'none'
 function ytdlpExtra() {
   const args = ['--no-playlist', '--no-warnings'];
-  if (process.env.YTDLP_COOKIES_B64) {
-    try {
-      if (!cookiesWritten) {
-        fs.writeFileSync('/tmp/yt-cookies.txt', Buffer.from(process.env.YTDLP_COOKIES_B64, 'base64').toString('utf8'));
-        cookiesWritten = true;
+  const raw = process.env.YTDLP_COOKIES_B64;
+
+  if (cookieState === null) {
+    if (!raw) {
+      cookieState = 'none';
+    } else {
+      try {
+        const text = Buffer.from(raw, 'base64').toString('utf8');
+        if (!looksLikeCookieJar(text)) {
+          console.error(
+            '⚠️  YTDLP_COOKIES_B64 does not contain a Netscape cookies.txt (no tab-separated cookie rows). ' +
+            'Ignoring it and downloading without cookies — export a fresh cookies.txt and set it again.'
+          );
+          cookieState = 'unusable';
+        } else {
+          fs.writeFileSync('/tmp/yt-cookies.txt', text);
+          cookieState = 'ok';
+        }
+      } catch (e) {
+        console.error('cookie write failed:', e.message);
+        cookieState = 'unusable';
       }
-      args.push('--cookies', '/tmp/yt-cookies.txt');
-    } catch (e) {
-      console.error('cookie write failed:', e.message);
     }
   }
+
+  if (cookieState === 'ok') args.push('--cookies', '/tmp/yt-cookies.txt');
   return args.join(' ');
 }
 
