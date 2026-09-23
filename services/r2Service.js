@@ -291,6 +291,24 @@ class R2Service {
   }
 
   /**
+   * Point a saved R2 link at the current public address. Links stored before
+   * the bucket moved to its own domain (R2_LEGACY_PUBLIC_URL, comma-separated
+   * if several) still say r2.dev — Cloudflare's rate-limited, uncached test
+   * address. Anything else is returned untouched.
+   */
+  toPublicUrl(url) {
+    if (!url || !this.publicUrl) return url;
+    const legacy = (process.env.R2_LEGACY_PUBLIC_URL || '')
+      .split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
+    for (const old of legacy) {
+      if (old !== this.publicUrl && url.startsWith(`${old}/`)) {
+        return `${this.publicUrl}${url.slice(old.length)}`;
+      }
+    }
+    return url;
+  }
+
+  /**
    * Delete a file from R2
    */
   async deleteFile(fileName) {

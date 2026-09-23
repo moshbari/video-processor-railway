@@ -23,6 +23,7 @@ const r2Service = require('./r2Service');
 const downloadService = require('./downloadService');
 const transcriptionService = require('./transcriptionService');
 const manualVideoLibraryService = require('./manualVideoLibraryService');
+const previewProxyService = require('./previewProxyService');
 
 // 🎭 Voice-disguise presets. `ratio` is the pitch multiplier: <1 lowers the
 // voice (deeper), >1 raises it. We shift sample rate then restore tempo, so the
@@ -201,6 +202,9 @@ class ManualClipService {
         console.error(`[ManualClip ${jobId}] Could not save to video library:`, libErr.message);
       }
 
+      // 🎞️ Light preview copy for the editor's previews (background, low priority).
+      previewProxyService.request(jobId, input.userId, videoPath);
+
       console.log(`[ManualClip ${jobId}] ✓ Video ready for manual clipping`);
 
       return result;
@@ -350,6 +354,9 @@ class ManualClipService {
       sourceKey: newKey,
       waveform: { peaks: waveform.peaks || [] },
     });
+
+    // The old preview copy was made from the replaced master — make a new one.
+    previewProxyService.request(jobId, userId, normalizedPath);
 
     console.log(`[ManualClip ${jobId}] ✓ Saved video matched to YouTube: ${newPlaybackUrl}`);
     return { success: true, jobId, playbackUrl: newPlaybackUrl, duration: newDuration };

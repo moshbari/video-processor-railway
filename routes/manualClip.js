@@ -16,6 +16,8 @@ const fs = require('fs-extra');
 
 const manualClipService = require('../services/manualClipService');
 const manualVideoLibraryService = require('../services/manualVideoLibraryService');
+const previewProxyService = require('../services/previewProxyService');
+const r2Service = require('../services/r2Service');
 const ctaLibraryService = require('../services/ctaLibraryService');
 const voiceService = require('../services/voiceService');
 const podcastBrain = require('../services/podcastBrain');
@@ -778,7 +780,7 @@ router.get('/status/:jobId', async (req, res) => {
     // Include video info if available
     if (status.videoTitle) response.videoTitle = status.videoTitle;
     if (status.videoDuration) response.videoDuration = status.videoDuration;
-    if (status.playbackUrl) response.playbackUrl = status.playbackUrl;
+    if (status.playbackUrl) response.playbackUrl = r2Service.toPublicUrl(status.playbackUrl);
 
     // Direct-from-server download for the finished render, available before the
     // R2 cloud copy is ready (see GET /download/:jobId below).
@@ -952,13 +954,19 @@ router.post('/restore/:jobId', async (req, res) => {
       waveform: { peaks: record.waveformPeaks || [] },
     });
 
+    // 🎞️ Older projects have no light preview copy yet — start one now.
+    const previewUrl = previewProxyService.previewFor(record);
+    if (!previewUrl) previewProxyService.request(jobId, userId);
+
     res.json({
       success: true,
       jobId,
       videoTitle: record.title,
       videoDuration: record.duration,
       videoDurationFormatted: record.durationFormatted,
-      playbackUrl: record.playbackUrl,
+      playbackUrl: r2Service.toPublicUrl(record.playbackUrl),
+      // Light copy for previews (null while it's still being made).
+      previewUrl,
       waveform: { peaks: record.waveformPeaks || [] },
       hooks: record.hooks || [],
       cuts: record.cuts || [],
@@ -981,6 +989,53 @@ router.post('/restore/:jobId', async (req, res) => {
   } catch (error) {
     console.error('[ManualClip] Restore error:', error);
     res.status(500).json({ success: false, error: 'Could not reopen that video.' });
+  }
+});
+
+// ============================================================
+// GET /api/manual-clip/preview/:jobId
+// 🎞️ "Is the light preview copy ready yet?" — the editor asks every few
+// seconds after opening a video that doesn't have one, then swaps its
+// players over. { status: ready|queued|making|failed|none, previewUrl }
+// ============================================================
+router.get('/preview/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const record = (await manualVideoLibraryService.get(userId, jobId))
+      || (await manualVideoLibraryService.get(null, jobId));
+    if (!record) return res.status(404).json({ success: false, error: 'That video is no longer available.' });
+    res.json({
+      success: true,
+      jobId,
+      status: previewProxyService.status(record),
+      previewUrl: previewProxyService.previewFor(record),
+    });
+  } catch (error) {
+    console.error('[ManualClip] Preview status error:', error);
+    res.status(500).json({ success: false, error: 'Could not check the preview.' });
+  }
+});
+
+// ============================================================
+// POST /api/manual-clip/preview/backfill
+// 🎞️ Queue a light preview copy for every video in this user's library that
+// doesn't have one. They're made one at a time in the background.
+// ============================================================
+router.post('/preview/backfill', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    const videos = await manualVideoLibraryService.list(userId);
+    const queued = [];
+    for (const v of videos) {
+      if (previewProxyService.previewFor(v)) continue;
+      previewProxyService.request(v.jobId, userId);
+      queued.push(v.jobId);
+    }
+    res.json({ success: true, total: videos.length, queued: queued.length, jobIds: queued });
+  } catch (error) {
+    console.error('[ManualClip] Preview backfill error:', error);
+    res.status(500).json({ success: false, error: 'Could not start the preview copies.' });
   }
 });
 
