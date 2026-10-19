@@ -22,6 +22,7 @@ const ctaLibraryService = require('../services/ctaLibraryService');
 const voiceService = require('../services/voiceService');
 const podcastBrain = require('../services/podcastBrain');
 const podcastBrainJobs = require('../services/podcastBrain/jobs');
+const carryEdits = require('../services/carryEdits');
 const podcastBrainPush = require('../services/podcastBrain/push');
 const podcastSelfTranscribe = require('../services/podcastBrain/selfTranscribe');
 const { buildTranscriptForModel, parseTranscript } = require('../services/podcastBrain/speakers');
@@ -836,6 +837,10 @@ router.get('/library', async (req, res) => {
       // 📺 And where the episode lives on YouTube, so anything showing this list
       // can fetch its captions without opening the project either.
       youtubeUrl: v.youtubeUrl || '',
+      // 🔁 How much work is on it — tells "the version I edited" apart from a
+      // fresh re-import when bringing edits over.
+      editCount: ['hooks', 'cuts', 'disguise', 'revoice', 'lowerThirds', 'inserts', 'backgroundSections']
+        .reduce((n, k) => n + (Array.isArray(v[k]) ? v[k].length : 0), 0),
     }));
     res.json({ success: true, videos: slim });
   } catch (error) {
@@ -985,6 +990,8 @@ router.post('/restore/:jobId', async (req, res) => {
       // 📺 Where this episode lives on YouTube — the editor asks the extension
       // for THIS video's captions when the transcript is fetched again.
       youtubeUrl: record.youtubeUrl || '',
+      // 🔁 Set when these edits were brought over from an older version.
+      carriedEdits: record.carriedEdits || null,
     });
   } catch (error) {
     console.error('[ManualClip] Restore error:', error);
@@ -1725,6 +1732,38 @@ router.put('/library/:jobId/backgrounds', async (req, res) => {
     console.error('[ManualClip] Save background sections error:', error);
     res.status(500).json({ success: false, error: 'Could not save your background sections.' });
   }
+});
+
+// ============================================================
+// POST /api/manual-clip/library/:jobId/carry-edits
+// 🔁 Bring every edit from an older version of this video (re-edited in Tella
+// and imported again) onto this one, each moved to where that moment now is —
+// found by sound. Replaces this video's edits; the older project is untouched.
+// Runs in the background; poll GET .../carry-edits/status.
+// Body: { fromJobId }
+// ============================================================
+router.post('/library/:jobId/carry-edits', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.headers['x-user-id'] || null;
+    const { fromJobId } = req.body || {};
+    if (!fromJobId || fromJobId === jobId) {
+      return res.status(400).json({ success: false, error: 'Pick the older version to bring the edits from.' });
+    }
+    const job = carryEdits.start(userId, jobId, String(fromJobId));
+    res.json({ success: true, status: job.status, message: job.message });
+  } catch (error) {
+    console.error('[ManualClip] Carry edits error:', error);
+    res.status(500).json({ success: false, error: 'Could not start bringing the edits over.' });
+  }
+});
+
+// GET /api/manual-clip/library/:jobId/carry-edits/status
+// { status: running|complete|error|none, message, error, report }
+router.get('/library/:jobId/carry-edits/status', (req, res) => {
+  const job = carryEdits.status(req.params.jobId);
+  if (!job) return res.json({ success: true, status: 'none' });
+  res.json({ success: true, status: job.status, message: job.message, error: job.error, report: job.report });
 });
 
 // ============================================================
