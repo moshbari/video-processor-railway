@@ -208,16 +208,10 @@ router.post('/generate/:jobId', async (req, res) => {
       }
     }
 
-    // Check job exists
+    // A missing in-memory job (server restarted) is rebuilt from the library
+    // inside generateManualClips -> ensureSourceAvailable; a present one must be ready.
     const jobStatus = manualClipService.getJobStatus(jobId);
-    if (!jobStatus) {
-      return res.status(404).json({
-        success: false,
-        error: 'Video session not found. Please prepare the video again.'
-      });
-    }
-
-    if (jobStatus.status !== 'ready' && jobStatus.status !== 'complete') {
+    if (jobStatus && jobStatus.status !== 'ready' && jobStatus.status !== 'complete') {
       return res.status(400).json({
         success: false,
         error: 'Video is not ready yet. Please wait for preparation to complete.'
@@ -352,13 +346,10 @@ router.post('/render-sequence/:jobId', async (req, res) => {
     }
 
     const jobStatus = manualClipService.getJobStatus(jobId);
-    if (!jobStatus) {
-      return res.status(404).json({
-        success: false,
-        error: 'Video session not found. Please prepare the video again.'
-      });
-    }
-    if (jobStatus.status !== 'ready' && jobStatus.status !== 'complete') {
+    // Allow when the in-memory job is gone (a redeploy/restart wipes it while
+    // the editor is still open) — renderPodcastSequence -> ensureSourceAvailable
+    // rebuilds it from the saved library. If it IS present it must be ready.
+    if (jobStatus && jobStatus.status !== 'ready' && jobStatus.status !== 'complete') {
       return res.status(400).json({
         success: false,
         error: 'Video is not ready yet. Please wait for preparation to complete.'

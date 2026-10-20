@@ -464,6 +464,9 @@ class ManualClipService {
    * @param {Object} options - { format, captionStyle, addCaptions }
    */
   async generateManualClips(jobId, clips, options = {}) {
+    // Mark it busy BEFORE the (possibly minutes-long) restore from R2, so the
+    // editor's /status polling finds a job instead of a 404 after a restart.
+    this.updateJob(jobId, { status: 'generating', progress: 1, currentClip: 'Getting your video ready...', generatedClips: [], error: null });
     const job = await this.ensureSourceAvailable(jobId, options.userId);
 
     const {
@@ -663,6 +666,9 @@ class ManualClipService {
    * @param {Object} options - { title }
    */
   async renderPodcastSequence(jobId, hooks, options = {}) {
+    // Mark it busy BEFORE the (possibly minutes-long) restore from R2, so the
+    // editor's /status polling finds a job instead of a 404 after a restart.
+    this.updateJob(jobId, { status: 'generating', progress: 1, currentClip: 'Getting your video ready...', generatedClips: [], error: null });
     const job = await this.ensureSourceAvailable(jobId, options.userId);
 
     let videoPath = job.videoPath;
