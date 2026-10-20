@@ -809,25 +809,33 @@ class ManualClipService {
       hooksTotalSeconds += (endTime - startTime);
     }
 
-    // ⚡ Hook transitions + red progress bar: join the hooks into one section
-    // with the effects drawn on (see buildHooksSection). They need each hook's
-    // REAL length, so probe rather than trust the ask. Best-effort — if it
-    // fails, the render goes ahead with the plain hooks.
+    // ⚡ Hook transitions + red progress bar, drawn onto each hook file in turn
+    // (see decorateHook). They need each hook's REAL length, so probe rather
+    // than trust the ask. Best-effort per hook — one that fails stays plain, the
+    // render goes on. The hooks stay separate inputs to the final concat, just
+    // as before.
     if (totalHooks > 0) {
       const hookDurations = [];
       for (let i = 0; i < totalHooks; i++) {
         const d = await this.getVideoDuration(segmentPaths[i]).catch(() => 0);
         hookDurations.push(d > 0 ? d : (parseFloat(ordered[i].endTime) - parseFloat(ordered[i].startTime)));
       }
-      this.updateJob(jobId, { step: 'hook_transitions', progress: 55, currentClip: 'Adding the hook transitions…' });
-      const sectionPath = path.join(seqDir, 'hooks_section.mp4');
-      try {
-        await this.buildHooksSection(segmentPaths.slice(0, totalHooks), hookDurations, sectionPath);
-        for (const p of segmentPaths.slice(0, totalHooks)) await fs.remove(p).catch(() => {});
-        segmentPaths.splice(0, totalHooks, sectionPath);
-      } catch (err) {
-        console.error(`[ManualClip ${jobId}] Hook transitions failed (rendering without them):`, err.message);
+      const hooksTotal = hookDurations.reduce((sum, d) => sum + d, 0);
+      let startSec = 0;
+      let failed = 0;
+      for (let i = 0; i < totalHooks; i++) {
+        this.updateJob(jobId, { step: 'hook_transitions', progress: 55, currentClip: `Adding hook transitions (${i + 1} of ${totalHooks})…` });
+        const fxPath = segmentPaths[i].replace(/\.mp4$/, '_fx.mp4');
+        try {
+          await this.decorateHook(segmentPaths[i], fxPath, { flash: i > 0, startSec, totalSec: hooksTotal });
+          await fs.remove(segmentPaths[i]).catch(() => {});
+          segmentPaths[i] = fxPath;
+        } catch (err) {
+          failed++;
+        }
+        startSec += hookDurations[i];
       }
+      console.log(`  ⚡ Hook transitions + red bar on ${totalHooks - failed}/${totalHooks} hook(s) (${hooksTotal.toFixed(1)}s)`);
     }
 
     // Step 2: Build the FINAL segment from the FULL source video. If the user
@@ -1101,72 +1109,58 @@ class ManualClipService {
   }
 
   /**
-   * ⚡ Join the extracted hooks into ONE "hooks section" file with the hook
-   * effects drawn on: a quick white flash + whoosh at the start of every hook
-   * after the first (so viewers see they're separate moments), and a thin red
-   * progress bar that fills across the whole section and is full on its last
-   * frame — i.e. exactly as the main video starts. Drawn ON the hooks, never
-   * added between them, so the length (and every final-clock CTA time) is
-   * unchanged.
+   * ⚡ Draw the hook effects onto ONE extracted hook, in its own small FFmpeg
+   * run: a quick white flash + whoosh at its start (every hook after the first,
+   * so viewers see they're separate moments), and a thin red progress bar that
+   * fills across the WHOLE hooks section — `startSec` is where this hook begins
+   * on that section's clock, `totalSec` its length — so the bar is full on the
+   * last hook's last frame, exactly as the main video starts. Drawn ON the hook,
+   * never added between hooks, so the length (and every final-clock CTA time)
+   * is unchanged.
    *
-   * Its own small pass ON PURPOSE. Doing this inside concatenateSequence16x9
-   * broke real renders on FFmpeg 5.1: when the main video's frame properties
-   * change mid-stream FFmpeg rebuilds the whole graph, and a graph holding
-   * color/anoisesrc sources could not be rebuilt ("Error reinitializing
-   * filters!"). The hooks are all cut the same way from one source, so they
-   * never trigger that — and the big final graph stays exactly as it was.
+   * One hook per run ON PURPOSE. With many inputs in one graph, FFmpeg 5.1
+   * configures the graph before it has seen the later inputs' first frames,
+   * then rebuilds it when they arrive — and a graph holding color/anoisesrc
+   * sources cannot be rebuilt ("auto_scale_N Failed to configure output pad /
+   * Error reinitializing filters!"). That killed every real render, both inside
+   * the final concat and as a single 16-hook pass. A single-input graph is set
+   * up from that input's first frame, so it never needs rebuilding.
    */
-  buildHooksSection(hookPaths, durations, outputPath) {
+  decorateHook(inputPath, outputPath, { flash, startSec, totalSec }) {
     return new Promise((resolve, reject) => {
-      const n = hookPaths.length;
-      const total = durations.reduce((s, d) => s + d, 0);
       const BAR_H = 8; // thin red bar along the bottom edge
       const AF = 'aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo';
-      const parts = [];
-      let concatInputs = '';
-      let startSoFar = 0;
-      for (let i = 0; i < n; i++) {
-        // Same normalising as the final concat (it's a no-op there afterwards).
-        parts.push(`[${i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,setpts=PTS-STARTPTS,format=yuv420p[vs${i}]`);
-        parts.push(`[${i}:a]asetpts=PTS-STARTPTS,${AF}[as${i}]`);
-        // Flash in from white on every hook after the first, then the bar: a
-        // faint track plus a red fill sliding in from the left, positioned on
-        // the section's clock (this hook's offset + t) so it runs on across joins.
-        const flash = i > 0 ? 'fade=t=in:st=0:d=0.25:color=white,' : '';
-        parts.push(`color=c=0xFF0000:s=1920x${BAR_H}:r=30[bar${i}]`);
-        parts.push(`[vs${i}]${flash}drawbox=x=0:y=ih-${BAR_H}:w=iw:h=${BAR_H}:color=black@0.35:t=fill[vt${i}]`);
-        parts.push(`[vt${i}][bar${i}]overlay=x='-1920+1920*min(1\\,(${startSoFar.toFixed(3)}+t)/${total.toFixed(3)})':y=H-h:shortest=1,format=yuv420p[v${i}]`);
-        if (i > 0) {
-          // Whoosh: a short burst of pink noise, band-limited and swelled in/out.
-          parts.push(`anoisesrc=d=0.4:c=pink:a=0.35:r=48000,highpass=f=300,lowpass=f=5000,afade=t=in:st=0:d=0.12,afade=t=out:st=0.12:d=0.28,${AF}[wh${i}]`);
-          parts.push(`[as${i}][wh${i}]amix=inputs=2:duration=first:dropout_transition=0:weights=1 1:normalize=0,${AF}[a${i}]`);
-        } else {
-          parts.push(`[as${i}]anull[a${i}]`);
-        }
-        concatInputs += `[v${i}][a${i}]`;
-        startSoFar += durations[i];
+      const parts = [
+        `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,setpts=PTS-STARTPTS,format=yuv420p${flash ? ',fade=t=in:st=0:d=0.25:color=white' : ''},drawbox=x=0:y=ih-${BAR_H}:w=iw:h=${BAR_H}:color=black@0.35:t=fill[vt]`,
+        `color=c=0xFF0000:s=1920x${BAR_H}:r=30[bar]`,
+        // Red fill slides in from the left on the hooks-section clock.
+        `[vt][bar]overlay=x='-1920+1920*min(1\\,(${startSec.toFixed(3)}+t)/${totalSec.toFixed(3)})':y=H-h:shortest=1,format=yuv420p[outv]`,
+      ];
+      if (flash) {
+        // Whoosh: a short burst of pink noise, band-limited and swelled in/out.
+        parts.push(`[0:a]asetpts=PTS-STARTPTS,${AF}[as]`);
+        parts.push(`anoisesrc=d=0.4:c=pink:a=0.35:r=48000,highpass=f=300,lowpass=f=5000,afade=t=in:st=0:d=0.12,afade=t=out:st=0.12:d=0.28,${AF}[wh]`);
+        parts.push(`[as][wh]amix=inputs=2:duration=first:dropout_transition=0:weights=1 1:normalize=0,${AF}[outa]`);
+      } else {
+        parts.push(`[0:a]asetpts=PTS-STARTPTS,${AF}[outa]`);
       }
-      parts.push(`${concatInputs}concat=n=${n}:v=1:a=1[outv][cata]`);
-      parts.push(`[cata]${AF}[outa]`);
 
-      // Near-transparent quality: this section is encoded once more by the
-      // final concat. AAC (not FLAC) — FLAC trips the concat FILTER on 5.1.
+      // Near-transparent quality: the final concat encodes it once more.
+      // AAC (not FLAC) — FLAC trips the concat FILTER on 5.1.
       const args = [
-        '-y',
-        ...hookPaths.flatMap(p => ['-i', p]),
+        '-y', '-i', inputPath,
         '-filter_complex', parts.join(';'),
         '-map', '[outv]', '-map', '[outa]',
         '-c:v', 'libx264', '-preset', 'medium', '-crf', '14',
         '-c:a', 'aac', '-ar', '48000', '-b:a', '320k',
         outputPath
       ];
-      console.log(`  [Hooks section] ${n} hook(s) + flash/whoosh + red bar (${total.toFixed(1)}s)`);
       const proc = spawn('ffmpeg', args);
       let stderr = '';
       proc.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 20000) stderr = stderr.slice(-10000); });
       proc.on('close', (code) => {
         if (code === 0) resolve(outputPath);
-        else { console.error(stderr.slice(-800)); reject(new Error('Could not add the hook transitions.')); }
+        else { console.error(stderr.slice(-800)); reject(new Error('Could not add the hook transition.')); }
       });
       proc.on('error', (err) => reject(err));
     });
