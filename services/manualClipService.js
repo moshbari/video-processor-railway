@@ -20,6 +20,8 @@ const execAsync = promisify(exec);
 
 const axios = require('axios');
 const r2Service = require('./r2Service');
+// Poppins (OFL) for the burned-in hook countdown — bundled, the slim image has no nice fonts.
+const HOOK_FONTS_DIR = path.join(__dirname, '..', 'assets', 'fonts');
 const downloadService = require('./downloadService');
 const transcriptionService = require('./transcriptionService');
 const manualVideoLibraryService = require('./manualVideoLibraryService');
@@ -827,7 +829,18 @@ class ManualClipService {
         this.updateJob(jobId, { step: 'hook_transitions', progress: 55, currentClip: `Adding hook transitions (${i + 1} of ${totalHooks})…` });
         const fxPath = segmentPaths[i].replace(/\.mp4$/, '_fx.mp4');
         try {
-          await this.decorateHook(segmentPaths[i], fxPath, { flash: i > 0, startSec, totalSec: hooksTotal });
+          // ⏱ The countdown card for THIS hook's slice of the hooks section.
+          // Best-effort: without it the hook still gets its flash + bar.
+          let countdownAss = null;
+          try {
+            countdownAss = await this.buildHookCountdownAss(
+              { startSec, dur: hookDurations[i], totalSec: hooksTotal, first: i === 0, last: i === totalHooks - 1 },
+              segmentPaths[i].replace(/\.mp4$/, '_countdown.ass'));
+          } catch (err) {
+            console.error(`[ManualClip ${jobId}] Countdown for hook ${i + 1} failed (skipping it):`, err.message);
+          }
+          await this.decorateHook(segmentPaths[i], fxPath, { flash: i > 0, startSec, totalSec: hooksTotal, countdownAss });
+          if (countdownAss) await fs.remove(countdownAss).catch(() => {});
           await fs.remove(segmentPaths[i]).catch(() => {});
           segmentPaths[i] = fxPath;
         } catch (err) {
@@ -835,7 +848,7 @@ class ManualClipService {
         }
         startSec += hookDurations[i];
       }
-      console.log(`  ⚡ Hook transitions + red bar on ${totalHooks - failed}/${totalHooks} hook(s) (${hooksTotal.toFixed(1)}s)`);
+      console.log(`  ⚡ Hook transitions + red bar + countdown on ${totalHooks - failed}/${totalHooks} hook(s) (${hooksTotal.toFixed(1)}s)`);
     }
 
     // Step 2: Build the FINAL segment from the FULL source video. If the user
@@ -1108,6 +1121,115 @@ class ManualClipService {
     };
   }
 
+  /** Escape a path for use inside a quoted FFmpeg filter option. */
+  escapeFilterPath(p) {
+    return String(p).replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'");
+  }
+
+  /**
+   * ⏱ The hooks-section countdown, as an animated ASS overlay for ONE hook.
+   *
+   * A frosted-glass card in the bottom-left corner, just above the red bar:
+   * a red "live" dot that sends out a soft radar ping every second, a small
+   * spaced-out FULL EPISODE IN label, and the time left until the main video in
+   * big Poppins (m:ss). Each new number slides up and fades in as the old one
+   * fades out; the last 5 seconds turn red and pop. The card glides up and
+   * fades in at the very start of the hooks and fades away at their end.
+   *
+   * Timed on this hook's own clock (0 = its first frame), but counting on the
+   * hooks-section clock: `startSec` is where the hook starts in the section,
+   * `totalSec` the section's length — so the count runs on unbroken across
+   * every join. Mirrored in the editor's Final Preview (FinalPreviewModal).
+   */
+  async buildHookCountdownAss({ startSec, dur, totalSec, first, last }, outputPath) {
+    // Geometry on the 1920x1080 frame. Keep in step with the preview's card.
+    const X = 56, Y = 924, W = 340, H = 112, R = 22;
+    const ENTER = first ? 450 : 0;           // ms — card glides in
+    const EXIT = last ? 320 : 0;             // ms — card fades away
+    const t = (sec) => this.secondsToAssTime(Math.max(0, sec));
+    const end = dur;
+    const RED = '3B3BFF';                    // &HBBGGRR& — #FF3B3B
+    const WHITE = 'FFFFFF';
+
+    const card = `m ${R} 0 l ${W - R} 0 b ${W} 0 ${W} 0 ${W} ${R} l ${W} ${H - R} b ${W} ${H} ${W} ${H} ${W - R} ${H} l ${R} ${H} b 0 ${H} 0 ${H} 0 ${H - R} l 0 ${R} b 0 0 0 0 ${R} 0`;
+    const circle = (d) => `m ${d / 2} 0 b ${d * 0.78} 0 ${d} ${d * 0.22} ${d} ${d / 2} b ${d} ${d * 0.78} ${d * 0.78} ${d} ${d / 2} ${d} b ${d * 0.22} ${d} 0 ${d * 0.78} 0 ${d / 2} b 0 ${d * 0.22} ${d * 0.22} 0 ${d / 2} 0`;
+    // Slide-in (first hook) + fade in/out, shared by every piece of the card.
+    const enter = (x, y, extra = '') => (ENTER
+      ? `\\move(${x},${y + 26},${x},${y},0,${ENTER})\\fad(${ENTER},${EXIT})${extra}`
+      : `\\pos(${x},${y})\\fad(0,${EXIT})${extra}`);
+
+    let ass = `[Script Info]
+Title: Hook Countdown
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: CDShape,Poppins,20,&H00FFFFFF,&H000000FF,&H00FFFFFF,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1
+Style: CDLabel,Poppins SemiBold,19,&H40FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,3.5,0,1,0,0,7,0,0,0,1
+Style: CDNum,Poppins,58,&H00FFFFFF,&H000000FF,&H00000000,&H96000000,-1,0,0,0,100,100,1,0,1,0,2,4,0,0,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+`;
+    const line = (layer, s0, s1, style, tags, body) => {
+      if (s1 - s0 < 0.02) return;
+      ass += `Dialogue: ${layer},${t(s0)},${t(s1)},${style},,0,0,0,,{${tags}}${body}\n`;
+    };
+
+    // The card: soft shadow, dark glass, hairline light border.
+    line(0, 0, end, 'CDShape', `\\an7${enter(X + 4, Y + 6)}\\1c&H000000&\\1a&HA0&\\bord0\\blur8\\p1`, `${card}{\\p0}`);
+    line(1, 0, end, 'CDShape', `\\an7${enter(X, Y)}\\1c&H140D0A&\\1a&H38&\\3c&HFFFFFF&\\3a&HC8&\\bord1.5\\p1`, `${card}{\\p0}`);
+    // Label.
+    line(3, 0, end, 'CDLabel', `\\an7${enter(X + 70, Y + 20)}`, 'FULL EPISODE IN');
+
+    // One event per second of countdown that overlaps this hook.
+    const DOT_X = X + 38, DOT_Y = Y + H / 2 + 4;
+    const fmt = (k) => `${Math.floor(k / 60)}:${String(k % 60).padStart(2, '0')}`;
+    const hookEnd = startSec + dur;
+    for (let k = Math.ceil(totalSec - startSec); k >= 1; k--) {
+      // On the section clock, k is shown while totalSec-k < g <= totalSec-(k-1).
+      const gFrom = Math.max(startSec, totalSec - k);
+      const gTo = Math.min(hookEnd, totalSec - (k - 1));
+      if (gTo <= gFrom) continue;
+      const a = gFrom - startSec;            // local seconds in this hook
+      const b = gTo - startSec;
+      const tick = gFrom > startSec + 0.01;  // a real tick, not just the hook's first frame
+      const isFirstShow = first && a < 0.01;
+      const urgent = k <= 5;
+      const col = urgent ? RED : WHITE;
+      const nx = X + 70, ny = Y + 72;
+      // The number's "window": anything rolling outside its row is hidden,
+      // so a tick reads as an odometer, not two numbers on top of each other.
+      const clip = `\\clip(${X + 60},${ny - 29},${X + W - 8},${ny + 29})`;
+      const ROLL = 46;
+      let tags;
+      if (isFirstShow) tags = `\\an4${enter(nx, ny)}\\1c&H${col}&`;
+      else if (tick && urgent) tags = `\\an4\\move(${nx},${ny + ROLL},${nx},${ny},0,200)${clip}\\1c&H${col}&\\fscx114\\fscy114\\t(170,400,0.6,\\fscx100\\fscy100)${last && b >= end - 0.01 ? `\\fad(0,${EXIT})` : ''}`;
+      else if (tick) tags = `\\an4\\move(${nx},${ny + ROLL},${nx},${ny},0,230)${clip}\\1c&H${col}&${last && b >= end - 0.01 ? `\\fad(0,${EXIT})` : ''}`;
+      else tags = `\\an4\\pos(${nx},${ny})\\1c&H${col}&${last && b >= end - 0.01 ? `\\fad(0,${EXIT})` : ''}`;
+      line(4, a, b, 'CDNum', tags, fmt(k));
+      // Slot roll: as the next number rises into place, this one rises out
+      // and fades. Not at the hook's end — the next hook starts on a flash.
+      if (b < end - 0.01) {
+        line(4, b, b + 0.23, 'CDNum', `\\an4\\move(${nx},${ny},${nx},${ny - ROLL},0,230)${clip}\\1c&H${col}&`, fmt(k));
+      }
+
+      // The live dot (steady) and its radar ping, once per second.
+      const dotTags = (d) => `\\an5\\1c&H${RED}&\\bord0`;
+      line(2, a, b, 'CDShape', `${dotTags(16)}${isFirstShow ? enter(DOT_X, DOT_Y) : `\\pos(${DOT_X},${DOT_Y})${last && b >= end - 0.01 ? `\\fad(0,${EXIT})` : ''}`}\\p1`, `${circle(16)}{\\p0}`);
+      if (tick) {
+        line(2, a, Math.min(b, a + 0.9), 'CDShape', `\\an5\\pos(${DOT_X},${DOT_Y})\\1c&H${RED}&\\1a&H50&\\bord0\\t(0,850,0.5,\\fscx300\\fscy300\\1a&HFF&)\\p1`, `${circle(16)}{\\p0}`);
+      }
+    }
+
+    await fs.writeFile(outputPath, ass, 'utf8');
+    return outputPath;
+  }
+
   /**
    * ⚡ Draw the hook effects onto ONE extracted hook, in its own small FFmpeg
    * run: a quick white flash + whoosh at its start (every hook after the first,
@@ -1126,7 +1248,7 @@ class ManualClipService {
    * the final concat and as a single 16-hook pass. A single-input graph is set
    * up from that input's first frame, so it never needs rebuilding.
    */
-  decorateHook(inputPath, outputPath, { flash, startSec, totalSec }) {
+  decorateHook(inputPath, outputPath, { flash, startSec, totalSec, countdownAss = null }) {
     return new Promise((resolve, reject) => {
       const BAR_H = 8; // thin red bar along the bottom edge
       const AF = 'aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo';
@@ -1134,7 +1256,7 @@ class ManualClipService {
         `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,setpts=PTS-STARTPTS,format=yuv420p${flash ? ',fade=t=in:st=0:d=0.25:color=white' : ''},drawbox=x=0:y=ih-${BAR_H}:w=iw:h=${BAR_H}:color=black@0.35:t=fill[vt]`,
         `color=c=0xFF0000:s=1920x${BAR_H}:r=30[bar]`,
         // Red fill slides in from the left on the hooks-section clock.
-        `[vt][bar]overlay=x='-1920+1920*min(1\\,(${startSec.toFixed(3)}+t)/${totalSec.toFixed(3)})':y=H-h:shortest=1,format=yuv420p[outv]`,
+        `[vt][bar]overlay=x='-1920+1920*min(1\\,(${startSec.toFixed(3)}+t)/${totalSec.toFixed(3)})':y=H-h:shortest=1,format=yuv420p${countdownAss ? `,subtitles=filename='${this.escapeFilterPath(countdownAss)}':fontsdir='${this.escapeFilterPath(HOOK_FONTS_DIR)}'` : ''}[outv]`,
       ];
       if (flash) {
         // Whoosh: a short burst of pink noise, band-limited and swelled in/out.
