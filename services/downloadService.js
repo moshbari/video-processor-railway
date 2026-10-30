@@ -132,10 +132,11 @@ function ytdlpExtra() {
 }
 
 // Same flags as an argv array, for runYtdlp.
-function ytdlpArgs() {
+// TikTok gets no cookies: the jar holds YouTube/Facebook/Instagram logins.
+function ytdlpArgs({ cookies = true } = {}) {
   ytdlpExtra();
   const args = ['--no-playlist', '--no-warnings'];
-  if (cookieState === 'ok') args.push('--cookies', '/tmp/yt-cookies.txt');
+  if (cookies && cookieState === 'ok') args.push('--cookies', '/tmp/yt-cookies.txt');
   return args;
 }
 
@@ -203,9 +204,10 @@ class DownloadService {
       const proxy = pick();
       if (pick === proxied && !proxy) continue; // no PROXY_URL set
       const net = proxy ? ['--proxy', proxy] : [];
+      const base = ytdlpArgs({ cookies: !isTikTok(url) });
       try {
         console.log(`Getting info for: ${url}${proxy ? ' (via proxy)' : ''}`);
-        const infoJson = await runYtdlp([...ytdlpArgs(), ...net, '--dump-json', url], { timeoutMs: 90 * 1000 });
+        const infoJson = await runYtdlp([...base, ...net, '--dump-json', url], { timeoutMs: 90 * 1000 });
         const info = JSON.parse(infoJson.split('\n').find((l) => l.trim().startsWith('{')));
 
         if (info.duration && info.duration > this.maxDuration) {
@@ -220,7 +222,7 @@ class DownloadService {
         console.log(`Downloading video: ${info.title || 'Unknown'}`);
         await fs.emptyDir(outputPath);
         await runYtdlp([
-          ...ytdlpArgs(), ...net,
+          ...base, ...net,
           '-N', '8', '--retries', '5', '--fragment-retries', '10',
           ...FORMAT_ARGS, '--merge-output-format', 'mp4',
           '-o', outputFile, url,
