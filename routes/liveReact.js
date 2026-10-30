@@ -103,7 +103,18 @@ async function runGrab(job) {
     // Move the index to the front (faststart) so the phone starts playing the
     // video straight from the link instead of waiting for the whole file.
     const ready = path.join(path.dirname(r.videoPath), 'ready.mp4');
-    await execAsync(`ffmpeg -y -v error -i "${r.videoPath}" -c copy -movflags +faststart "${ready}"`, { maxBuffer: 1024 * 1024 * 20 });
+    // Some sites (Facebook) only give AV1 or VP9 at 1080p, which most iPhones
+    // can't play (black picture, sound only). Anything but H.264 is turned into
+    // H.264 at the same size; H.264 is just copied.
+    const { stdout: codecOut } = await execAsync(`ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "${r.videoPath}"`).catch(() => ({ stdout: '' }));
+    const codec = String(codecOut).trim();
+    if (codec && codec !== 'h264') {
+      job.stage = 'convert';
+      console.log(`[LiveReact] converting ${codec} to h264: ${job.url}`);
+      await execAsync(`ffmpeg -y -v error -i "${r.videoPath}" -map 0:v:0 -map 0:a:0? -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -c:a aac -b:a 160k -movflags +faststart "${ready}"`, { maxBuffer: 1024 * 1024 * 20 });
+    } else {
+      await execAsync(`ffmpeg -y -v error -i "${r.videoPath}" -c copy -movflags +faststart "${ready}"`, { maxBuffer: 1024 * 1024 * 20 });
+    }
 
     const [duration, dims] = await Promise.all([
       renderService.probeDuration(ready),
