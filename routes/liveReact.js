@@ -7,6 +7,7 @@
  *
  *   POST /api/live-react/grab        {url}  -> { grabId }  (download runs in the background)
  *   GET  /api/live-react/grab/:id            -> { status, stage, progress, main, warning, error }
+ *   POST /api/live-react/import      file 'file', field 'title' -> { grabId }  (a video from the phone's Photos/Files)
  *   POST /api/live-react/upload      file 'file', field 'project' -> { url }  (one recording)
  *   POST /api/live-react/render      {project} -> { renderId }  (runs in the background)
  *   GET  /api/live-react/render/:id           -> { status, progress, words, video, error }
@@ -184,6 +185,56 @@ router.get('/grab/:id', (req, res) => {
   if (!job || job.deviceId !== deviceId) {
     return res.status(404).json({ success: false, error: 'That download is no longer on the server. Send the link again.' });
   }
+  res.json({ success: true, ...publicJob(job) });
+});
+
+// ===================== A video from the phone (Photos / Files) =====================
+// Same job as a grab, so the app follows it the same way. Phone videos come in
+// every shape (HEVC, 4K, rotated), so they're always made into H.264 with the
+// short side at most 1080, rotation applied, ready to stream.
+async function runImport(job, file, title) {
+  const work = path.join(process.env.TEMP_DIR || '/app/temp', `live-react-${job.id}`);
+  try {
+    await fs.ensureDir(work);
+    job.stage = 'convert';
+    job.progress = 0;
+    const ready = path.join(work, 'ready.mp4');
+    const fit = "scale='if(gt(iw,ih),-2,min(1080,iw))':'if(gt(iw,ih),min(1080,ih),-2)'";
+    await execAsync(`ffmpeg -y -v error -i "${file}" -map 0:v:0 -map 0:a:0? -vf "${fit}" -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -r 30 -c:a aac -b:a 160k -movflags +faststart "${ready}"`, { maxBuffer: 1024 * 1024 * 20 });
+    const [duration, dims] = await Promise.all([renderService.probeDuration(ready), renderService.probeDimensions(ready)]);
+    if (duration > MAX_SECONDS) throw new Error('Video too long');
+    job.stage = 'upload';
+    const key = `live-react/${job.deviceId}/${job.id}/main.mp4`;
+    const up = await r2Service.uploadFile(ready, key, 'video/mp4');
+    const shortSide = Math.min(dims.width || 0, dims.height || 0);
+    job.warning = shortSide >= 1080 ? null : `This video is ${dims.width}×${dims.height}, so your final video will be that size too.`;
+    job.main = {
+      id: job.id, r2Key: key, url: up.downloadUrl || r2Service.getPublicUrl(key),
+      width: dims.width, height: dims.height, duration, isHD: shortSide >= 1080,
+      title: title || 'My video', thumbnail: null, platform: 'upload', sourceUrl: null,
+    };
+    job.stage = 'done';
+    job.progress = 100;
+    job.status = 'done';
+    console.log(`[LiveReact] imported ${dims.width}x${dims.height} ${Math.round(duration)}s from the phone`);
+  } catch (err) {
+    console.error('[LiveReact] import failed:', err.message);
+    job.status = 'failed';
+    job.error = /too long/i.test(err.message) ? friendly(err.message) : 'That video couldn’t be used. Try another one.';
+  } finally {
+    fs.remove(work).catch(() => {});
+    fs.remove(file).catch(() => {});
+  }
+}
+
+router.post('/import', upload.single('file'), (req, res) => {
+  const deviceId = deviceOf(req);
+  if (!deviceId) { if (req.file) fs.remove(req.file.path).catch(() => {}); return res.status(401).json({ success: false, error: 'Open the app and sign in with your code first.' }); }
+  if (!req.file) return res.status(400).json({ success: false, error: 'No video was sent.' });
+  const title = String((req.body && req.body.title) || '').trim().slice(0, 120);
+  const job = { id: uuidv4(), deviceId, url: `upload:${req.file.originalname || 'video'}`, status: 'working', stage: 'convert', progress: 0, created: Date.now() };
+  GRABS.set(job.id, job);
+  runImport(job, req.file.path, title);
   res.json({ success: true, ...publicJob(job) });
 });
 
