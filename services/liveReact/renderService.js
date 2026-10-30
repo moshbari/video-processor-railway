@@ -21,6 +21,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs-extra');
 const r2Service = require('../r2Service');
+const captions = require('./captions');
 
 const FPS = 30;
 const LUT_DIR = path.join(__dirname, '..', '..', 'assets', 'luts');
@@ -274,7 +275,7 @@ async function watchPiece(main, a, b, watches, cw, ch, box, look, blur, evenVolu
  * recording). Landscape video: the frozen frame fills it and the talk sits
  * full-height at the side.
  */
-async function talkPiece(main, at, talkFile, talkLen, cw, ch, out, workDir, i) {
+async function talkPiece(main, at, talkFile, talkLen, cw, ch, out, workDir, i, cap = '') {
   const still = path.join(workDir, `still-${i}.jpg`);
   await run(['-y', '-ss', f3(Math.max(0, at - 0.04)), '-i', main, '-frames:v', '1', '-q:v', '2', still], 'still')
     .catch(() => run(['-y', '-i', main, '-frames:v', '1', '-q:v', '2', still], 'still'));
@@ -284,12 +285,12 @@ async function talkPiece(main, at, talkFile, talkLen, cw, ch, out, workDir, i) {
     const mw = even(cw * 0.32);
     fc = `[1:v]scale=${cw}:${ch}:force_original_aspect_ratio=increase,crop=${cw}:${ch},setsar=1,fps=${FPS}[t];` +
          `[0:v]scale=${mw}:-2,pad=iw+8:ih+8:4:4:white[m];` +
-         `[t][m]overlay=x=${Math.round(cw * 0.04)}:y=${Math.round(ch * 0.04)},format=yuv420p[vo]`;
+         `[t][m]overlay=x=${Math.round(cw * 0.04)}:y=${Math.round(ch * 0.04)}${cap ? ',' + cap : ''},format=yuv420p[vo]`;
   } else {
     const th = even(ch * 0.9);
     fc = `[0:v]scale=${cw}:${ch}:force_original_aspect_ratio=decrease,pad=${cw}:${ch}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${FPS}[bg];` +
          `[1:v]scale=-2:${th},pad=iw+8:ih+8:4:4:white[t];` +
-         `[bg][t]overlay=x=W-w-${Math.round(cw * 0.03)}:y=(H-h)/2,format=yuv420p[vo]`;
+         `[bg][t]overlay=x=W-w-${Math.round(cw * 0.03)}:y=(H-h)/2${cap ? ',' + cap : ''},format=yuv420p[vo]`;
   }
   await run(['-y', '-loop', '1', '-t', f3(talkLen), '-i', still, '-i', talkFile,
     '-filter_complex', fc, '-map', '[vo]', '-map', '1:a', '-t', f3(talkLen), ...ENC, ...AENC, out], 'talk piece');
@@ -297,11 +298,11 @@ async function talkPiece(main, at, talkFile, talkLen, cw, ch, out, workDir, i) {
 }
 
 /** Intro / ending: the talk on its own, filling the frame (blurred copy behind it if the shapes differ). */
-async function soloPiece(talkFile, talkLen, cw, ch, out) {
+async function soloPiece(talkFile, talkLen, cw, ch, out, cap = '') {
   const fc = `[0:v]split[a][b];` +
     `[a]scale=${cw}:${ch}:force_original_aspect_ratio=increase,crop=${cw}:${ch},gblur=sigma=40,eq=brightness=-0.08[bg];` +
     `[b]scale=${cw}:${ch}:force_original_aspect_ratio=decrease,setsar=1[fg];` +
-    `[bg][fg]overlay=(W-w)/2:(H-h)/2,fps=${FPS},format=yuv420p[vo]`;
+    `[bg][fg]overlay=(W-w)/2:(H-h)/2,fps=${FPS}${cap ? ',' + cap : ''},format=yuv420p[vo]`;
   await run(['-y', '-i', talkFile, '-filter_complex', fc, '-map', '[vo]', '-map', '0:a', '-t', f3(talkLen), ...ENC, ...AENC, out], 'solo piece');
   return out;
 }
@@ -375,7 +376,10 @@ async function render(project, workDir, onProgress = () => {}) {
     if (!keep.length) continue;   // nothing left (all silence)
     const dims = await probeDisplaySize(t.file);
     const look = reactorFilter(lut, blur, Math.min(dims.width, dims.height));
-    cleaned.set(t, await cleanTalk(t.file, path.join(workDir, `talk-${i}.mp4`), keep, look, evenVolume));
+    const c = await cleanTalk(t.file, path.join(workDir, `talk-${i}.mp4`), keep, look, evenVolume);
+    // Captions: the words moved to where they land after the cuts.
+    if (opt.captions && Array.isArray(t.words)) c.words = captions.remapWords(t.words, cuts);
+    cleaned.set(t, c);
   }
 
   // Watch clips get the same look; their blur is applied at box size in watchPiece.
@@ -409,8 +413,11 @@ async function render(project, workDir, onProgress = () => {}) {
       pieces.push(await watchPiece(main, s.a, s.b, watches, cw, ch, box, faceLook, blur, evenVolume, out));
     } else {
       const c = cleaned.get(s.t);
-      if (s.type === 'talk') pieces.push(await talkPiece(main, s.at, c.file, c.duration, cw, ch, out, workDir, i));
-      else pieces.push(await soloPiece(c.file, c.duration, cw, ch, out));
+      const cap = opt.captions
+        ? await captions.captionFilter(c.words, opt.captions.design, opt.captions.place, cw, ch, path.join(workDir, `captions-${i}.ass`))
+        : '';
+      if (s.type === 'talk') pieces.push(await talkPiece(main, s.at, c.file, c.duration, cw, ch, out, workDir, i, cap));
+      else pieces.push(await soloPiece(c.file, c.duration, cw, ch, out, cap));
     }
   }
   if (!pieces.length) throw new Error('Nothing to render: no video and no talks.');

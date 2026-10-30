@@ -225,7 +225,7 @@ router.post('/render', async (req, res) => {
     } catch (err) {
       console.error('[LiveReact] render failed:', err.message);
       job.status = 'failed';
-      job.error = 'The video didn’t render. Tap Render to try again.';
+      job.error = 'The video didn’t render. Tap Make my RANT to try again.';
     } finally {
       fs.remove(workDir).catch(() => {});
     }
@@ -235,7 +235,7 @@ router.post('/render', async (req, res) => {
 
 router.get('/render/:id', (req, res) => {
   const job = RENDERS.get(req.params.id);
-  if (!job || job.deviceId !== deviceOf(req)) return res.status(404).json({ success: false, error: 'That render is no longer on the server. Tap Render again.' });
+  if (!job || job.deviceId !== deviceOf(req)) return res.status(404).json({ success: false, error: 'That render is no longer on the server. Tap Make my RANT again.' });
   const { id, status, progress, words, video, error } = job;
   res.json({ success: true, renderId: id, status, progress, words, video, error });
 });
