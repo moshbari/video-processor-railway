@@ -184,24 +184,19 @@ class DownloadService {
       }
     }
 
-    // --- TikTok: yt-dlp is IP-blocked from datacenter, resolve via tikwm CDN ---
-    if (isTikTok(url)) {
-      try {
-        return await this.downloadTikTok(url, outputPath, id);
-      } catch (e) {
-        console.error('TikTok resolver failed, falling back to yt-dlp:', e.message);
-        // fall through to yt-dlp
-      }
-    }
-
     const outputFile = path.join(outputPath, 'video.%(ext)s');
 
     // Try order. YouTube: through the proxy (3 fresh home IPs), then direct.
     // Everything else: direct first (free), then through the proxy.
     const proxied = () => proxyUrl();
+    // TikTok: yt-dlp is IP-blocked from data centres, so it goes through the
+    // proxy (that gets TikTok's best copy, e.g. 720p where tikwm hands 540p),
+    // and the free tikwm resolver below is the backup.
     const plan = isYouTube(url)
       ? [proxied, proxied, proxied, () => null]
-      : [() => null, proxied];
+      : isTikTok(url)
+        ? [proxied, proxied]
+        : [() => null, proxied];
 
     let lastError = null;
     for (const pick of plan) {
@@ -256,6 +251,15 @@ class DownloadService {
         lastError = error;
         console.error(`Download attempt failed${proxy ? ' (via proxy)' : ''}: ${error.message}`);
         if (error.final || /Unsupported URL|Private video|Video unavailable|removed/i.test(error.message)) break;
+      }
+    }
+
+    if (isTikTok(url)) {
+      try {
+        await fs.emptyDir(outputPath);
+        return await this.downloadTikTok(url, outputPath, id);
+      } catch (e) {
+        console.error('TikTok resolver failed too:', e.message);
       }
     }
 
