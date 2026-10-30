@@ -22,6 +22,7 @@ const path = require('path');
 const fs = require('fs-extra');
 const r2Service = require('../r2Service');
 const captions = require('./captions');
+const talkWords = require('./talkWords');
 
 const FPS = 30;
 const LUT_DIR = path.join(__dirname, '..', '..', 'assets', 'luts');
@@ -320,7 +321,8 @@ async function concat(files, out, workDir) {
  * project = {
  *   main: { url }, startAt, endAt,
  *   watches: [{ url, sourceStart, sourceEnd }],
- *   talks:   [{ kind: 'intro'|'talk'|'ending', at, url, oops: [], cuts: [[a,b]] }],
+ *   talks:   [{ kind: 'intro'|'talk'|'ending', at, url, oops: [], cuts: [[a,b]],
+ *              words?: [{ text, start, end, endsSentence }], script?, lang? }],
  *   options: { silence: 'off'|'tight'|'natural'|'relaxed', blur: 0…1, look, lookStrength: 0…1,
  *              evenVolume: bool, faceBox: { xPct, yPct, wPct } }
  * }
@@ -377,7 +379,12 @@ async function render(project, workDir, onProgress = () => {}) {
     const dims = await probeDisplaySize(t.file);
     const look = reactorFilter(lut, blur, Math.min(dims.width, dims.height));
     const c = await cleanTalk(t.file, path.join(workDir, `talk-${i}.mp4`), keep, look, evenVolume);
-    // Captions: the words moved to where they land after the cuts.
+    // Captions: words the phone didn't time (Android, or an iPhone talk it couldn't hear)
+    // are timed here; then moved to where they land after the cuts.
+    if (opt.captions && !(Array.isArray(t.words) && t.words.length)) {
+      say(0.15 + 0.3 * (i / Math.max(1, allTalks.length)), `Timing captions for talk ${i + 1}`);
+      t.words = await talkWords.timeWords(t.file, workDir, i, t.lang || opt.captions.lang || 'english', t.script);
+    }
     if (opt.captions && Array.isArray(t.words)) c.words = captions.remapWords(t.words, cuts);
     cleaned.set(t, c);
   }
