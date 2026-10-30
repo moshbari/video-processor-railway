@@ -26,7 +26,7 @@ const talkWords = require('./talkWords');
 
 const FPS = 30;
 const LUT_DIR = path.join(__dirname, '..', '..', 'assets', 'luts');
-const LOOKS = ['orangeTeal', 'studio', 'pinkCyan', 'darkCinema', 'golden', 'cinematicBlue', 'moody', 'vintage', 'vibrant', 'pastel', 'mono'];
+const LOOKS = ['orangeTeal', 'studio', 'pinkCyan', 'darkCinema', 'podcast', 'golden', 'cinematicBlue', 'moody', 'vintage', 'vibrant', 'pastel', 'mono'];
 
 // Same numbers as AiPrompter's SilenceTrimmer / FlowCast's SilenceDetector:
 // -40 dBFS, silences of 0.5s+, keep this much after / before speech, never cut under 0.3s.
