@@ -7,6 +7,9 @@
  *
  *   POST /api/live-react/grab        {url}  -> { grabId }  (download runs in the background)
  *   GET  /api/live-react/grab/:id            -> { status, stage, progress, main, warning, error }
+ *   POST /api/live-react/upload      file 'file', field 'project' -> { url }  (one recording)
+ *   POST /api/live-react/render      {project} -> { renderId }  (runs in the background)
+ *   GET  /api/live-react/render/:id           -> { status, progress, words, video, error }
  *
  * X-Device-Id is the Get Transcript code (32 hex). It scopes the daily cap, so
  * one phone can't burn the proxy budget.
@@ -23,6 +26,20 @@ const { v4: uuidv4 } = require('uuid');
 const downloadService = require('../services/downloadService');
 const r2Service = require('../services/r2Service');
 const renderService = require('../services/proRant/renderService');
+const liveRender = require('../services/liveReact/renderService');
+const multer = require('multer');
+const os = require('os');
+const crypto = require('crypto');
+
+const uploadDir = path.join(process.env.TEMP_DIR || os.tmpdir(), 'live-react-uploads');
+fs.ensureDirSync(uploadDir);
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, uploadDir),
+    filename: (_req, file, cb) => cb(null, `${crypto.randomBytes(8).toString('hex')}${path.extname(file.originalname) || '.mov'}`),
+  }),
+  limits: { fileSize: 4 * 1024 * 1024 * 1024 },
+});
 
 const execAsync = promisify(exec);
 
@@ -158,5 +175,74 @@ router.get('/grab/:id', (req, res) => {
   }
   res.json({ success: true, ...publicJob(job) });
 });
+
+// ===================== Upload one recording =====================
+router.post('/upload', upload.single('file'), async (req, res) => {
+  const deviceId = deviceOf(req);
+  if (!deviceId) return res.status(401).json({ success: false, error: 'Open the app and sign in with your code first.' });
+  if (!req.file) return res.status(400).json({ success: false, error: 'No recording was sent.' });
+  try {
+    const project = String((req.body && req.body.project) || 'loose').replace(/[^a-z0-9-]/gi, '').slice(0, 64) || 'loose';
+    const name = String(req.file.originalname || 'clip.mov').replace(/[^a-z0-9._-]/gi, '').slice(0, 80) || 'clip.mov';
+    const key = `live-react/${deviceId}/${project}/${name}`;
+    const type = /\.mp4$/i.test(name) ? 'video/mp4' : 'video/quicktime';
+    const up = await r2Service.uploadFile(req.file.path, key, type);
+    res.json({ success: true, url: up.downloadUrl || r2Service.getPublicUrl(key) });
+  } catch (err) {
+    console.error('[LiveReact] upload failed:', err.message);
+    res.status(500).json({ success: false, error: 'The recording didn’t upload. It will try again.' });
+  } finally {
+    fs.remove(req.file.path).catch(() => {});
+  }
+});
+
+// ===================== Render =====================
+// One render at a time on this box (they're CPU-heavy); the rest wait in line.
+const RENDERS = new Map();   // renderId -> job
+let line = Promise.resolve();
+
+router.post('/render', async (req, res) => {
+  const deviceId = deviceOf(req);
+  if (!deviceId) return res.status(401).json({ success: false, error: 'Open the app and sign in with your code first.' });
+  const project = req.body && req.body.project;
+  if (!project || !project.main || !project.main.url) return res.status(400).json({ success: false, error: 'Nothing to render.' });
+
+  const job = { id: uuidv4(), deviceId, status: 'waiting', progress: 0, words: 'Waiting for the renderer', video: null, error: null, created: Date.now() };
+  RENDERS.set(job.id, job);
+  line = line.then(async () => {
+    job.status = 'working';
+    const workDir = path.join(process.env.TEMP_DIR || '/app/temp', `live-react-render-${job.id}`);
+    try {
+      const r = await liveRender.render(project, workDir, (f, words) => { job.progress = Math.round(f * 100); job.words = words; });
+      job.words = 'Saving your video';
+      const key = `live-react/${deviceId}/${String(project.id || 'p').replace(/[^a-z0-9-]/gi, '')}/final-${job.id.slice(0, 8)}.mp4`;
+      const up = await r2Service.uploadFile(r.file, key, 'video/mp4');
+      job.video = { url: up.downloadUrl || r2Service.getPublicUrl(key), duration: r.duration, width: r.width, height: r.height };
+      job.status = 'done';
+      job.progress = 100;
+      job.words = 'Done';
+      console.log(`[LiveReact] rendered ${r.width}x${r.height} ${Math.round(r.duration)}s for ${deviceId.slice(0, 6)}`);
+    } catch (err) {
+      console.error('[LiveReact] render failed:', err.message);
+      job.status = 'failed';
+      job.error = 'The video didn’t render. Tap Render to try again.';
+    } finally {
+      fs.remove(workDir).catch(() => {});
+    }
+  });
+  res.json({ success: true, renderId: job.id, status: job.status });
+});
+
+router.get('/render/:id', (req, res) => {
+  const job = RENDERS.get(req.params.id);
+  if (!job || job.deviceId !== deviceOf(req)) return res.status(404).json({ success: false, error: 'That render is no longer on the server. Tap Render again.' });
+  const { id, status, progress, words, video, error } = job;
+  res.json({ success: true, renderId: id, status, progress, words, video, error });
+});
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, j] of RENDERS) if (now - j.created > TTL_MS) RENDERS.delete(id);
+}, 15 * 60 * 1000).unref();
 
 module.exports = router;
