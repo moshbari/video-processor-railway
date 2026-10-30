@@ -222,7 +222,7 @@ async function cleanTalk(input, out, keep, look, evenVolume) {
  * A stretch of the main video [a,b] with the face box laid over it from the
  * watch clips that cover it (faces recorded with the video, so they line up).
  */
-async function watchPiece(main, a, b, watches, cw, ch, box, look, evenVolume, out) {
+async function watchPiece(main, a, b, watches, cw, ch, box, look, blur, evenVolume, out) {
   const len = b - a;
   const inputs = ['-ss', f3(a), '-t', f3(len), '-i', main];
   const overlays = [];
@@ -246,8 +246,11 @@ async function watchPiece(main, a, b, watches, cw, ch, box, look, evenVolume, ou
   const parts = [`[0:v]scale=${cw}:${ch}:force_original_aspect_ratio=decrease,pad=${cw}:${ch}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${FPS}[base0]`];
   let last = 'base0';
   overlays.forEach((o, k) => {
-    // Face box: the look + blur, scaled to the box width, a thin white frame.
-    parts.push(`[${o.idx}:v]${look ? look + ',' : ''}scale=${bw}:-2,pad=iw+8:ih+8:4:4:white,setpts=PTS-STARTPTS+${f3(o.at)}/TB[f${k}]`);
+    // Face box: the look, scaled to the box, THEN Blur Me sized to the box
+    // itself, so the small face is hidden as well as a full-screen talk
+    // (blurring first and shrinking after made it ~3x weaker and recognisable).
+    const boxBlur = blur > 0.001 ? `,gblur=sigma=${f3(Math.max(0.5, blur * 0.04 * bw))}:steps=3` : '';
+    parts.push(`[${o.idx}:v]${look ? look + ',' : ''}scale=${bw}:-2${boxBlur},pad=iw+8:ih+8:4:4:white,setpts=PTS-STARTPTS+${f3(o.at)}/TB[f${k}]`);
     parts.push(`[${last}][f${k}]overlay=x=${bx}:y=${by}:enable='between(t,${f3(o.at)},${f3(o.at + o.len)})':eof_action=pass[base${k + 1}]`);
     last = `base${k + 1}`;
   });
@@ -375,12 +378,8 @@ async function render(project, workDir, onProgress = () => {}) {
     cleaned.set(t, await cleanTalk(t.file, path.join(workDir, `talk-${i}.mp4`), keep, look, evenVolume));
   }
 
-  // Watch clips get the same look; their short side decides the blur size.
-  let faceLook = '';
-  if (watches.length) {
-    const d = await probeDisplaySize(watches[0].file);
-    faceLook = reactorFilter(lut, blur, Math.min(d.width, d.height));
-  }
+  // Watch clips get the same look; their blur is applied at box size in watchPiece.
+  const faceLook = reactorFilter(lut, 0, 0);
 
   // Order: intro(s), then the timeline cut at every talk, then ending(s).
   const intros = allTalks.filter((t) => t.kind === 'intro' && cleaned.has(t));
@@ -407,7 +406,7 @@ async function render(project, workDir, onProgress = () => {}) {
     say(0.45 + 0.5 * (i / steps.length), `Building part ${i + 1} of ${steps.length}`);
     const out = path.join(workDir, `piece-${String(i).padStart(3, '0')}.mp4`);
     if (s.type === 'watch') {
-      pieces.push(await watchPiece(main, s.a, s.b, watches, cw, ch, box, faceLook, evenVolume, out));
+      pieces.push(await watchPiece(main, s.a, s.b, watches, cw, ch, box, faceLook, blur, evenVolume, out));
     } else {
       const c = cleaned.get(s.t);
       if (s.type === 'talk') pieces.push(await talkPiece(main, s.at, c.file, c.duration, cw, ch, out, workDir, i));
