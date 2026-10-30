@@ -53,6 +53,7 @@ const audioReactionRoutes = require('./routes/audioReaction');
 const combineRoutes = require('./routes/combine');
 const downloadRoutes = require('./routes/download');
 const proRantRoutes = require('./routes/proRant');
+const liveReactRoutes = require('./routes/liveReact');
 const jobsRoutes = require('./routes/jobs');
 const renderRoutes = require('./routes/render');
 const singleReactionRoutes = require('./routes/singleReaction');
@@ -107,7 +108,7 @@ app.use(cors({
     'http://localhost:8080'
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Id', 'X-User-Email', 'X-Admin-Key'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Id', 'X-User-Email', 'X-Admin-Key', 'X-Device-Id'],
   credentials: true
 }));
 
@@ -149,6 +150,7 @@ app.use('/api/opus-clip', opusClipRoutes);        // 🎬 OPUS CLIP
 app.use('/api/manual-clip', manualClipRoutes);    // ✂️ MANUAL CLIP
 app.use('/api/doc-factory', docFactoryRoutes);    // 🎬 DOC FACTORY
 app.use('/api/pro-rant', proRantRoutes);          // 🎬 PRO-RANT
+app.use('/api/live-react', liveReactRoutes);      // 🎥 LIVE REACT (phone apps)
 app.use('/api/combine', combineRoutes);
 app.use('/api/download', downloadRoutes);
 app.use('/api/jobs', jobsRoutes);

@@ -1,4 +1,4 @@
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const { promisify } = require('util');
 const path = require('path');
 const fs = require('fs-extra');
@@ -9,6 +9,69 @@ const execAsync = promisify(exec);
 const tellaService = require('./tellaService');
 
 const isTikTok = (url) => /tiktok\.com|vm\.tiktok|vt\.tiktok/i.test(url);
+const isYouTube = (url) => /youtube\.com|youtu\.be/i.test(url);
+
+// Residential proxy (same IPRoyal account as the Transcriber). YouTube blocks
+// data-centre IPs for the video FILE, but serves a home IP like any viewer, so
+// YouTube goes through the proxy first. PROXY_URL looks like
+// http://USER:PASS_country-us@geo.iproyal.com:12321 — we append a sticky
+// session to the password so one download (video + audio) stays on one IP.
+function proxyUrl() {
+  const raw = process.env.PROXY_URL;
+  if (!raw) return null;
+  try {
+    const u = new URL(raw);
+    const session = Math.random().toString(36).slice(2, 10);
+    u.password = `${decodeURIComponent(u.password)}_session-${session}_lifetime-30m`;
+    return u.toString();
+  } catch (e) {
+    console.error('PROXY_URL is not a valid URL — downloading without the proxy');
+    return null;
+  }
+}
+
+// Quality: the best up to 1080p measured on the SHORT side ("res"), so a
+// vertical 1080x1920 Short/Reel/TikTok stays full size (a height<=1080 filter
+// would shrink it to 608x1080). Then prefer H.264 + AAC: every phone plays it,
+// FFmpeg cuts it fast, and it merges cleanly into mp4. Without the codec hint
+// yt-dlp picks AV1 for many YouTube videos.
+const FORMAT_ARGS = ['-f', 'bv*+ba/b', '-S', 'res:1080,vcodec:h264,acodec:aac'];
+
+/**
+ * Run yt-dlp without a shell (the URL never touches sh). Reports download
+ * progress as 0–100 through onProgress. Rejects with yt-dlp's last error line.
+ */
+function runYtdlp(args, { onProgress, timeoutMs = 45 * 60 * 1000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('yt-dlp', ['--newline', ...args]);
+    let out = '';
+    let errTail = '';
+    let lastPct = -1;
+    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Download took too long')); }, timeoutMs);
+    const onLine = (line) => {
+      const m = /\[download\]\s+([\d.]+)%/.exec(line);
+      if (m && onProgress) {
+        const pct = Math.floor(parseFloat(m[1]));
+        if (pct !== lastPct) { lastPct = pct; onProgress(pct); }
+      }
+      if (/ERROR/.test(line)) errTail = line;
+    };
+    let buf = '';
+    child.stdout.on('data', (d) => {
+      const t = d.toString(); out += t; buf += t;
+      const lines = buf.split('\n'); buf = lines.pop();
+      lines.forEach(onLine);
+    });
+    child.stderr.on('data', (d) => { const t = d.toString(); t.split('\n').forEach(onLine); if (!errTail) errTail = t.trim().slice(-300); });
+    child.on('error', (e) => { clearTimeout(timer); reject(e); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(out);
+      // Never let the proxy password reach a log or an error message.
+      else reject(new Error((errTail || `yt-dlp exited ${code}`).replace(/https?:\/\/[^@\s]+@/g, 'http://***@')));
+    });
+  });
+}
 
 // Login cookies (Instagram/Facebook + YouTube bot-check) come from YTDLP_COOKIES_B64
 // — a base64 of a Netscape cookies.txt. Written once to /tmp and passed to yt-dlp.
@@ -68,6 +131,14 @@ function ytdlpExtra() {
   return args.join(' ');
 }
 
+// Same flags as an argv array, for runYtdlp.
+function ytdlpArgs() {
+  ytdlpExtra();
+  const args = ['--no-playlist', '--no-warnings'];
+  if (cookieState === 'ok') args.push('--cookies', '/tmp/yt-cookies.txt');
+  return args;
+}
+
 class DownloadService {
   constructor() {
     this.tempDir = process.env.TEMP_DIR || '/app/temp';
@@ -82,7 +153,7 @@ class DownloadService {
   /**
    * Download video from URL using yt-dlp
    */
-  async downloadVideo(url, jobId = null) {
+  async downloadVideo(url, jobId = null, opts = {}) {
     const id = jobId || uuidv4();
     const outputPath = path.join(this.tempDir, id);
     await fs.ensureDir(outputPath);
@@ -125,74 +196,73 @@ class DownloadService {
 
     const outputFile = path.join(outputPath, 'video.%(ext)s');
 
-    try {
-      // Get video info first
-      console.log(`Getting info for: ${url}`);
-      const infoCommand = `yt-dlp ${ytdlpExtra()} --dump-json "${url}"`;
-      const { stdout: infoJson } = await execAsync(infoCommand);
-      const info = JSON.parse(infoJson);
+    // Try order. YouTube: through the proxy (3 fresh home IPs), then direct.
+    // Everything else: direct first (free), then through the proxy.
+    const proxied = () => proxyUrl();
+    const plan = isYouTube(url)
+      ? [proxied, proxied, proxied, () => null]
+      : [() => null, proxied];
 
-      // Validate duration
-      if (info.duration && info.duration > this.maxDuration) {
-        throw new Error(`Video too long. Max ${this.maxDuration}s, got ${info.duration}s`);
+    let lastError = null;
+    for (const pick of plan) {
+      const proxy = pick();
+      if (pick === proxied && !proxy) continue; // no PROXY_URL set
+      const net = proxy ? ['--proxy', proxy] : [];
+      try {
+        console.log(`Getting info for: ${url}${proxy ? ' (via proxy)' : ''}`);
+        const infoJson = await runYtdlp([...ytdlpArgs(), ...net, '--dump-json', url], { timeoutMs: 90 * 1000 });
+        const info = JSON.parse(infoJson.split('\n').find((l) => l.trim().startsWith('{')));
+
+        if (info.duration && info.duration > this.maxDuration) {
+          throw Object.assign(new Error(`Video too long. Max ${this.maxDuration}s, got ${info.duration}s`), { final: true });
+        }
+        if (info.filesize && info.filesize > this.maxSizeMB * 1024 * 1024) {
+          throw Object.assign(new Error(`Video too large. Max ${this.maxSizeMB}MB`), { final: true });
+        }
+
+        // Best <=1080p video + best audio, merged to mp4 (YouTube's single-file
+        // stream caps at 360p; everything above is separate video+audio).
+        console.log(`Downloading video: ${info.title || 'Unknown'}`);
+        await fs.emptyDir(outputPath);
+        await runYtdlp([
+          ...ytdlpArgs(), ...net,
+          '-N', '8', '--retries', '5', '--fragment-retries', '10',
+          ...FORMAT_ARGS, '--merge-output-format', 'mp4',
+          '-o', outputFile, url,
+        ], { onProgress: opts.onProgress });
+
+        const files = await fs.readdir(outputPath);
+        const videoFile = files.find((f) => f.startsWith('video.') && !f.endsWith('.part'));
+        if (!videoFile) throw new Error('Downloaded video file not found');
+
+        const videoPath = path.join(outputPath, videoFile);
+        const stats = await fs.stat(videoPath);
+        return {
+          jobId: id,
+          videoPath,
+          filename: videoFile,
+          title: info.title || 'Unknown',
+          duration: info.duration || 0,
+          fileSize: stats.size,
+          thumbnail: info.thumbnail || null,
+          platform: info.extractor || 'unknown',
+          uploadDate: info.upload_date || null,
+          uploader: info.uploader || null,
+          description: info.description || null,
+          url: info.webpage_url || url,
+          viaProxy: !!proxy,
+        };
+      } catch (error) {
+        lastError = error;
+        console.error(`Download attempt failed${proxy ? ' (via proxy)' : ''}: ${error.message}`);
+        if (error.final || /Unsupported URL|Private video|Video unavailable|removed/i.test(error.message)) break;
       }
-
-      // Validate file size (if available)
-      if (info.filesize && info.filesize > this.maxSizeMB * 1024 * 1024) {
-        throw new Error(`Video too large. Max ${this.maxSizeMB}MB`);
-      }
-
-      // Download the video.
-      // Prefer the highest quality UP TO 1080p. `best[ext=mp4]` alone only ever
-      // returns YouTube's single-file progressive stream, which caps at 360p —
-      // every resolution above that (720p/1080p/4K) is DASH (separate video+audio
-      // that must be merged). This selector grabs the best <=1080p video + best
-      // audio and merges to mp4, so a 1080p source arrives as 1080p (capped at
-      // 1080p so 4K sources don't balloon), with graceful fallbacks for odd sites.
-      console.log(`Downloading video: ${info.title || 'Unknown'}`);
-      const fmt = 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080][ext=mp4]/best[ext=mp4]/best';
-      const downloadCommand = `yt-dlp ${ytdlpExtra()} -f "${fmt}" --merge-output-format mp4 -o "${outputFile}" "${url}"`;
-      
-      await execAsync(downloadCommand, {
-        maxBuffer: 1024 * 1024 * 100 // 100MB buffer
-      });
-
-      // Find the downloaded file
-      const files = await fs.readdir(outputPath);
-      const videoFile = files.find(f => f.startsWith('video.'));
-      
-      if (!videoFile) {
-        throw new Error('Downloaded video file not found');
-      }
-
-      const videoPath = path.join(outputPath, videoFile);
-      const stats = await fs.stat(videoPath);
-
-      return {
-        jobId: id,
-        videoPath,
-        filename: videoFile,
-        title: info.title || 'Unknown',
-        duration: info.duration || 0,
-        fileSize: stats.size,
-        thumbnail: info.thumbnail || null,
-        platform: info.extractor || 'unknown',
-        uploadDate: info.upload_date || null,
-        uploader: info.uploader || null,
-        description: info.description || null,
-        url: info.webpage_url || url
-      };
-
-    } catch (error) {
-      // Cleanup on error
-      await fs.remove(outputPath).catch(console.error);
-      
-      if (error.message.includes('Unsupported URL')) {
-        throw new Error('Unsupported platform or invalid URL');
-      }
-      
-      throw new Error(`Download failed: ${error.message}`);
     }
+
+    await fs.remove(outputPath).catch(console.error);
+    const msg = lastError ? lastError.message : 'unknown error';
+    if (msg.includes('Unsupported URL')) throw new Error('Unsupported platform or invalid URL');
+    throw new Error(`Download failed: ${msg}`);
   }
 
   /**
