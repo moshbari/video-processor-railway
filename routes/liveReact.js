@@ -11,6 +11,8 @@
  *   POST /api/live-react/upload      file 'file', field 'project' -> { url }  (one recording)
  *   POST /api/live-react/render      {project} -> { renderId }  (runs in the background)
  *   GET  /api/live-react/render/:id           -> { status, progress, words, video, error }
+ *   POST /api/live-react/ready-rant  {sourceUrl, mainUrl, duration, language} -> { jobId }
+ *   GET  /api/live-react/ready-rant/:id       -> { status, rants: [{at, script, why}], ending, error }
  *
  * X-Device-Id is the Get Transcript code (32 hex). It scopes the daily cap, so
  * one phone can't burn the proxy budget.
@@ -28,6 +30,7 @@ const downloadService = require('../services/downloadService');
 const r2Service = require('../services/r2Service');
 const renderService = require('../services/proRant/renderService');
 const liveRender = require('../services/liveReact/renderService');
+const { readyRant } = require('../services/liveReact/readyRant');
 const multer = require('multer');
 const os = require('os');
 const crypto = require('crypto');
@@ -302,9 +305,49 @@ router.get('/render/:id', (req, res) => {
   res.json({ success: true, renderId: id, status, progress, words, video, error });
 });
 
+// ===================== Ready-made RANT =====================
+// The AI reads the video's transcript and writes the RANTs at the right
+// moments; the app drops them in as scripts to record.
+const READY = new Map();     // jobId -> job
+const READY_USE = new Map(); // deviceId -> { day, count }
+const DAILY_READY = Number(process.env.READY_RANT_DAILY || 20);
+
+router.post('/ready-rant', (req, res) => {
+  const deviceId = deviceOf(req);
+  if (!deviceId) return res.status(401).json({ success: false, error: 'Open the app and sign in with your code first.' });
+  const { sourceUrl, mainUrl, duration, language } = req.body || {};
+  if (!sourceUrl && !mainUrl) return res.status(400).json({ success: false, error: 'Download a video first.' });
+  const u = READY_USE.get(deviceId);
+  if (u && u.day === today() && u.count >= DAILY_READY) {
+    return res.status(429).json({ success: false, error: `You’ve made ${DAILY_READY} ready-made RANTs today. Try again tomorrow.` });
+  }
+  if (!u || u.day !== today()) READY_USE.set(deviceId, { day: today(), count: 1 }); else u.count += 1;
+
+  const job = { id: uuidv4(), deviceId, status: 'working', rants: null, ending: null, error: null, created: Date.now() };
+  READY.set(job.id, job);
+  readyRant({ sourceUrl, mainUrl, duration, language: language === 'bengali' ? 'bengali' : 'english' })
+    .then((r) => { job.rants = r.rants; job.ending = r.ending; job.status = 'done'; })
+    .catch((err) => {
+      console.error('[ready-rant] failed:', err.message);
+      job.status = 'failed';
+      job.error = /not set up/.test(err.message) ? err.message
+        : /transcript/i.test(err.message) ? 'We couldn’t read what this video says. Try another video.'
+        : 'The RANTs didn’t come out. Tap Try again.';
+    });
+  res.json({ success: true, jobId: job.id, status: job.status });
+});
+
+router.get('/ready-rant/:id', (req, res) => {
+  const job = READY.get(req.params.id);
+  if (!job || job.deviceId !== deviceOf(req)) return res.status(404).json({ success: false, error: 'That job is no longer on the server. Tap Try again.' });
+  const { id, status, rants, ending, error } = job;
+  res.json({ success: true, jobId: id, status, rants, ending, error });
+});
+
 setInterval(() => {
   const now = Date.now();
   for (const [id, j] of RENDERS) if (now - j.created > TTL_MS) RENDERS.delete(id);
+  for (const [id, j] of READY) if (now - j.created > TTL_MS) READY.delete(id);
 }, 15 * 60 * 1000).unref();
 
 module.exports = router;

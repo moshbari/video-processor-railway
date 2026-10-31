@@ -40,3 +40,6 @@ build/
 
 # Railway
 .railway/
+
+# Private prompts (repo is public)
+private/
