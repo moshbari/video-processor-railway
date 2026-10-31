@@ -128,17 +128,45 @@ function reactorFilter(lut, blur, shortSide) {
 
 // --- cleaning a talk: oops, cut-a-bit, silences ------------------------------
 
+/** The talk's sound as 16 kHz mono 16-bit samples. */
+function pcm(file) {
+  return new Promise((resolve) => {
+    const child = spawn('ffmpeg', ['-hide_banner', '-nostdin', '-v', 'error', '-i', file, '-vn', '-ac', '1', '-ar', '16000', '-f', 's16le', '-']);
+    const parts = [];
+    child.stdout.on('data', (d) => parts.push(d));
+    child.on('close', () => resolve(Buffer.concat(parts)));
+    child.on('error', () => resolve(Buffer.alloc(0)));
+  });
+}
+
+/**
+ * Quiet stretches of at least minSilence seconds, measured like AiPrompter's
+ * SilenceTrimmer / FlowCast: -40 dBFS RMS in 50 ms windows. (ffmpeg's
+ * silencedetect checks every sample, so a phone mic's room hiss keeps breaking
+ * the silence and the pause before Stop was never found.) A run that reaches
+ * the end comes back ending at the end of the sound.
+ */
 async function detectSilences(file, minSilence) {
-  const log = await run(['-i', file, '-af', `silencedetect=noise=-40dB:d=${minSilence}`, '-f', 'null', '-'], 'silencedetect').catch(() => '');
-  const out = [];
-  let start = null;
-  for (const line of log.split('\n')) {
-    let m = /silence_start: (-?[\d.]+)/.exec(line);
-    if (m) { start = Math.max(0, parseFloat(m[1])); continue; }
-    m = /silence_end: ([\d.]+)/.exec(line);
-    if (m && start !== null) { out.push([start, parseFloat(m[1])]); start = null; }
+  const buf = await pcm(file);
+  const rate = 16000, per = rate * 0.05, n = Math.floor(buf.length / 2);
+  const silent = [];
+  for (let i = 0; i < n; i += per) {
+    const end = Math.min(n, i + per);
+    let sum = 0;
+    for (let k = i; k < end; k++) { const v = buf.readInt16LE(k * 2) / 32768; sum += v * v; }
+    const rms = Math.sqrt(sum / Math.max(1, end - i));
+    silent.push((rms > 0 ? 20 * Math.log10(rms) : -120) <= -40);
   }
-  return { list: out, openStart: start };
+  const out = [];
+  for (let i = 0; i < silent.length;) {
+    if (!silent[i]) { i++; continue; }
+    let j = i;
+    while (j < silent.length && silent[j]) j++;
+    const s = i * 0.05, e = Math.min(j * 0.05, n / rate);
+    if (e - s >= minSilence) out.push([s, e]);
+    i = j;
+  }
+  return { list: out, openStart: null, soundEnd: n / rate };
 }
 
 /** Ranges (seconds) to REMOVE from a talk, merged and sorted. */
@@ -164,12 +192,12 @@ async function talkCuts(file, duration, talk, style) {
 
   const st = SILENCE[style];
   if (st) {
-    const { list, openStart } = await detectSilences(file, 0.5);
-    if (openStart !== null) list.push([openStart, duration]);
+    const { list, soundEnd } = await detectSilences(file, 0.5);
     for (const [s, e] of list) {
-      // No padding at the clip's own edges: leading/trailing silence goes entirely.
+      // No padding at the clip's own edges: leading/trailing silence goes entirely
+      // (the sound can stop a few ms before the picture).
       const a = s <= 0.05 ? 0 : s + st.after;
-      const b = e >= duration - 0.05 ? duration : e - st.before;
+      const b = e >= Math.min(duration, soundEnd) - 0.1 ? duration : e - st.before;
       if (b - a >= 0.3) remove.push([a, b]);
     }
   }
