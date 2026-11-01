@@ -22,6 +22,7 @@ const path = require('path');
 const fs = require('fs-extra');
 const r2Service = require('../r2Service');
 const captions = require('./captions');
+const rantPost = require('./rantPost');
 const talkWords = require('./talkWords');
 
 const FPS = 30;
@@ -369,7 +370,7 @@ async function concat(files, out, workDir) {
  * }
  * onProgress(fraction 0…1, words)
  */
-async function render(project, workDir, onProgress = () => {}) {
+async function render(project, workDir, onProgress = () => {}, onSaid = null) {
   await fs.ensureDir(workDir);
   const opt = project.options || {};
   const say = (f, words) => onProgress(Math.max(0, Math.min(1, f)), words);
@@ -433,6 +434,17 @@ async function render(project, workDir, onProgress = () => {}) {
     }
     if (opt.captions && Array.isArray(t.words)) c.words = captions.remapWords(t.words, cuts);
     cleaned.set(t, c);
+  }
+
+  // What was said in the RANT, for the Facebook post (written while the video renders).
+  // Talks with no words and no script (captions off) are heard here just for the post.
+  if (onSaid) {
+    for (let i = 0; i < allTalks.length; i++) {
+      const t = allTalks[i];
+      if (!cleaned.has(t) || (Array.isArray(t.words) && t.words.length) || String(t.script || '').trim()) continue;
+      t.words = await talkWords.timeWords(t.file, workDir, `post-${i}`, t.lang || 'english', '').catch(() => null);
+    }
+    try { onSaid(rantPost.saidIn(allTalks.filter((t) => cleaned.has(t)))); } catch (e) { console.warn('[live-react] post text:', e.message); }
   }
 
   // Watch clips get the same look; their blur is applied at box size in watchPiece.

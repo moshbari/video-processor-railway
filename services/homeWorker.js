@@ -41,7 +41,7 @@ function handOut() {
     job.state = 'working';
     clearTimeout(job.pickupTimer);
     job.finishTimer = setTimeout(() => finish(job, new Error('The home downloader took too long.')), FINISH_MS);
-    pollers.shift()({ id: job.id, url: job.url });
+    pollers.shift()({ id: job.id, url: job.url, ...(job.extra || {}) });
   }
 }
 
@@ -55,12 +55,13 @@ function finish(job, err, result) {
 }
 
 /**
- * Ask the home helper to fetch a video. Resolves { files: {video, audio?}, info }.
+ * Ask the home helper to fetch a video. Resolves { files: {video, audio?}, info, ...rest }.
+ * extra (e.g. { kind: 'captions', langs }) is handed to the helper with the job.
  * Rejects with err.notPicked = true when no helper took it in time.
  */
-function download(url, onProgress) {
+function download(url, onProgress, extra) {
   return new Promise((resolve, reject) => {
-    const job = { id: uuidv4(), url, state: 'waiting', resolve, reject, onProgress, created: Date.now() };
+    const job = { id: uuidv4(), url, extra, state: 'waiting', resolve, reject, onProgress, created: Date.now() };
     job.pickupTimer = setTimeout(() => {
       const i = waiting.indexOf(job.id);
       if (i >= 0) waiting.splice(i, 1);
@@ -95,11 +96,11 @@ function progress(id, p) {
   return !!job;
 }
 
-function complete(id, files, info) {
+function complete(id, files, info, rest = {}) {
   seen();
   const job = jobs.get(id);
   if (!job) return false;
-  finish(job, null, { files, info });
+  finish(job, null, { files, info, ...rest });
   return true;
 }
 

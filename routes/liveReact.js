@@ -31,6 +31,7 @@ const r2Service = require('../services/r2Service');
 const renderService = require('../services/proRant/renderService');
 const liveRender = require('../services/liveReact/renderService');
 const { readyRant } = require('../services/liveReact/readyRant');
+const rantPost = require('../services/liveReact/rantPost');
 const multer = require('multer');
 const os = require('os');
 const crypto = require('crypto');
@@ -274,13 +275,23 @@ router.post('/render', async (req, res) => {
   const project = req.body && req.body.project;
   if (!project || !project.main || !project.main.url) return res.status(400).json({ success: false, error: 'Nothing to render.' });
 
-  const job = { id: uuidv4(), deviceId, status: 'waiting', progress: 0, words: 'Waiting for the renderer', video: null, error: null, created: Date.now() };
+  const job = { id: uuidv4(), deviceId, status: 'waiting', progress: 0, words: 'Waiting for the renderer', video: null, error: null, created: Date.now(),
+    said: null, post: null, postStatus: null };
   RENDERS.set(job.id, job);
+  // The Facebook post is written while the video renders, from what was said.
+  const onSaid = (said) => {
+    job.said = said || null;
+    if (!job.said) return;
+    job.postStatus = 'working';
+    rantPost.writePost({ said: job.said, title: project.main.title, url: project.main.sourceUrl })
+      .then((p) => { job.post = p; job.postStatus = 'done'; })
+      .catch((e) => { console.error('[rant-post] failed:', e.message); job.postStatus = 'failed'; });
+  };
   line = line.then(async () => {
     job.status = 'working';
     const workDir = path.join(process.env.TEMP_DIR || '/app/temp', `live-react-render-${job.id}`);
     try {
-      const r = await liveRender.render(project, workDir, (f, words) => { job.progress = Math.round(f * 100); job.words = words; });
+      const r = await liveRender.render(project, workDir, (f, words) => { job.progress = Math.round(f * 100); job.words = words; }, onSaid);
       job.words = 'Saving your video';
       const key = `live-react/${deviceId}/${String(project.id || 'p').replace(/[^a-z0-9-]/gi, '')}/final-${job.id.slice(0, 8)}.mp4`;
       const up = await r2Service.uploadFile(r.file, key, 'video/mp4');
@@ -303,8 +314,32 @@ router.post('/render', async (req, res) => {
 router.get('/render/:id', (req, res) => {
   const job = RENDERS.get(req.params.id);
   if (!job || job.deviceId !== deviceOf(req)) return res.status(404).json({ success: false, error: 'That render is no longer on the server. Tap Make my RANT again.' });
-  const { id, status, progress, words, video, error } = job;
-  res.json({ success: true, renderId: id, status, progress, words, video, error });
+  const { id, status, progress, words, video, error, said, post, postStatus } = job;
+  res.json({ success: true, renderId: id, status, progress, words, video, error, said, post, postStatus });
+});
+
+// ===================== Facebook post =====================
+// A (new) post for a RANT already made: { said, title, url, earlier? } → { post }.
+const POST_USE = new Map();  // deviceId -> { day, count }
+const DAILY_POSTS = Number(process.env.RANT_POST_DAILY || 30);
+
+router.post('/post', async (req, res) => {
+  const deviceId = deviceOf(req);
+  if (!deviceId) return res.status(401).json({ success: false, error: 'Open the app and sign in with your code first.' });
+  const { said, title, url, earlier } = req.body || {};
+  if (!String(said || '').trim()) return res.status(400).json({ success: false, error: 'Make the RANT video first, then the post comes with it.' });
+  const u = POST_USE.get(deviceId);
+  if (u && u.day === today() && u.count >= DAILY_POSTS) {
+    return res.status(429).json({ success: false, error: `You’ve made ${DAILY_POSTS} posts today. Try again tomorrow.` });
+  }
+  if (!u || u.day !== today()) POST_USE.set(deviceId, { day: today(), count: 1 }); else u.count += 1;
+  try {
+    const post = await rantPost.writePost({ said, title, url, earlier });
+    res.json({ success: true, post });
+  } catch (e) {
+    console.error('[rant-post] failed:', e.message);
+    res.status(500).json({ success: false, error: /not set up/.test(e.message) ? e.message : 'The post didn’t come out. Tap Try again.' });
+  }
 });
 
 // ===================== Ready-made RANT =====================
