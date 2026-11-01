@@ -14,6 +14,7 @@ const OpenAI = require('openai');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const { pickCta } = require('./rantCtas');
 
 const TRANSCRIBER = process.env.TRANSCRIBER_URL || 'https://transcriber-production-f2f1.up.railway.app';
 const MODEL = process.env.READY_RANT_MODEL || 'gpt-6.1-sol';
@@ -133,7 +134,10 @@ async function readyRant({ sourceUrl, mainUrl, duration, language }) {
   const { out, most, usage } = await write({ segs, duration: dur, language });
   const rants = place(out, words, dur, most);
   console.log(`[ready-rant] ${Math.round(dur)}s → ${rants.length}/${most} RANTs (${usage?.prompt_tokens || 0} in, ${usage?.completion_tokens || 0} out)`);
-  return { rants, ending: String(out.ending || '').trim() || null };
+  // The ending is the AI's verdict + one of Mosh's 99% DFY calls to action (random).
+  const verdict = String(out.ending || '').trim();
+  const ending = [verdict, pickCta(language)].filter(Boolean).join(' ');
+  return { rants, ending };
 }
 
 module.exports = { readyRant, mostFor, wordsOf, locate, place };
