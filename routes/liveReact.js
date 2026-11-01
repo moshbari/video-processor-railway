@@ -151,7 +151,7 @@ async function runGrab(job) {
     job.stage = 'done';
     job.progress = 100;
     job.status = 'done';
-    console.log(`[LiveReact] grabbed ${dims.width}x${dims.height} ${Math.round(duration)}s ${r.viaProxy ? 'via proxy' : 'direct'}: ${job.url}`);
+    console.log(`[LiveReact] grabbed ${dims.width}x${dims.height} ${Math.round(duration)}s ${r.viaHome ? 'via home' : r.viaProxy ? 'via proxy' : 'direct'}: ${job.url}`);
   } catch (err) {
     console.error('[LiveReact] grab failed:', err.message);
     job.status = 'failed';

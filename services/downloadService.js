@@ -9,6 +9,7 @@ const execAsync = promisify(exec);
 const tellaService = require('./tellaService');
 
 const isTikTok = (url) => /tiktok\.com|vm\.tiktok|vt\.tiktok/i.test(url);
+const homeWorker = require('./homeWorker');
 const isYouTube = (url) => /youtube\.com|youtu\.be/i.test(url);
 
 // Residential proxy (same IPRoyal account as the Transcriber). YouTube blocks
@@ -186,6 +187,42 @@ class DownloadService {
     }
 
     const outputFile = path.join(outputPath, 'video.%(ext)s');
+
+    // YouTube: the home downloader first (a computer on a home internet line,
+    // which YouTube doesn't bot-block, so no paid proxy). Falls back below.
+    if (isYouTube(url) && homeWorker.online()) {
+      try {
+        console.log(`Getting from the home downloader: ${url}`);
+        const { files, info } = await homeWorker.download(url, opts.onProgress);
+        await fs.emptyDir(outputPath);
+        const videoPath = path.join(outputPath, 'video.mp4');
+        const ins = files.audio ? ['-i', files.video, '-i', files.audio, '-map', '0:v:0', '-map', '1:a:0'] : ['-i', files.video];
+        await new Promise((resolve, reject) => {
+          const ff = spawn('ffmpeg', ['-y', '-v', 'error', ...ins, '-c', 'copy', videoPath]);
+          let err = '';
+          ff.stderr.on('data', (d) => { err += d; });
+          ff.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`merge failed: ${err.slice(-200)}`))));
+          ff.on('error', reject);
+        });
+        fs.remove(files.video).catch(() => {});
+        if (files.audio) fs.remove(files.audio).catch(() => {});
+        if (info.duration && info.duration > this.maxDuration) {
+          throw Object.assign(new Error(`Video too long. Max ${this.maxDuration}s, got ${info.duration}s`), { final: true });
+        }
+        const stats = await fs.stat(videoPath);
+        return {
+          jobId: id, videoPath, filename: 'video.mp4',
+          title: info.title || 'Unknown', duration: info.duration || 0, fileSize: stats.size,
+          thumbnail: info.thumbnail || null, platform: info.extractor || 'youtube',
+          uploadDate: info.upload_date || null, uploader: info.uploader || null,
+          description: info.description || null, url: info.webpage_url || url,
+          viaProxy: false, viaHome: true,
+        };
+      } catch (error) {
+        console.error(`Home downloader: ${error.message}`);
+        if (error.final || /Private video|Video unavailable|removed|too long/i.test(error.message)) throw error;
+      }
+    }
 
     // Try order. YouTube: through the proxy (3 fresh home IPs), then direct.
     // Everything else: direct first (free), then through the proxy.

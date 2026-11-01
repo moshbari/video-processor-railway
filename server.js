@@ -151,6 +151,7 @@ app.use('/api/manual-clip', manualClipRoutes);    // ✂️ MANUAL CLIP
 app.use('/api/doc-factory', docFactoryRoutes);    // 🎬 DOC FACTORY
 app.use('/api/pro-rant', proRantRoutes);          // 🎬 PRO-RANT
 app.use('/api/live-react', liveReactRoutes);      // 🎥 LIVE REACT (phone apps)
+app.use('/api/home-worker', require('./routes/homeWorker'));   // 🏠 HOME DOWNLOADER (YouTube without a paid proxy)
 app.use('/api/combine', combineRoutes);
 app.use('/api/download', downloadRoutes);
 app.use('/api/jobs', jobsRoutes);
