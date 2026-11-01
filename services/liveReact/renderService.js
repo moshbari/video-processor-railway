@@ -242,7 +242,20 @@ async function cleanTalk(input, out, keep, look, evenVolume) {
   parts.push(`${joined}concat=n=${n}:v=1:a=1[vc][ac]`);
   parts.push(`[vc]${look ? look + ',' : ''}fps=${FPS},format=yuv420p[vo]`);
   parts.push(`[ac]aformat=sample_rates=48000:channel_layouts=stereo${evenVolume ? ',' + LOUDNORM : ''}[ao]`);
-  await run(['-y', '-i', input, '-filter_complex', parts.join(';'), '-map', '[vo]', '-map', '[ao]', ...ENC, ...AENC, out], 'clean talk');
+  try {
+    await run(['-y', '-i', input, '-filter_complex', parts.join(';'), '-map', '[vo]', '-map', '[ao]', ...ENC, ...AENC, out], 'clean talk');
+  } catch (err) {
+    // Many pieces (a long talk with Tight silence cuts) + a colour look can make
+    // ffmpeg's trim/concat graph fail ("Error reinitializing filters"). Same cut
+    // in one pass instead: select keeps the frames/samples inside the ranges.
+    console.warn(`[LiveReact] clean talk: ${n} pieces failed, trying one pass (${err.message.slice(0, 80)})`);
+    const expr = keep.map(([a, b]) => `between(t,${f3(a)},${f3(b)})`).join('+');
+    const one = [`[0:v]select='${expr}',setpts=N/FRAME_RATE/TB,${look ? look + ',' : ''}fps=${FPS},format=yuv420p[vo]`];
+    one.push(audio
+      ? `[0:a]aselect='${expr}',asetpts=N/SR/TB,aformat=sample_rates=48000:channel_layouts=stereo${evenVolume ? ',' + LOUDNORM : ''}[ao]`
+      : `anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration=${f3(keep.reduce((t, [a, b]) => t + b - a, 0))}[ao]`);
+    await run(['-y', '-i', input, '-filter_complex', one.join(';'), '-map', '[vo]', '-map', '[ao]', ...ENC, ...AENC, out], 'clean talk (one pass)');
+  }
   return { file: out, duration: await probeDuration(out) };
 }
 
