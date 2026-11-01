@@ -36,15 +36,42 @@ function overScript(script, heard) {
   }).map((w, k, all) => (k + 1 < all.length ? { ...w, end: Math.min(w.end, Math.max(w.start + 0.05, all[k + 1].start)) } : w));
 }
 
+// Bangla (and Banglish) speech: AiPrompter's Soniox endpoint, the same one the
+// iPhone uses. whisper-1 loops on Bangla, and an English pass can't spell it.
+const BN_URL = process.env.BANGLA_TRANSCRIBE_URL || 'https://app.aiprompter.com/api/bn/transcribe';
+const banglaShare = (text) => {
+  const letters = String(text).match(/\p{L}/gu) || [];
+  return letters.length ? letters.filter((c) => /[\u0980-\u09FF]/.test(c)).length / letters.length : 0;
+};
+async function banglaWords(audio, script) {
+  const token = process.env.AIPROMPTER_APP_TOKEN;
+  if (!token) return null;
+  const form = new FormData();
+  form.append('script', String(script || ''));
+  form.append('file', new Blob([await fs.readFile(audio)], { type: 'audio/mp4' }), 'take.m4a');
+  const r = await fetch(BN_URL, { method: 'POST', headers: { 'x-aiprompter-app': token }, body: form, signal: AbortSignal.timeout(180000) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !Array.isArray(j.words)) return null;
+  return j.words.map((w) => ({ text: String(w.text || '').trim(), start: Number(w.start), end: Number(w.end) }))
+    .filter((w) => w.text && Number.isFinite(w.start) && Number.isFinite(w.end));
+}
+
 /**
  * Words of one talk: [{ text, start, end, endsSentence }] in seconds into the take.
  * lang: 'english' | 'bengali'.
  */
 async function timeWords(file, workDir, index, lang, script) {
-  if (!process.env.OPENAI_API_KEY) return [];
   const audio = path.join(workDir, `words-${index}.m4a`);
   try {
     await extractAudio(file, audio);
+    // Each talk finds its own language: if the Bangla service hears Bangla, use it
+    // (a Bangla talk in an "English captions" RANT still gets Bangla captions).
+    const bn = await banglaWords(audio, script).catch((e) => { console.warn('[live-react] bangla words:', e.message); return null; });
+    if (bn && bn.length && (lang === 'bengali' || banglaShare(bn.map((w) => w.text).join(' ')) >= 0.2)) {
+      if (script && String(script).trim()) return overScript(script, bn);
+      return bn.map((w) => ({ ...w, endsSentence: sentenceEnd(w.text) }));
+    }
+    if (!process.env.OPENAI_API_KEY) return [];
     const res = await openai().audio.transcriptions.create({
       file: fs.createReadStream(audio),
       model: 'whisper-1',
