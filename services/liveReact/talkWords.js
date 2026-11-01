@@ -99,4 +99,29 @@ async function timeWords(file, workDir, index, lang, script) {
   }
 }
 
-module.exports = { timeWords, overScript };
+/**
+ * A talk that came with words from the phone: if they aren't Bangla, ask the
+ * Bangla service once. Bangla heard → those words (older apps time every talk
+ * in one language, so a Bangla talk in an English RANT arrived as English).
+ * Returns the words to use, or null to keep the phone's.
+ */
+async function banglaCheck(file, workDir, index, script, phoneWords) {
+  const text = (phoneWords || []).map((w) => w.text).join(' ');
+  if (banglaShare(text) >= 0.2) return null;              // already Bangla
+  const audio = path.join(workDir, `bncheck-${index}.m4a`);
+  try {
+    await extractAudio(file, audio);
+    const bn = await banglaWords(audio, script);
+    if (!bn || !bn.length || banglaShare(bn.map((w) => w.text).join(' ')) < 0.2) return null;
+    console.log(`[live-react] talk ${index + 1}: Bangla heard, using Bangla captions (${bn.length} words)`);
+    if (script && String(script).trim() && banglaShare(script) >= 0.2) return overScript(script, bn);
+    return bn.map((w) => ({ ...w, endsSentence: sentenceEnd(w.text) }));
+  } catch (e) {
+    console.warn('[live-react] bangla check:', e.message);
+    return null;
+  } finally {
+    fs.remove(audio).catch(() => {});
+  }
+}
+
+module.exports = { timeWords, overScript, banglaCheck };

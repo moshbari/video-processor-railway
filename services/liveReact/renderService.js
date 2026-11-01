@@ -425,6 +425,11 @@ async function render(project, workDir, onProgress = () => {}) {
     if (opt.captions && !(Array.isArray(t.words) && t.words.length)) {
       say(0.15 + 0.3 * (i / Math.max(1, allTalks.length)), `Timing captions for talk ${i + 1}`);
       t.words = await talkWords.timeWords(t.file, workDir, i, t.lang || opt.captions.lang || 'english', t.script);
+    } else if (opt.captions) {
+      // The phone's words aren't Bangla: make sure the talk wasn't Bangla speech.
+      say(0.15 + 0.3 * (i / Math.max(1, allTalks.length)), `Checking captions for talk ${i + 1}`);
+      const bn = await talkWords.banglaCheck(t.file, workDir, i, t.script, t.words);
+      if (bn) t.words = bn;
     }
     if (opt.captions && Array.isArray(t.words)) c.words = captions.remapWords(t.words, cuts);
     cleaned.set(t, c);
