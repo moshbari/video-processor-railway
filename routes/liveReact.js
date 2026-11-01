@@ -100,6 +100,8 @@ async function runGrab(job) {
   try {
     const r = await downloadService.downloadVideo(job.url, workId, {
       onProgress: (p) => { job.progress = p; },
+      app: 'rant',
+      who: crypto.createHash('sha256').update(job.deviceId).digest('hex').slice(0, 10),
     });
 
     job.stage = 'prepare';

@@ -193,7 +193,8 @@ class DownloadService {
     if (isYouTube(url) && homeWorker.online()) {
       try {
         console.log(`Getting from the home downloader: ${url}`);
-        const { files, info } = await homeWorker.download(url, opts.onProgress);
+        // who (scrambled user id) + app go along so the helper's usage log can count people.
+        const { files, info } = await homeWorker.download(url, opts.onProgress, { kind: 'video', app: opts.app || 'devrant', who: opts.who || null });
         await fs.emptyDir(outputPath);
         const videoPath = path.join(outputPath, 'video.mp4');
         const ins = files.audio ? ['-i', files.video, '-i', files.audio, '-map', '0:v:0', '-map', '1:a:0'] : ['-i', files.video];
