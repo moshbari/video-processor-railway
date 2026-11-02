@@ -27,6 +27,7 @@ const rantPost = require('./rantPost');
 const talkWords = require('./talkWords');
 
 const FPS = 30;
+const CTA_WORDS = new Map();   // CTA clip url|lang|script -> caption words (same clip, many RANTs)
 const LUT_DIR = path.join(__dirname, '..', '..', 'assets', 'luts');
 const LOOKS = ['orangeTeal', 'studio', 'pinkCyan', 'darkCinema', 'podcast', 'golden', 'cinematicBlue', 'moody', 'vintage', 'vibrant', 'pastel', 'mono'];
 
@@ -354,10 +355,10 @@ async function soloPiece(talkFile, talkLen, cw, ch, out, cap = '') {
 /**
  * The CTA clip at the very end (the user's own call-to-action video), fitted
  * into the frame with a blurred copy behind it if the shapes differ. It gets
- * the same colour look as the rest of the RANT so it matches; no Blur Me, no
- * captions, no silence cuts (it's already made).
+ * the same colour look and the same captions as the rest of the RANT so it
+ * matches; no Blur Me, no silence cuts (it's already made).
  */
-async function ctaPiece(file, cw, ch, evenVolume, out, look = '') {
+async function ctaPiece(file, cw, ch, evenVolume, out, look = '', cap = '') {
   const len = await probeDuration(file);
   if (!(len > 0.2)) throw new Error('The CTA clip has no picture.');
   const audio = await hasAudio(file);
@@ -366,7 +367,7 @@ async function ctaPiece(file, cw, ch, evenVolume, out, look = '') {
   const fc = `[0:v]${look ? look + ',' : ''}split[a][b];` +
     `[a]scale=${cw}:${ch}:force_original_aspect_ratio=increase,crop=${cw}:${ch},gblur=sigma=40,eq=brightness=-0.08[bg];` +
     `[b]scale=${cw}:${ch}:force_original_aspect_ratio=decrease,setsar=1[fg];` +
-    `[bg][fg]overlay=(W-w)/2:(H-h)/2,fps=${FPS},format=yuv420p[vo];` +
+    `[bg][fg]overlay=(W-w)/2:(H-h)/2,fps=${FPS}${cap ? ',' + cap : ''},format=yuv420p[vo];` +
     `[${audio ? '0' : '1'}:a]aformat=sample_rates=48000:channel_layouts=stereo${evenVolume ? ',' + LOUDNORM : ''}[ao]`;
   args.push('-filter_complex', fc, '-map', '[vo]', '-map', '[ao]', '-t', f3(len), ...ENC, ...AENC, out);
   await run(args, 'CTA clip');
@@ -516,7 +517,19 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
     say(0.94, 'Adding your CTA clip');
     const ctaIn = path.join(workDir, `cta-in${path.extname(new URL(project.cta.url).pathname) || '.mp4'}`);
     await r2Service.downloadFile(project.cta.url, ctaIn);
-    pieces.push(await ctaPiece(ctaIn, cw, ch, evenVolume, path.join(workDir, 'piece-cta.mp4'), faceLook));
+    let cap = '';
+    if (opt.captions) {
+      // Same captions as the talks (the CTA is usually the same clip every RANT, so its words are kept a while).
+      say(0.945, 'Captions for your CTA clip');
+      const key = `${project.cta.url}|${opt.captions.lang || ''}|${project.cta.script || ''}`;
+      let words = CTA_WORDS.get(key);
+      if (!words) {
+        words = await talkWords.timeWords(ctaIn, workDir, 'cta', opt.captions.lang || 'english', project.cta.script || '');
+        if (words && words.length) { CTA_WORDS.set(key, words); if (CTA_WORDS.size > 200) CTA_WORDS.delete(CTA_WORDS.keys().next().value); }
+      }
+      cap = await captions.captionFilter(words, opt.captions.design, opt.captions.place, cw, ch, path.join(workDir, 'captions-cta.ass'));
+    }
+    pieces.push(await ctaPiece(ctaIn, cw, ch, evenVolume, path.join(workDir, 'piece-cta.mp4'), faceLook, cap));
   }
 
   say(0.96, 'Joining it all together');
