@@ -352,17 +352,18 @@ async function soloPiece(talkFile, talkLen, cw, ch, out, cap = '') {
 }
 
 /**
- * The CTA clip at the very end (the user's own call-to-action video): played
- * as it is, fitted into the frame with a blurred copy behind it if the shapes
- * differ. No look, no blur, no captions, no silence cuts: it's already made.
+ * The CTA clip at the very end (the user's own call-to-action video), fitted
+ * into the frame with a blurred copy behind it if the shapes differ. It gets
+ * the same colour look as the rest of the RANT so it matches; no Blur Me, no
+ * captions, no silence cuts (it's already made).
  */
-async function ctaPiece(file, cw, ch, evenVolume, out) {
+async function ctaPiece(file, cw, ch, evenVolume, out, look = '') {
   const len = await probeDuration(file);
   if (!(len > 0.2)) throw new Error('The CTA clip has no picture.');
   const audio = await hasAudio(file);
   const args = ['-y', '-i', file];
   if (!audio) args.push('-f', 'lavfi', '-t', f3(len), '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000');
-  const fc = `[0:v]split[a][b];` +
+  const fc = `[0:v]${look ? look + ',' : ''}split[a][b];` +
     `[a]scale=${cw}:${ch}:force_original_aspect_ratio=increase,crop=${cw}:${ch},gblur=sigma=40,eq=brightness=-0.08[bg];` +
     `[b]scale=${cw}:${ch}:force_original_aspect_ratio=decrease,setsar=1[fg];` +
     `[bg][fg]overlay=(W-w)/2:(H-h)/2,fps=${FPS},format=yuv420p[vo];` +
@@ -515,7 +516,7 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
     say(0.94, 'Adding your CTA clip');
     const ctaIn = path.join(workDir, `cta-in${path.extname(new URL(project.cta.url).pathname) || '.mp4'}`);
     await r2Service.downloadFile(project.cta.url, ctaIn);
-    pieces.push(await ctaPiece(ctaIn, cw, ch, evenVolume, path.join(workDir, 'piece-cta.mp4')));
+    pieces.push(await ctaPiece(ctaIn, cw, ch, evenVolume, path.join(workDir, 'piece-cta.mp4'), faceLook));
   }
 
   say(0.96, 'Joining it all together');
