@@ -5,6 +5,7 @@
  *   - watch clips: the reactor's face (no sound) while a stretch of the video played
  *   - talks: the video paused at a moment and the reactor spoke (front or back camera)
  *   - an optional intro (before the video) and ending (after it)
+ *   - an optional CTA clip (the user's own ready-made video), at the very end
  *
  * Final video, in order:
  *   intro → [main video piece with the face box] → talk (over the frozen frame)
@@ -350,6 +351,27 @@ async function soloPiece(talkFile, talkLen, cw, ch, out, cap = '') {
   return out;
 }
 
+/**
+ * The CTA clip at the very end (the user's own call-to-action video): played
+ * as it is, fitted into the frame with a blurred copy behind it if the shapes
+ * differ. No look, no blur, no captions, no silence cuts: it's already made.
+ */
+async function ctaPiece(file, cw, ch, evenVolume, out) {
+  const len = await probeDuration(file);
+  if (!(len > 0.2)) throw new Error('The CTA clip has no picture.');
+  const audio = await hasAudio(file);
+  const args = ['-y', '-i', file];
+  if (!audio) args.push('-f', 'lavfi', '-t', f3(len), '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000');
+  const fc = `[0:v]split[a][b];` +
+    `[a]scale=${cw}:${ch}:force_original_aspect_ratio=increase,crop=${cw}:${ch},gblur=sigma=40,eq=brightness=-0.08[bg];` +
+    `[b]scale=${cw}:${ch}:force_original_aspect_ratio=decrease,setsar=1[fg];` +
+    `[bg][fg]overlay=(W-w)/2:(H-h)/2,fps=${FPS},format=yuv420p[vo];` +
+    `[${audio ? '0' : '1'}:a]aformat=sample_rates=48000:channel_layouts=stereo${evenVolume ? ',' + LOUDNORM : ''}[ao]`;
+  args.push('-filter_complex', fc, '-map', '[vo]', '-map', '[ao]', '-t', f3(len), ...ENC, ...AENC, out);
+  await run(args, 'CTA clip');
+  return out;
+}
+
 async function concat(files, out, workDir) {
   const list = path.join(workDir, 'concat.txt');
   await fs.writeFile(list, files.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join('\n'));
@@ -366,7 +388,8 @@ async function concat(files, out, workDir) {
  *   talks:   [{ kind: 'intro'|'talk'|'ending', at, url, oops: [], cuts: [[a,b]],
  *              words?: [{ text, start, end, endsSentence }], script?, lang? }],
  *   options: { silence: 'off'|'tight'|'natural'|'relaxed', blur: 0…1, look, lookStrength: 0…1,
- *              evenVolume: bool, faceBox: { xPct, yPct, wPct } }
+ *              evenVolume: bool, faceBox: { xPct, yPct, wPct } },
+ *   cta?: { url }   (optional CTA clip, added after everything else)
  * }
  * onProgress(fraction 0…1, words)
  */
@@ -487,10 +510,18 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
   }
   if (!pieces.length) throw new Error('Nothing to render: no video and no talks.');
 
+  // The CTA clip goes last, after the ending.
+  if (project.cta && project.cta.url) {
+    say(0.94, 'Adding your CTA clip');
+    const ctaIn = path.join(workDir, `cta-in${path.extname(new URL(project.cta.url).pathname) || '.mp4'}`);
+    await r2Service.downloadFile(project.cta.url, ctaIn);
+    pieces.push(await ctaPiece(ctaIn, cw, ch, evenVolume, path.join(workDir, 'piece-cta.mp4')));
+  }
+
   say(0.96, 'Joining it all together');
   const final = path.join(workDir, 'final.mp4');
   await concat(pieces, final, workDir);
   return { file: final, duration: await probeDuration(final), width: cw, height: ch };
 }
 
-module.exports = { render, talkCuts, keepRanges, LOOKS };
+module.exports = { render, talkCuts, keepRanges, ctaPiece, LOOKS };
