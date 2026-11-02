@@ -206,9 +206,14 @@ async function createPipSegment(originalPath, reactionPath, outputPath, targetWi
   // Step 3: Overlay reaction video (scaled to PiP size) on frozen background
   console.log('  Overlaying reaction PiP on frozen background...');
   
+  // Keep the reaction's own shape (a tall phone selfie must not be squashed into
+  // a wide box): fit it inside the 25% box, then pin it to the chosen corner.
+  const pad = 20;
+  const xExpr = coords.x <= pad ? `${pad}` : `main_w-overlay_w-${pad}`;
+  const yExpr = coords.y <= pad ? `${pad}` : `main_h-overlay_h-${pad}`;
   const filterComplex = [
-    `[1:v]scale=${pipWidth}:${pipHeight}[pip]`,
-    `[0:v][pip]overlay=${coords.x}:${coords.y}[outv]`
+    `[1:v]scale=${pipWidth}:${Math.floor(targetHeight * 0.35)}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1[pip]`,
+    `[0:v][pip]overlay=${xExpr}:${yExpr}[outv]`
   ].join(';');
 
   // Use audio from frozen background (which has reaction audio)
@@ -236,7 +241,23 @@ async function createPipSegment(originalPath, reactionPath, outputPath, targetWi
 // ============================================
 // CONCATENATION WITH PROPER FRAME RATE HANDLING
 // ============================================
-async function concatenateClips(clipPaths, outputPath) {
+async function hasAudioStream(videoPath) {
+  return new Promise((resolve) => {
+    ffmpeg.ffprobe(videoPath, (err, metadata) => {
+      if (err) { resolve(true); return; }
+      resolve(!!metadata.streams.find(s => s.codec_type === 'audio'));
+    });
+  });
+}
+
+// targetWidth/targetHeight = the MAIN video's own frame. Every clip is fitted
+// inside it (letterboxed, never stretched). Before 2Nov26 this was hard-coded to
+// 1080x1920, so a landscape main video came out as a thin strip in a tall frame.
+async function concatenateClips(clipPaths, outputPath, targetWidth = 1080, targetHeight = 1920) {
+  const W = Math.max(2, Math.round(targetWidth / 2) * 2);
+  const H = Math.max(2, Math.round(targetHeight / 2) * 2);
+  const audioFlags = await Promise.all(clipPaths.map(hasAudioStream));
+  const durations = await Promise.all(clipPaths.map(p => getVideoDuration(p)));
   return new Promise((resolve, reject) => {
     console.log(`  Running concatenation with concat FILTER + audio normalization...`);
     console.log(`  Clips to concat: ${clipPaths.length}`);
@@ -250,16 +271,20 @@ async function concatenateClips(clipPaths, outputPath) {
     const inputArgs = clipPaths.flatMap(p => ['-i', p]);
     
     // Build filter_complex with scale normalization AND audio normalization
-    // Each input gets scaled to 1080x1920 and fps set to 30, then concatenated
+    // Each input is fitted inside the main video's frame (W x H) at 30fps, then concatenated
     // Audio gets normalized with loudnorm for consistent volume
     let filterParts = [];
     let concatInputs = '';
     
     for (let i = 0; i < numClips; i++) {
       // Scale each video to same size and fps
-      filterParts.push(`[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p[v${i}]`);
-      // Normalize audio format
-      filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a${i}]`);
+      filterParts.push(`[${i}:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v${i}]`);
+      // Normalize audio format (a clip with no sound gets silence, or concat fails)
+      if (audioFlags[i]) {
+        filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
+      } else {
+        filterParts.push(`anullsrc=r=48000:cl=stereo,atrim=duration=${durations[i].toFixed(3)},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
+      }
       concatInputs += `[v${i}][a${i}]`;
     }
     
@@ -282,11 +307,12 @@ async function concatenateClips(clipPaths, outputPath) {
       '-crf', '23',
       '-c:a', 'aac',
       '-b:a', '128k',
+      '-ar', '48000',
       '-movflags', '+faststart',
       outputPath
     ];
     
-    console.log(`  Filter has ${filterParts.length} parts, normalizing all to 1080x1920@30fps + loudnorm`);
+    console.log(`  Filter has ${filterParts.length} parts, normalizing all to ${W}x${H}@30fps + loudnorm`);
     
     const ffmpegProcess = spawn('ffmpeg', args);
     
@@ -448,7 +474,7 @@ async function combineClipsWithReactions(originalClipPaths, reactionClipPaths, w
 
     // Pass the clip paths directly to concatenateClips (uses concat FILTER now)
     const outputPath = path.join(workDir, 'final_combined.mp4');
-    await concatenateClips(processedClips, outputPath);
+    await concatenateClips(processedClips, outputPath, targetWidth, targetHeight);
 
     // Get final file stats
     const stats = await fs.stat(outputPath);
