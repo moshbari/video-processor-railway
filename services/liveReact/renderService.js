@@ -288,7 +288,14 @@ async function watchPiece(main, a, b, watches, cw, ch, box, look, blur, evenVolu
   const bh = Math.round(bw * faceAspect) + 8;
   const margin = Math.round(Math.min(cw, ch) * 0.03);
   const bx = box.xPct != null ? Math.round(box.xPct * cw) : cw - (bw + 8) - margin;
-  const by = box.yPct != null ? Math.min(ch - bh, Math.round(box.yPct * ch)) : ch - bh - margin;
+  // Portrait: the box ends at 62% of the height, not in the corner (3 Nov 2026,
+  // Mosh: "the selfie is half gone under the border"). Facebook's feed and
+  // profile show a 9:16 video cropped to 4:5 (only ~15%-85% of the height), and
+  // full screen its caption + buttons cover the bottom ~35%. 15%-62% is seen
+  // everywhere, and the box stays clear of "low" captions (72%).
+  const safeBottom = ch > cw ? Math.round(ch * 0.62) : ch - margin;
+  const by = box.yPct != null ? Math.min(ch - bh, Math.round(box.yPct * ch))
+    : Math.max(ch > cw ? Math.round(ch * 0.15) : 0, safeBottom - bh);
   const parts = [`[0:v]scale=${cw}:${ch}:force_original_aspect_ratio=decrease,pad=${cw}:${ch}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${FPS}[base0]`];
   let last = 'base0';
   overlays.forEach((o, k) => {
@@ -429,7 +436,8 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
   const blur = Math.max(0, Math.min(1, Number(opt.blur) || 0));
   const evenVolume = opt.evenVolume !== false;
 
-  // Face box: bottom-right corner by default, ~30% wide on a portrait video;
+  // Face box: right side by default (portrait: inside Facebook's safe area, see
+  // watchPiece), ~30% wide on a portrait video;
   // on landscape no taller than 45% of the frame.
   const portrait = ch >= cw;
   const box = { wPct: portrait ? 0.30 : 0.22, maxHPct: portrait ? 0.32 : 0.45, ...(opt.faceBox || {}) };
