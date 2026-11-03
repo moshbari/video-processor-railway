@@ -400,7 +400,7 @@ async function concat(files, out, workDir) {
  *              words?: [{ text, start, end, endsSentence }], script?, lang? }],
  *   options: { silence: 'off'|'tight'|'natural'|'relaxed', blur: 0…1, look, lookStrength: 0…1,
  *              evenVolume: bool, faceBox: { xPct, yPct, wPct } },
- *   clips?: [{ url, place: 'before'|'after', recorded: bool, look: bool, script?, lang? }]
+ *   clips?: [{ url, place: 'before'|'after', recorded: bool, look: bool, captions: bool, script?, lang? }]
  *           (extra clips in the order they play; recorded = filmed in the app, so it
  *            is cleaned like a talk: silence cuts, look, Blur Me, captions)
  *   cta?: { url }   (optional CTA clip, added after everything else)
@@ -530,7 +530,7 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
     } else if (s.type === 'clip') {
       // An imported clip (Photos / Files / Tella or any link): fitted like the CTA clip.
       let cap = '';
-      if (opt.captions) {
+      if (opt.captions && s.c.captions !== false) {
         say(0.45 + 0.5 * (i / steps.length), `Captions for clip ${i + 1}`);
         const key = `${s.c.url}|${opt.captions.lang || ''}|${s.c.script || ''}`;
         let words = CTA_WORDS.get(key);
@@ -543,7 +543,7 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
       pieces.push(await ctaPiece(s.c.file, cw, ch, evenVolume, out, s.c.look === false ? '' : faceLook, cap));
     } else {
       const c = cleaned.get(s.t);
-      const cap = opt.captions
+      const cap = opt.captions && !(s.t.kind === 'clip' && s.t.captions === false)
         ? await captions.captionFilter(c.words, opt.captions.design, opt.captions.place, cw, ch, path.join(workDir, `captions-${i}.ass`))
         : '';
       if (s.type === 'talk') pieces.push(await talkPiece(main, s.at, c.file, c.duration, cw, ch, out, workDir, i, cap));
