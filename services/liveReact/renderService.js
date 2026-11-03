@@ -5,6 +5,8 @@
  *   - watch clips: the reactor's face (no sound) while a stretch of the video played
  *   - talks: the video paused at a moment and the reactor spoke (front or back camera)
  *   - an optional intro (before the video) and ending (after it)
+ *   - extra clips (from Photos, Files, a link like Tella, or recorded on the
+ *     front/back camera), each placed before or after the RANT, in order
  *   - an optional CTA clip (the user's own ready-made video), at the very end
  *
  * Final video, in order:
@@ -398,6 +400,9 @@ async function concat(files, out, workDir) {
  *              words?: [{ text, start, end, endsSentence }], script?, lang? }],
  *   options: { silence: 'off'|'tight'|'natural'|'relaxed', blur: 0…1, look, lookStrength: 0…1,
  *              evenVolume: bool, faceBox: { xPct, yPct, wPct } },
+ *   clips?: [{ url, place: 'before'|'after', recorded: bool, look: bool, script?, lang? }]
+ *           (extra clips in the order they play; recorded = filmed in the app, so it
+ *            is cleaned like a talk: silence cuts, look, Blur Me, captions)
  *   cta?: { url }   (optional CTA clip, added after everything else)
  * }
  * onProgress(fraction 0…1, words)
@@ -417,9 +422,12 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
   const startAt = Math.max(0, Number(project.startAt) || 0);
   const endAt = Math.min(mainLen, Number(project.endAt) || mainLen);
 
-  const allTalks = (project.talks || []).filter((t) => t.url);
+  // Extra clips: recorded ones are cleaned with the talks (kind 'clip'), imported ones are fitted as-is.
+  const clips = (project.clips || []).filter((c) => c && c.url)
+    .map((c) => ({ ...c, place: c.place === 'before' ? 'before' : 'after', kind: 'clip', oops: [], cuts: [], words: [] }));
+  const allTalks = [...(project.talks || []).filter((t) => t.url), ...clips.filter((c) => c.recorded)];
   const watches = [];
-  const fetchList = [...(project.watches || []).filter((w) => w.url), ...allTalks];
+  const fetchList = [...(project.watches || []).filter((w) => w.url), ...allTalks, ...clips.filter((c) => !c.recorded)];
   for (let i = 0; i < fetchList.length; i++) {
     say(0.04 + 0.1 * (i / Math.max(1, fetchList.length)), 'Fetching your recordings');
     const item = fetchList[i];
@@ -452,7 +460,7 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
     const keep = keepRanges(len, cuts);
     if (!keep.length) continue;   // nothing left (all silence)
     const dims = await probeDisplaySize(t.file);
-    const look = reactorFilter(lut, blur, Math.min(dims.width, dims.height));
+    const look = t.kind === 'clip' && t.look === false ? '' : reactorFilter(lut, blur, Math.min(dims.width, dims.height));
     const c = await cleanTalk(t.file, path.join(workDir, `talk-${i}.mp4`), keep, look, evenVolume);
     // Captions: words the phone didn't time (Android, or an iPhone talk it couldn't hear)
     // are timed here; then moved to where they land after the cuts.
@@ -477,7 +485,11 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
       if (!cleaned.has(t) || (Array.isArray(t.words) && t.words.length) || String(t.script || '').trim()) continue;
       t.words = await talkWords.timeWords(t.file, workDir, `post-${i}`, t.lang || 'english', '').catch(() => null);
     }
-    try { onSaid(rantPost.saidIn(allTalks.filter((t) => cleaned.has(t)))); } catch (e) { console.warn('[live-react] post text:', e.message); }
+    try {
+      // Clips before the RANT come first in what was said, clips after it last.
+      const rank = (t) => (t.kind !== 'clip' ? t : { ...t, kind: t.place === 'before' ? 'intro' : 'ending' });
+      onSaid(rantPost.saidIn(allTalks.filter((t) => cleaned.has(t)).map(rank)));
+    } catch (e) { console.warn('[live-react] post text:', e.message); }
   }
 
   // Watch clips get the same look; their blur is applied at box size in watchPiece.
@@ -492,6 +504,11 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
     .sort((x, y) => x.at - y.at);
 
   const steps = [];
+  const clipSteps = (place) => clips.filter((c) => c.place === place).forEach((c) => {
+    if (c.recorded) { if (cleaned.has(c)) steps.push({ type: 'solo', t: c }); }
+    else steps.push({ type: 'clip', c });
+  });
+  clipSteps('before');
   intros.forEach((t) => steps.push({ type: 'solo', t }));
   let cursor = startAt;
   for (const m of mids) {
@@ -501,6 +518,7 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
   }
   if (endAt - cursor >= 0.2) steps.push({ type: 'watch', a: cursor, b: endAt });
   endings.forEach((t) => steps.push({ type: 'solo', t }));
+  clipSteps('after');
 
   const pieces = [];
   for (let i = 0; i < steps.length; i++) {
@@ -509,6 +527,20 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
     const out = path.join(workDir, `piece-${String(i).padStart(3, '0')}.mp4`);
     if (s.type === 'watch') {
       pieces.push(await watchPiece(main, s.a, s.b, watches, cw, ch, box, faceLook, blur, evenVolume, out));
+    } else if (s.type === 'clip') {
+      // An imported clip (Photos / Files / Tella or any link): fitted like the CTA clip.
+      let cap = '';
+      if (opt.captions) {
+        say(0.45 + 0.5 * (i / steps.length), `Captions for clip ${i + 1}`);
+        const key = `${s.c.url}|${opt.captions.lang || ''}|${s.c.script || ''}`;
+        let words = CTA_WORDS.get(key);
+        if (!words) {
+          words = await talkWords.timeWords(s.c.file, workDir, `clip-${i}`, s.c.lang || opt.captions.lang || 'english', s.c.script || '').catch(() => []);
+          if (words && words.length) { CTA_WORDS.set(key, words); if (CTA_WORDS.size > 200) CTA_WORDS.delete(CTA_WORDS.keys().next().value); }
+        }
+        cap = await captions.captionFilter(words, opt.captions.design, opt.captions.place, cw, ch, path.join(workDir, `captions-${i}.ass`));
+      }
+      pieces.push(await ctaPiece(s.c.file, cw, ch, evenVolume, out, s.c.look === false ? '' : faceLook, cap));
     } else {
       const c = cleaned.get(s.t);
       const cap = opt.captions
