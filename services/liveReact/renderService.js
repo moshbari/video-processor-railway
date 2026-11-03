@@ -230,6 +230,27 @@ function keepRanges(duration, cuts) {
 }
 
 /**
+ * A clip that's already made (imported clip, CTA clip) with its silences cut,
+ * the same way as the talks when "Cut silences" is on. No look or volume here
+ * (ctaPiece does those). Returns the file to use (the original if nothing to cut).
+ */
+async function trimSilences(file, style, out) {
+  if (!SILENCE[style]) return file;
+  try {
+    const len = await probeDuration(file);
+    if (!(len > 0.2) || !(await hasAudio(file))) return file;
+    const cuts = await talkCuts(file, len, {}, style);
+    const keep = keepRanges(len, cuts);
+    if (!cuts.length || !keep.length) return file;
+    const c = await cleanTalk(file, out, keep, '', false);
+    return c.file || out;
+  } catch (e) {
+    console.warn('[LiveReact] trim silences:', e.message);
+    return file;
+  }
+}
+
+/**
  * Clean one talk into a new file at its own size: keeps only `keep` ranges,
  * applies the reactor look, levels the voice. Returns { file, duration }.
  */
@@ -365,7 +386,7 @@ async function soloPiece(talkFile, talkLen, cw, ch, out, cap = '') {
  * The CTA clip at the very end (the user's own call-to-action video), fitted
  * into the frame with a blurred copy behind it if the shapes differ. It gets
  * the same colour look and the same captions as the rest of the RANT so it
- * matches; no Blur Me, no silence cuts (it's already made).
+ * matches; no Blur Me. Its silences are cut before this (trimSilences).
  */
 async function ctaPiece(file, cw, ch, evenVolume, out, look = '', cap = '') {
   const len = await probeDuration(file);
@@ -528,19 +549,22 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
     if (s.type === 'watch') {
       pieces.push(await watchPiece(main, s.a, s.b, watches, cw, ch, box, faceLook, blur, evenVolume, out));
     } else if (s.type === 'clip') {
-      // An imported clip (Photos / Files / Tella or any link): fitted like the CTA clip.
+      // An imported clip (Photos / Files / Tella or any link): silences cut like the talks, fitted like the CTA clip.
+      const silence = opt.silence || 'relaxed';
+      say(0.45 + 0.5 * (i / steps.length), `Cutting silences in clip ${i + 1}`);
+      const clipFile = await trimSilences(s.c.file, silence, path.join(workDir, `clip-trim-${i}.mp4`));
       let cap = '';
       if (opt.captions && s.c.captions !== false) {
         say(0.45 + 0.5 * (i / steps.length), `Captions for clip ${i + 1}`);
-        const key = `${s.c.url}|${opt.captions.lang || ''}|${s.c.script || ''}`;
+        const key = `${s.c.url}|${opt.captions.lang || ''}|${s.c.script || ''}|${silence}`;
         let words = CTA_WORDS.get(key);
         if (!words) {
-          words = await talkWords.timeWords(s.c.file, workDir, `clip-${i}`, s.c.lang || opt.captions.lang || 'english', s.c.script || '').catch(() => []);
+          words = await talkWords.timeWords(clipFile, workDir, `clip-${i}`, s.c.lang || opt.captions.lang || 'english', s.c.script || '').catch(() => []);
           if (words && words.length) { CTA_WORDS.set(key, words); if (CTA_WORDS.size > 200) CTA_WORDS.delete(CTA_WORDS.keys().next().value); }
         }
         cap = await captions.captionFilter(words, opt.captions.design, opt.captions.place, cw, ch, path.join(workDir, `captions-${i}.ass`));
       }
-      pieces.push(await ctaPiece(s.c.file, cw, ch, evenVolume, out, s.c.look === false ? '' : faceLook, cap));
+      pieces.push(await ctaPiece(clipFile, cw, ch, evenVolume, out, s.c.look === false ? '' : faceLook, cap));
     } else {
       const c = cleaned.get(s.t);
       const cap = opt.captions && !(s.t.kind === 'clip' && s.t.captions === false)
@@ -557,19 +581,22 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
     say(0.94, 'Adding your CTA clip');
     const ctaIn = path.join(workDir, `cta-in${path.extname(new URL(project.cta.url).pathname) || '.mp4'}`);
     await r2Service.downloadFile(project.cta.url, ctaIn);
+    // Silences cut like everything else.
+    const silence = opt.silence || 'relaxed';
+    const ctaFile = await trimSilences(ctaIn, silence, path.join(workDir, 'cta-trim.mp4'));
     let cap = '';
     if (opt.captions) {
       // Same captions as the talks (the CTA is usually the same clip every RANT, so its words are kept a while).
       say(0.945, 'Captions for your CTA clip');
-      const key = `${project.cta.url}|${opt.captions.lang || ''}|${project.cta.script || ''}`;
+      const key = `${project.cta.url}|${opt.captions.lang || ''}|${project.cta.script || ''}|${silence}`;
       let words = CTA_WORDS.get(key);
       if (!words) {
-        words = await talkWords.timeWords(ctaIn, workDir, 'cta', opt.captions.lang || 'english', project.cta.script || '');
+        words = await talkWords.timeWords(ctaFile, workDir, 'cta', opt.captions.lang || 'english', project.cta.script || '');
         if (words && words.length) { CTA_WORDS.set(key, words); if (CTA_WORDS.size > 200) CTA_WORDS.delete(CTA_WORDS.keys().next().value); }
       }
       cap = await captions.captionFilter(words, opt.captions.design, opt.captions.place, cw, ch, path.join(workDir, 'captions-cta.ass'));
     }
-    pieces.push(await ctaPiece(ctaIn, cw, ch, evenVolume, path.join(workDir, 'piece-cta.mp4'), faceLook, cap));
+    pieces.push(await ctaPiece(ctaFile, cw, ch, evenVolume, path.join(workDir, 'piece-cta.mp4'), faceLook, cap));
   }
 
   say(0.96, 'Joining it all together');
@@ -578,4 +605,4 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
   return { file: final, duration: await probeDuration(final), width: cw, height: ch };
 }
 
-module.exports = { render, talkCuts, keepRanges, ctaPiece, LOOKS };
+module.exports = { render, talkCuts, keepRanges, ctaPiece, trimSilences, LOOKS };
