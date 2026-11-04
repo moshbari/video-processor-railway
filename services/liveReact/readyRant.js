@@ -140,4 +140,35 @@ async function readyRant({ sourceUrl, mainUrl, duration, language }) {
   return { rants, ending };
 }
 
-module.exports = { readyRant, mostFor, wordsOf, locate, place };
+/** "Pick by words": the transcript as tappable lines, one sentence each (or
+ *  ~9 s chunks when the captions have no full stops). Overlapping caption
+ *  pieces are cleaned first, then every word gets its time within its piece. */
+function linesOf(segs) {
+  // 1. Drop the words a piece repeats from the end of the one before it.
+  const clean = [];
+  let said = '';
+  for (const s of segs) {
+    let t = s.text.replace(/\s+/g, ' ').trim();
+    const tail = said.split(' ').slice(-8).join(' ');
+    const w = t.split(' ');
+    for (let k = Math.min(8, w.length); k > 0; k--) {
+      if (tail.endsWith(w.slice(0, k).join(' '))) { t = w.slice(k).join(' '); break; }
+    }
+    if (t) { clean.push({ start: s.start, end: s.end, text: t }); said = `${said} ${t}`.slice(-400); }
+  }
+  // 2. Timed words, 3. grouped into sentences.
+  const words = wordsOf(clean);
+  const out = [];
+  let cur = null;
+  words.forEach((w, i) => {
+    if (cur && w.start - words[i - 1].end > 1.5) { out.push(cur); cur = null; }
+    if (!cur) cur = { start: w.start, end: w.end, text: '' };
+    cur.text = cur.text ? `${cur.text} ${w.text}` : w.text;
+    cur.end = w.end;
+    if (/[.!?।]["')\]]?$/.test(w.text) || cur.end - cur.start >= 9 || cur.text.length >= 160) { out.push(cur); cur = null; }
+  });
+  if (cur) out.push(cur);
+  return out.map((l) => ({ start: Math.round(l.start * 100) / 100, end: Math.round(l.end * 100) / 100, text: l.text }));
+}
+
+module.exports = { readyRant, mostFor, wordsOf, locate, place, transcript, linesOf };
