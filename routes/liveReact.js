@@ -380,6 +380,10 @@ router.get('/ready-rant/:id', (req, res) => {
   const job = READY.get(req.params.id);
   if (!job || job.deviceId !== deviceOf(req)) return res.status(404).json({ success: false, error: 'That job is no longer on the server. Tap Try again.' });
 
+  const { id, status, rants, ending, error } = job;
+  res.json({ success: true, jobId: id, status, rants, ending, error });
+});
+
 // ===================== Pick by words =====================
 // The video's transcript as timed lines, so a part can be picked by what's said.
 // Same transcriber as Ready-made RANT; the answer is kept per video for a day.
@@ -423,9 +427,6 @@ setInterval(() => {
   const now = Date.now();
   for (const [id, j] of WORDS_JOBS) if (now - j.created > TTL_MS) WORDS_JOBS.delete(id);
 }, 15 * 60 * 1000).unref();
-  const { id, status, rants, ending, error } = job;
-  res.json({ success: true, jobId: id, status, rants, ending, error });
-});
 
 setInterval(() => {
   const now = Date.now();
