@@ -57,48 +57,8 @@ const MAX_SECONDS = Number(process.env.LIVE_REACT_MAX_SECONDS || 3 * 3600);
 const GRABS = new Map();     // grabId -> job
 const USE = new Map();       // deviceId -> { day, count }
 const TTL_MS = 6 * 60 * 60 * 1000;
-// ===================== Pick by words =====================
-// The video's transcript as timed lines, so a part can be picked by what's said.
-// Same transcriber as Ready-made RANT; the answer is kept per video for a day.
-const LINES = new Map();       // jobId -> job
-const LINES_CACHE = new Map(); // video link -> { lines, at }
-
-router.post('/lines', (req, res) => {
-  const deviceId = deviceOf(req);
-  if (!deviceId) return res.status(401).json({ success: false, error: 'Open the app and sign in with your code first.' });
-  const { sourceUrl, mainUrl } = req.body || {};
-  if (!sourceUrl && !mainUrl) return res.status(400).json({ success: false, error: 'Download a video first.' });
-  const key = sourceUrl || mainUrl;
-  const job = { id: uuidv4(), deviceId, status: 'working', lines: null, error: null, created: Date.now() };
-  LINES.set(job.id, job);
-  const hit = LINES_CACHE.get(key);
-  if (hit && Date.now() - hit.at < 24 * 3600 * 1000) { job.lines = hit.lines; job.status = 'done'; }
-  else {
-    transcript([sourceUrl, mainUrl])
-      .then((segs) => {
-        job.lines = linesOf(segs); job.status = 'done';
-        LINES_CACHE.set(key, { lines: job.lines, at: Date.now() });
-        if (LINES_CACHE.size > 300) LINES_CACHE.delete(LINES_CACHE.keys().next().value);
-      })
-      .catch((err) => {
-        console.error('[lines] failed:', err.message);
-        job.status = 'failed';
-        job.error = 'We couldn’t read what this video says. Use the yellow handles instead.';
-      });
-  }
-  res.json({ success: true, jobId: job.id, status: job.status, lines: job.lines });
-});
-
-router.get('/lines/:id', (req, res) => {
-  const job = LINES.get(req.params.id);
-  if (!job || job.deviceId !== deviceOf(req)) return res.status(404).json({ success: false, error: 'That job is no longer on the server. Tap Try again.' });
-  const { id, status, lines, error } = job;
-  res.json({ success: true, jobId: id, status, lines, error });
-});
-
 setInterval(() => {
   const now = Date.now();
-  for (const [id, j] of LINES) if (now - j.created > TTL_MS) LINES.delete(id);
   for (const [id, j] of GRABS) if (now - j.created > TTL_MS) GRABS.delete(id);
 }, 15 * 60 * 1000).unref();
 
@@ -419,15 +379,12 @@ router.post('/ready-rant', (req, res) => {
 router.get('/ready-rant/:id', (req, res) => {
   const job = READY.get(req.params.id);
   if (!job || job.deviceId !== deviceOf(req)) return res.status(404).json({ success: false, error: 'That job is no longer on the server. Tap Try again.' });
-  const { id, status, rants, ending, error } = job;
-  res.json({ success: true, jobId: id, status, rants, ending, error });
-});
 
 // ===================== Pick by words =====================
 // The video's transcript as timed lines, so a part can be picked by what's said.
 // Same transcriber as Ready-made RANT; the answer is kept per video for a day.
-const LINES = new Map();       // jobId -> job
-const LINES_CACHE = new Map(); // video link -> { lines, at }
+const WORDS_JOBS = new Map();  // jobId -> job
+const WORDS_CACHE = new Map(); // video link -> { lines, at }
 
 router.post('/lines', (req, res) => {
   const deviceId = deviceOf(req);
@@ -436,15 +393,15 @@ router.post('/lines', (req, res) => {
   if (!sourceUrl && !mainUrl) return res.status(400).json({ success: false, error: 'Download a video first.' });
   const key = sourceUrl || mainUrl;
   const job = { id: uuidv4(), deviceId, status: 'working', lines: null, error: null, created: Date.now() };
-  LINES.set(job.id, job);
-  const hit = LINES_CACHE.get(key);
+  WORDS_JOBS.set(job.id, job);
+  const hit = WORDS_CACHE.get(key);
   if (hit && Date.now() - hit.at < 24 * 3600 * 1000) { job.lines = hit.lines; job.status = 'done'; }
   else {
     transcript([sourceUrl, mainUrl])
       .then((segs) => {
         job.lines = linesOf(segs); job.status = 'done';
-        LINES_CACHE.set(key, { lines: job.lines, at: Date.now() });
-        if (LINES_CACHE.size > 300) LINES_CACHE.delete(LINES_CACHE.keys().next().value);
+        WORDS_CACHE.set(key, { lines: job.lines, at: Date.now() });
+        if (WORDS_CACHE.size > 300) WORDS_CACHE.delete(WORDS_CACHE.keys().next().value);
       })
       .catch((err) => {
         console.error('[lines] failed:', err.message);
@@ -456,7 +413,7 @@ router.post('/lines', (req, res) => {
 });
 
 router.get('/lines/:id', (req, res) => {
-  const job = LINES.get(req.params.id);
+  const job = WORDS_JOBS.get(req.params.id);
   if (!job || job.deviceId !== deviceOf(req)) return res.status(404).json({ success: false, error: 'That job is no longer on the server. Tap Try again.' });
   const { id, status, lines, error } = job;
   res.json({ success: true, jobId: id, status, lines, error });
@@ -464,7 +421,14 @@ router.get('/lines/:id', (req, res) => {
 
 setInterval(() => {
   const now = Date.now();
-  for (const [id, j] of LINES) if (now - j.created > TTL_MS) LINES.delete(id);
+  for (const [id, j] of WORDS_JOBS) if (now - j.created > TTL_MS) WORDS_JOBS.delete(id);
+}, 15 * 60 * 1000).unref();
+  const { id, status, rants, ending, error } = job;
+  res.json({ success: true, jobId: id, status, rants, ending, error });
+});
+
+setInterval(() => {
+  const now = Date.now();
   for (const [id, j] of RENDERS) if (now - j.created > TTL_MS) RENDERS.delete(id);
   for (const [id, j] of READY) if (now - j.created > TTL_MS) READY.delete(id);
 }, 15 * 60 * 1000).unref();
