@@ -407,7 +407,24 @@ async function ctaPiece(file, cw, ch, evenVolume, out, look = '', cap = '') {
 async function concat(files, out, workDir) {
   const list = path.join(workDir, 'concat.txt');
   await fs.writeFile(list, files.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join('\n'));
-  await run(['-y', '-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', '-movflags', '+faststart', out], 'concat');
+  const joined = path.join(workDir, 'joined.mp4');
+  await run(['-y', '-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', joined], 'concat');
+  // The AAC encoder's start-up delay leaves the picture starting ~21 ms after
+  // the sound, so the first moment of the video has no picture: Photos and
+  // Facebook take the thumbnail from there and show it black. Move the
+  // picture back to 0 (no re-encode).
+  const first = parseFloat(await ffprobe(['-v', 'error', '-select_streams', 'v:0', '-read_intervals', '%+#1',
+    '-show_entries', 'packet=pts_time', '-of', 'csv=p=0', joined]).catch(() => '0')) || 0;
+  if (first > 0.001 && first < 1) {
+    try {
+      await run(['-y', '-itsoffset', f3(-first), '-i', joined, '-i', joined, '-map', '0:v', '-map', '1:a',
+        '-c', 'copy', '-movflags', '+faststart', out], 'picture to 0');
+      return out;
+    } catch (e) {
+      console.warn('[LiveReact] picture-to-0 skipped:', e.message);
+    }
+  }
+  await run(['-y', '-i', joined, '-c', 'copy', '-movflags', '+faststart', out], 'faststart');
   return out;
 }
 
