@@ -432,7 +432,7 @@ async function concat(files, out, workDir) {
 
 /**
  * project = {
- *   main: { url }, startAt, endAt,
+ *   main: { url }, startAt, endAt, parts?: [[a, b], …]  (only these bits play, in order),
  *   watches: [{ url, sourceStart, sourceEnd }],
  *   talks:   [{ kind: 'intro'|'talk'|'ending', at, url, oops: [], cuts: [[a,b]],
  *              words?: [{ text, start, end, endsSentence }], script?, lang? }],
@@ -548,13 +548,39 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
   });
   clipSteps('before');
   intros.forEach((t) => steps.push({ type: 'solo', t }));
-  let cursor = startAt;
-  for (const m of mids) {
-    if (m.at - cursor >= 0.2) steps.push({ type: 'watch', a: cursor, b: m.at });
-    steps.push({ type: 'talk', t: m.t, at: m.at });
-    cursor = m.at;
+  // "Pick your parts": only these bits of the video play, in order, each with
+  // the talks made in it or right after it. The bits in between are left out.
+  const parts = (Array.isArray(project.parts) ? project.parts : [])
+    .map((p) => [Math.max(0, Number(p && p[0])), Math.min(mainLen, Number(p && p[1]))])
+    .filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b) && b - a >= 0.5)
+    .sort((x, y) => x[0] - y[0]);
+  if (parts.length) {
+    // Each talk goes with the part it was made in (or the last part before it).
+    const byPart = parts.map(() => []);
+    for (const m of mids) {
+      const raw = Number(m.t.at) || 0;
+      let i = parts.findIndex(([a, b]) => raw >= a - 0.3 && raw <= b + 0.3);
+      if (i < 0) { i = 0; parts.forEach(([a], j) => { if (a <= raw) i = j; }); }
+      byPart[i].push({ t: m.t, at: Math.min(parts[i][1], Math.max(parts[i][0], raw)) });
+    }
+    parts.forEach(([a, b], i) => {
+      let cur = a;
+      for (const m of byPart[i].sort((x, y) => x.at - y.at)) {
+        if (m.at - cur >= 0.2) steps.push({ type: 'watch', a: cur, b: m.at });
+        steps.push({ type: 'talk', t: m.t, at: m.at });
+        cur = m.at;
+      }
+      if (b - cur >= 0.2) steps.push({ type: 'watch', a: cur, b });
+    });
+  } else {
+    let cursor = startAt;
+    for (const m of mids) {
+      if (m.at - cursor >= 0.2) steps.push({ type: 'watch', a: cursor, b: m.at });
+      steps.push({ type: 'talk', t: m.t, at: m.at });
+      cursor = m.at;
+    }
+    if (endAt - cursor >= 0.2) steps.push({ type: 'watch', a: cursor, b: endAt });
   }
-  if (endAt - cursor >= 0.2) steps.push({ type: 'watch', a: cursor, b: endAt });
   endings.forEach((t) => steps.push({ type: 'solo', t }));
   clipSteps('after');
 
