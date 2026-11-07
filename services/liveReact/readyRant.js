@@ -10,17 +10,15 @@
  * READY_RANT_PROMPT env var, or a local git-ignored private/ready-rant-prompt.md.
  */
 
-const OpenAI = require('openai');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const { pickCta } = require('./rantCtas');
 
 const TRANSCRIBER = process.env.TRANSCRIBER_URL || 'https://transcriber-production-f2f1.up.railway.app';
-const MODEL = process.env.READY_RANT_MODEL || 'gpt-6.1-sol';
-
-let client = null;
-const openai = () => (client ||= new OpenAI({ apiKey: process.env.OPENAI_API_KEY }));
+// Claude on the owner's subscription (was OpenAI until its credit ran out, 7 Nov 2026).
+const MODEL = process.env.READY_RANT_CLAUDE_MODEL || 'sonnet';
+const { askText, jsonIn } = require('./claudeText');
 
 function masterPrompt() {
   if (process.env.READY_RANT_PROMPT) return process.env.READY_RANT_PROMPT;
@@ -100,13 +98,8 @@ async function write({ segs, duration, language }) {
   if (!prompt) throw new Error('Ready-made RANT is not set up on the server yet.');
   const most = mostFor(duration);
   const user = `Video length: ${Math.round(duration)} seconds\nMost RANTs allowed: ${most}\nLanguage: ${language === 'bengali' ? 'Bengali' : 'English'}\n\nTranscript (seconds in brackets):\n${promptLines(segs)}`;
-  const res = await openai().chat.completions.create({
-    model: MODEL,
-    messages: [{ role: 'system', content: prompt }, { role: 'user', content: user }],
-    response_format: { type: 'json_object' },
-  });
-  const text = res.choices?.[0]?.message?.content || '{}';
-  return { out: JSON.parse(text), most, usage: res.usage };
+  const text = await askText({ system: prompt + '\n\nReply with ONE JSON object and nothing else.', user, model: MODEL });
+  return { out: jsonIn(text), most, usage: { model: MODEL } };
 }
 
 /** The AI's picks → safe stops, in order, never breaking the rules. */

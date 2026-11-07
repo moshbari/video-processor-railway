@@ -10,14 +10,12 @@
  * git-ignored private/rant-post-prompt.md.
  */
 
-const OpenAI = require('openai');
 const fs = require('fs');
 const path = require('path');
+const { askText, jsonIn } = require('./claudeText');
 
-const MODEL = process.env.RANT_POST_MODEL || process.env.READY_RANT_MODEL || 'gpt-6.1-sol';
-
-let client = null;
-const openai = () => (client ||= new OpenAI({ apiKey: process.env.OPENAI_API_KEY }));
+// Claude on the owner's subscription (was OpenAI until its credit ran out, 7 Nov 2026).
+const MODEL = process.env.RANT_POST_CLAUDE_MODEL || 'sonnet';
 
 function postPrompt() {
   if (process.env.RANT_POST_PROMPT) return process.env.RANT_POST_PROMPT;
@@ -53,16 +51,12 @@ async function writePost({ said, title, url, earlier }) {
   const head = [title && `Video I reacted to: ${title}`, url].filter(Boolean).join('\n');
   prompt += `\n\nINPUT:\n${head ? head + '\n\n' : ''}What I said:\n${String(said).slice(0, 30000)}`;
 
-  const res = await openai().chat.completions.create({
-    model: MODEL,
-    messages: [{ role: 'user', content: prompt }],
-    response_format: { type: 'json_object' },
-  });
+  const text = await askText({ user: prompt, model: MODEL });
   let out = {};
-  try { out = JSON.parse(res.choices?.[0]?.message?.content || '{}'); } catch (_) { /* below */ }
+  try { out = jsonIn(text); } catch (_) { /* below */ }
   const post = String(out.post || '').trim();
   if (!post) throw new Error('The post came back empty.');
-  console.log(`[rant-post] ${post.length} chars (${res.usage?.prompt_tokens || 0} in, ${res.usage?.completion_tokens || 0} out)`);
+  console.log(`[rant-post] ${post.length} chars (Claude ${MODEL})`);
   return post;
 }
 
