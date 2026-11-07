@@ -92,6 +92,8 @@ const publicJob = (j) => ({
   error: j.error || null,
 });
 
+const NO_SOUND = 'This video came through with no sound, so it will be silent in your RANT. Your voice is still recorded when you talk.';
+
 function friendly(msg) {
   if (/Private video/i.test(msg)) return 'That video is private, so it can’t be downloaded.';
   if (/Video unavailable|removed|does not exist/i.test(msg)) return 'That video is no longer available.';
@@ -143,6 +145,10 @@ async function runGrab(job) {
     const shortSide = Math.min(dims.width || 0, dims.height || 0);
     job.warning = shortSide >= 1080 ? null
       : `This video only exists at ${dims.width}×${dims.height} on ${r.platform || 'the site'}, so your final video will be that size too.`;
+    if (!(await liveRender.hasAudio(ready))) {
+      console.log(`[LiveReact] no sound in the video: ${job.url}`);
+      job.warning = [NO_SOUND, job.warning].filter(Boolean).join(' ');
+    }
     job.main = {
       id: job.id,
       r2Key: key,
@@ -219,6 +225,7 @@ async function runImport(job, file, title) {
     const up = await r2Service.uploadFile(ready, key, 'video/mp4');
     const shortSide = Math.min(dims.width || 0, dims.height || 0);
     job.warning = shortSide >= 1080 ? null : `This video is ${dims.width}×${dims.height}, so your final video will be that size too.`;
+    if (!(await liveRender.hasAudio(ready))) job.warning = [NO_SOUND, job.warning].filter(Boolean).join(' ');
     job.main = {
       id: job.id, r2Key: key, url: up.downloadUrl || r2Service.getPublicUrl(key),
       width: dims.width, height: dims.height, duration, isHD: shortSide >= 1080,

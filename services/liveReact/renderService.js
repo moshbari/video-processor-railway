@@ -731,4 +731,4 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
   return { file: final, duration: await probeDuration(final), width: cw, height: ch };
 }
 
-module.exports = { render, talkCuts, keepRanges, ctaPiece, trimSilences, LOOKS, blurRanges };
+module.exports = { render, talkCuts, keepRanges, ctaPiece, trimSilences, LOOKS, blurRanges, hasAudio };

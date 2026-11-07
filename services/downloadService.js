@@ -1,4 +1,4 @@
-const { exec, spawn } = require('child_process');
+const { exec, execFile, spawn } = require('child_process');
 const { promisify } = require('util');
 const path = require('path');
 const fs = require('fs-extra');
@@ -37,6 +37,14 @@ function proxyUrl() {
 // FFmpeg cuts it fast, and it merges cleanly into mp4. Without the codec hint
 // yt-dlp picks AV1 for many YouTube videos.
 const FORMAT_ARGS = ['-f', 'bv*+ba/b', '-S', 'res:1080,vcodec:h264,acodec:aac'];
+
+/** Does this file have a sound track? If the check itself fails, assume yes. */
+function fileHasAudio(file) {
+  return new Promise((resolve) => {
+    execFile('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', file],
+      (err, stdout) => resolve(err ? true : String(stdout).trim().length > 0));
+  });
+}
 
 /**
  * Run yt-dlp without a shell (the URL never touches sh). Reports download
@@ -237,6 +245,14 @@ class DownloadService {
         ? [proxied, proxied]
         : [() => null, proxied];
 
+    // Facebook sometimes leaves the sound out of what it serves a data-centre IP
+    // (no audio format at all, and its "hd"/"sd" files are picture only), while a
+    // home IP gets the sound, often a higher resolution too. So a silent copy
+    // from the direct try is set aside and the proxy gets a turn. It's only used
+    // if the proxy can't do better (the video may really have no sound).
+    const silentDir = `${outputPath}-silent`;
+    let silent = null;
+
     let lastError = null;
     for (const pick of plan) {
       const proxy = pick();
@@ -272,7 +288,7 @@ class DownloadService {
 
         const videoPath = path.join(outputPath, videoFile);
         const stats = await fs.stat(videoPath);
-        return {
+        const got = {
           jobId: id,
           videoPath,
           filename: videoFile,
@@ -287,11 +303,27 @@ class DownloadService {
           url: info.webpage_url || url,
           viaProxy: !!proxy,
         };
+        if (!proxy && proxyUrl() && !(await fileHasAudio(videoPath))) {
+          console.log(`No sound in the direct download, trying the proxy: ${url}`);
+          await fs.move(videoPath, path.join(silentDir, videoFile), { overwrite: true });
+          silent = got;
+          continue;
+        }
+        fs.remove(silentDir).catch(() => {});
+        return got;
       } catch (error) {
         lastError = error;
         console.error(`Download attempt failed${proxy ? ' (via proxy)' : ''}: ${error.message}`);
         if (error.final || /Unsupported URL|Private video|Video unavailable|removed/i.test(error.message)) break;
       }
+    }
+
+    // The proxy didn't work out: the silent copy is still better than nothing.
+    if (silent) {
+      await fs.emptyDir(outputPath);
+      await fs.move(path.join(silentDir, silent.filename), silent.videoPath, { overwrite: true });
+      await fs.remove(silentDir).catch(() => {});
+      return silent;
     }
 
     if (isTikTok(url)) {
