@@ -243,7 +243,7 @@ class DownloadService {
       ? [proxied, proxied, proxied, () => null]
       : isTikTok(url)
         ? [proxied, proxied]
-        : [() => null, proxied];
+        : [() => null, proxied, proxied, proxied]; // a home IP can time out; each try gets a fresh one
 
     // Facebook sometimes leaves the sound out of what it serves a data-centre IP
     // (no audio format at all, and its "hd"/"sd" files are picture only), while a
