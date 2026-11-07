@@ -6,13 +6,10 @@
  * script's. Any failure just means that talk has no captions.
  */
 
-const OpenAI = require('openai');
 const fs = require('fs-extra');
 const path = require('path');
 const { spawn } = require('child_process');
 
-let client = null;
-const openai = () => (client ||= new OpenAI({ apiKey: process.env.OPENAI_API_KEY }));
 
 const sentenceEnd = (w) => /[.!?।]["')\]]?$/.test(w);
 
@@ -60,6 +57,21 @@ async function banglaWords(audio, script) {
  * Words of one talk: [{ text, start, end, endsSentence }] in seconds into the take.
  * lang: 'english' | 'bengali'.
  */
+// Word times come from the YapText server (its OpenAI account; this server's ran
+// dry 7 Nov 2026). Same whisper-1 underneath, so the captions are unchanged.
+const YAP_WORDS = process.env.YAPTEXT_WORDS_URL || 'https://yaptext-api-production.up.railway.app/words';
+
+async function yapWords(audio, lang, script) {
+  if (!process.env.YAPTEXT_APP_SECRET) { console.warn('[live-react] YAPTEXT_APP_SECRET not set: no caption timing'); return null; }
+  const form = new FormData();
+  form.append('audio', new Blob([await fs.readFile(audio)], { type: 'audio/mp4' }), 'talk.m4a');
+  form.append('language', lang === 'bengali' ? 'bengali' : 'english');
+  if (script) form.append('prompt', String(script).slice(0, 800));
+  const r = await fetch(YAP_WORDS, { method: 'POST', headers: { 'X-App-Secret': process.env.YAPTEXT_APP_SECRET }, body: form, signal: AbortSignal.timeout(180000) });
+  if (!r.ok) throw new Error(`YapText words ${r.status}`);
+  return r.json();
+}
+
 async function timeWords(file, workDir, index, lang, script) {
   const audio = path.join(workDir, `words-${index}.m4a`);
   try {
@@ -71,16 +83,8 @@ async function timeWords(file, workDir, index, lang, script) {
       if (script && String(script).trim()) return overScript(script, bn);
       return bn.map((w) => ({ ...w, endsSentence: sentenceEnd(w.text) }));
     }
-    if (!process.env.OPENAI_API_KEY) return [];
-    const res = await openai().audio.transcriptions.create({
-      file: fs.createReadStream(audio),
-      model: 'whisper-1',
-      response_format: 'verbose_json',
-      timestamp_granularities: ['word', 'segment'],
-      language: lang === 'bengali' ? 'bn' : 'en',
-      temperature: 0,
-      ...(script ? { prompt: String(script).slice(0, 800) } : {}),
-    });
+    const res = await yapWords(audio, lang, script);
+    if (!res) return [];
     const heard = (res.words || [])
       .map((w) => ({ text: String(w.word || '').trim(), start: Number(w.start), end: Number(w.end) }))
       .filter((w) => w.text && Number.isFinite(w.start) && Number.isFinite(w.end));
