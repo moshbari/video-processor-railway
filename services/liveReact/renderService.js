@@ -16,8 +16,10 @@
  * Talks are cleaned first: Oops cuts (back to the pause before the slip),
  * "cut a bit" ranges the user marked, then silence cutting in AiPrompter /
  * FlowCast's three styles. Blur Me and the colour look apply to the reactor
- * only, never the main video. Every piece is normalised to the main video's
- * size, 30fps, stereo 48k, then joined with the concat demuxer.
+ * only, never the main video. "Blur the video" blurs picked stretches of the
+ * main video (never the reactor), with the same strength scale as Blur Me.
+ * Every piece is normalised to the main video's size, 30fps, stereo 48k, then
+ * joined with the concat demuxer.
  */
 
 const { spawn } = require('child_process');
@@ -129,6 +131,48 @@ function reactorFilter(lut, blur, shortSide) {
   if (lut) parts.push(`lut3d=file='${lut.replace(/'/g, "\\'")}'`);
   if (blur > 0.001) parts.push(`gblur=sigma=${f3(Math.max(0.5, blur * 0.04 * shortSide))}:steps=3`);
   return parts.join(',');
+}
+
+// --- "Blur the video": picked stretches of the main video -------------------
+
+// A frame's edge can land a hair either side of a marked moment: a little
+// extra blur is fine, a sharp frame of what should be hidden is not.
+const BLUR_PAD = 0.05;
+
+/** The stretches to blur, in main-video seconds: tidied, padded and merged. */
+function blurRanges(list, mainLen) {
+  const out = [];
+  (Array.isArray(list) ? list : [])
+    .map((r) => [Number(r && r[0]), Number(r && r[1])])
+    .filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b) && b > a)
+    .map(([a, b]) => [Math.max(0, a - BLUR_PAD), Math.min(mainLen, b + BLUR_PAD)])
+    .filter(([a, b]) => b > a)
+    .sort((x, y) => x[0] - y[0])
+    .forEach(([a, b]) => {
+      const last = out[out.length - 1];
+      if (last && a <= last[1]) last[1] = Math.max(last[1], b);
+      else out.push([a, b]);
+    });
+  return out;
+}
+
+/** gblur for the main video, sized like Blur Me. strength 0…1 → up to 4% of the short side. */
+function mainBlur(strength, shortSide) {
+  return `gblur=sigma=${f3(Math.max(0.5, strength * 0.04 * shortSide))}:steps=3`;
+}
+
+/** The blur for a stretch [a,b] of the main video, in that piece's own time ('' if none of it is blurred). */
+function pieceBlur(ranges, a, b, sigmaFilter) {
+  const hits = ranges
+    .map(([s, e]) => [Math.max(s, a) - a, Math.min(e, b) - a])
+    .filter(([s, e]) => e > s);
+  if (!hits.length) return '';
+  return `,${sigmaFilter}:enable='${hits.map(([s, e]) => `between(t,${f3(s)},${f3(e)})`).join('+')}'`;
+}
+
+/** Is this moment of the main video inside a blurred stretch? */
+function isBlurred(ranges, t) {
+  return ranges.some(([s, e]) => t >= s && t <= e);
 }
 
 // --- cleaning a talk: oops, cut-a-bit, silences ------------------------------
@@ -291,7 +335,7 @@ async function cleanTalk(input, out, keep, look, evenVolume) {
  * A stretch of the main video [a,b] with the face box laid over it from the
  * watch clips that cover it (faces recorded with the video, so they line up).
  */
-async function watchPiece(main, a, b, watches, cw, ch, box, look, blur, evenVolume, out) {
+async function watchPiece(main, a, b, watches, cw, ch, box, look, blur, evenVolume, out, videoBlur = '') {
   const len = b - a;
   const inputs = ['-ss', f3(a), '-t', f3(len), '-i', main];
   const overlays = [];
@@ -319,7 +363,7 @@ async function watchPiece(main, a, b, watches, cw, ch, box, look, blur, evenVolu
   const safeBottom = ch > cw ? Math.round(ch * 0.62) : ch - margin;
   const by = box.yPct != null ? Math.min(ch - bh, Math.round(box.yPct * ch))
     : Math.max(ch > cw ? Math.round(ch * 0.15) : 0, safeBottom - bh);
-  const parts = [`[0:v]scale=${cw}:${ch}:force_original_aspect_ratio=decrease,pad=${cw}:${ch}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${FPS}[base0]`];
+  const parts = [`[0:v]scale=${cw}:${ch}:force_original_aspect_ratio=decrease,pad=${cw}:${ch}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${FPS}${videoBlur}[base0]`];
   let last = 'base0';
   overlays.forEach((o, k) => {
     // Face box: the look, scaled to the box, THEN Blur Me sized to the box
@@ -350,10 +394,12 @@ async function watchPiece(main, a, b, watches, cw, ch, box, look, blur, evenVolu
  * recording). Landscape video: the frozen frame fills it and the talk sits
  * full-height at the side.
  */
-async function talkPiece(main, at, talkFile, talkLen, cw, ch, out, workDir, i, cap = '') {
+async function talkPiece(main, at, talkFile, talkLen, cw, ch, out, workDir, i, cap = '', stillBlur = '') {
   const still = path.join(workDir, `still-${i}.jpg`);
-  await run(['-y', '-ss', f3(Math.max(0, at - 0.04)), '-i', main, '-frames:v', '1', '-q:v', '2', still], 'still')
-    .catch(() => run(['-y', '-i', main, '-frames:v', '1', '-q:v', '2', still], 'still'));
+  // A frozen frame inside a blurred stretch is blurred too (once, here, not on every frame).
+  const vf = stillBlur ? ['-vf', stillBlur] : [];
+  await run(['-y', '-ss', f3(Math.max(0, at - 0.04)), '-i', main, ...vf, '-frames:v', '1', '-q:v', '2', still], 'still')
+    .catch(() => run(['-y', '-i', main, ...vf, '-frames:v', '1', '-q:v', '2', still], 'still'));
   const portrait = ch >= cw;
   let fc;
   if (portrait) {
@@ -433,6 +479,7 @@ async function concat(files, out, workDir) {
 /**
  * project = {
  *   main: { url }, startAt, endAt, parts?: [[a, b], …]  (only these bits play, in order),
+ *   blurs?: [[a, b], …]  (stretches of the main video to blur; options.videoBlur = strength 0…1),
  *   watches: [{ url, sourceStart, sourceEnd }],
  *   talks:   [{ kind: 'intro'|'talk'|'ending', at, url, oops: [], cuts: [[a,b]],
  *              words?: [{ text, start, end, endsSentence }], script?, lang? }],
@@ -481,6 +528,11 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
   const lut = await lutFile(opt.look, opt.lookStrength ?? 1, workDir);
   const blur = Math.max(0, Math.min(1, Number(opt.blur) || 0));
   const evenVolume = opt.evenVolume !== false;
+
+  // "Blur the video": picked stretches of the main video, moving and frozen.
+  const blurred = blurRanges(project.blurs, mainLen);
+  const blurStrength = Math.max(0.05, Math.min(1, Number(opt.videoBlur) || 0.5));
+  const blurFilter = mainBlur(blurStrength, Math.min(cw, ch));
 
   // Face box: right side by default (portrait: inside Facebook's safe area, see
   // watchPiece), ~30% wide on a portrait video;
@@ -590,7 +642,7 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
     say(0.45 + 0.5 * (i / steps.length), `Building part ${i + 1} of ${steps.length}`);
     const out = path.join(workDir, `piece-${String(i).padStart(3, '0')}.mp4`);
     if (s.type === 'watch') {
-      pieces.push(await watchPiece(main, s.a, s.b, watches, cw, ch, box, faceLook, blur, evenVolume, out));
+      pieces.push(await watchPiece(main, s.a, s.b, watches, cw, ch, box, faceLook, blur, evenVolume, out, pieceBlur(blurred, s.a, s.b, blurFilter)));
     } else if (s.type === 'clip') {
       // An imported clip (Photos / Files / Tella or any link): silences cut like the talks, fitted like the CTA clip.
       const silence = opt.silence || 'relaxed';
@@ -613,7 +665,10 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
       const cap = opt.captions && !(s.t.kind === 'clip' && s.t.captions === false)
         ? await captions.captionFilter(c.words, opt.captions.design, opt.captions.place, cw, ch, path.join(workDir, `captions-${i}.ass`))
         : '';
-      if (s.type === 'talk') pieces.push(await talkPiece(main, s.at, c.file, c.duration, cw, ch, out, workDir, i, cap));
+      if (s.type === 'talk') {
+        const hide = isBlurred(blurred, s.at) || isBlurred(blurred, Math.max(0, s.at - 0.04));
+        pieces.push(await talkPiece(main, s.at, c.file, c.duration, cw, ch, out, workDir, i, cap, hide ? blurFilter : ''));
+      }
       else pieces.push(await soloPiece(c.file, c.duration, cw, ch, out, cap));
     }
   }
@@ -648,4 +703,4 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
   return { file: final, duration: await probeDuration(final), width: cw, height: ch };
 }
 
-module.exports = { render, talkCuts, keepRanges, ctaPiece, trimSilences, LOOKS };
+module.exports = { render, talkCuts, keepRanges, ctaPiece, trimSilences, LOOKS, blurRanges };
