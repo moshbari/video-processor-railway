@@ -7,11 +7,15 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     curl \
     wget \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install yt-dlp (-U fetches the latest and busts this cached layer; a stale
 # yt-dlp is the #1 cause of social-media download failures)
 RUN pip3 install --break-system-packages -U "yt-dlp[default,curl-cffi]"
+
+# RANT: finds and follows faces so women's faces can be blurred (services/liveReact/faceScan.py)
+RUN pip3 install --break-system-packages "opencv-python-headless==4.12.0.88"
 
 # Create app directory
 WORKDIR /app

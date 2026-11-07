@@ -13,6 +13,8 @@
  *   GET  /api/live-react/render/:id           -> { status, progress, words, video, error }
  *   POST /api/live-react/ready-rant  {sourceUrl, mainUrl, duration, language} -> { jobId }
  *   GET  /api/live-react/ready-rant/:id       -> { status, rants: [{at, script, why}], ending, error }
+ *   POST /api/live-react/faces  {mainUrl} -> { jobId }   (find the women's faces)
+ *   GET  /api/live-react/faces/:id       -> { status, progress, url, tracks: [{id,start,end,label,boxes}], error }
  *   POST /api/live-react/lines  {sourceUrl, mainUrl} -> { jobId }   ("Pick by words")
  *   GET  /api/live-react/lines/:id               -> { status, lines: [{start, end, text}], error }
  *
@@ -34,6 +36,7 @@ const renderService = require('../services/proRant/renderService');
 const liveRender = require('../services/liveReact/renderService');
 const { readyRant, transcript, linesOf } = require('../services/liveReact/readyRant');
 const rantPost = require('../services/liveReact/rantPost');
+const faceScan = require('../services/liveReact/faceScan');
 const multer = require('multer');
 const os = require('os');
 const crypto = require('crypto');
@@ -382,6 +385,72 @@ router.get('/ready-rant/:id', (req, res) => {
 
   const { id, status, rants, ending, error } = job;
   res.json({ success: true, jobId: id, status, rants, ending, error });
+});
+
+// ===================== Find the women's faces =====================
+// One scan per video: the answer is saved next to it, so a copy of the same
+// RANT or a server restart never pays twice. Render reads it back from `url`.
+const FACE_JOBS = new Map();   // jobId -> job
+const FACE_LIVE = new Map();   // video link -> job still running
+const DAILY_FACES = Number(process.env.LIVE_REACT_DAILY_FACES || 20);
+const FACE_USE = new Map();
+
+function faceKey(mainUrl) {
+  return `live-react/faces/${crypto.createHash('sha256').update(mainUrl).digest('hex').slice(0, 32)}.json`;
+}
+
+async function runFaceJob(job, mainUrl) {
+  const workDir = path.join(os.tmpdir(), `faces-${job.id}`);
+  const key = faceKey(mainUrl);
+  const url = r2Service.getPublicUrl(key);
+  try {
+    await fs.ensureDir(workDir);
+    const saved = path.join(workDir, 'saved.json');
+    const had = await r2Service.downloadFile(url, saved).then(() => fs.readJson(saved)).catch(() => null);
+    if (had && Array.isArray(had.tracks)) { Object.assign(job, { tracks: had.tracks, url, status: 'done', progress: 1 }); return; }
+
+    const video = path.join(workDir, 'main.mp4');
+    await r2Service.downloadFile(mainUrl, video);
+    const r = await faceScan.scan(video, workDir, (p) => { job.progress = p; });
+    const file = path.join(workDir, 'faces.json');
+    await fs.writeJson(file, { duration: r.duration, tracks: r.tracks });
+    const up = await r2Service.uploadFile(file, key, 'application/json');
+    Object.assign(job, { tracks: r.tracks, url: up.downloadUrl || url, status: 'done', progress: 1 });
+  } catch (err) {
+    console.error('[faces] failed:', err.message);
+    job.status = 'failed';
+    job.error = 'Couldn’t check the faces in this video. Tap Try again.';
+  } finally {
+    FACE_LIVE.delete(mainUrl);
+    setTimeout(() => FACE_JOBS.delete(job.id), TTL_MS).unref();
+    fs.remove(workDir).catch(() => {});
+  }
+}
+
+router.post('/faces', (req, res) => {
+  const deviceId = deviceOf(req);
+  if (!deviceId) return res.status(401).json({ success: false, error: 'Open the app and sign in with your code first.' });
+  const { mainUrl } = req.body || {};
+  if (!mainUrl) return res.status(400).json({ success: false, error: 'Download a video first.' });
+  const running = FACE_LIVE.get(mainUrl);
+  if (running && running.deviceId === deviceId) return res.json({ success: true, jobId: running.id, status: running.status });
+  const u = FACE_USE.get(deviceId);
+  if (u && u.day === today() && u.count >= DAILY_FACES) {
+    return res.status(429).json({ success: false, error: `You’ve checked ${DAILY_FACES} videos for faces today. Try again tomorrow.` });
+  }
+  if (!u || u.day !== today()) FACE_USE.set(deviceId, { day: today(), count: 1 }); else u.count += 1;
+  const job = { id: uuidv4(), deviceId, status: 'working', progress: 0, tracks: null, url: null, error: null, created: Date.now() };
+  FACE_JOBS.set(job.id, job);
+  FACE_LIVE.set(mainUrl, job);
+  runFaceJob(job, mainUrl);
+  res.json({ success: true, jobId: job.id, status: job.status });
+});
+
+router.get('/faces/:id', (req, res) => {
+  const job = FACE_JOBS.get(req.params.id);
+  if (!job || job.deviceId !== deviceOf(req)) return res.status(404).json({ success: false, error: 'That job is no longer on the server. Tap Try again.' });
+  const { id, status, progress, url, tracks, error } = job;
+  res.json({ success: true, jobId: id, status, progress, url, tracks, error });
 });
 
 // ===================== Pick by words =====================

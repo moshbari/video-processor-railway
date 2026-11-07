@@ -29,6 +29,7 @@ const r2Service = require('../r2Service');
 const captions = require('./captions');
 const rantPost = require('./rantPost');
 const talkWords = require('./talkWords');
+const faceMask = require('./faceMask');
 
 const FPS = 30;
 const CTA_WORDS = new Map();   // CTA clip url|lang|script -> caption words (same clip, many RANTs)
@@ -335,7 +336,7 @@ async function cleanTalk(input, out, keep, look, evenVolume) {
  * A stretch of the main video [a,b] with the face box laid over it from the
  * watch clips that cover it (faces recorded with the video, so they line up).
  */
-async function watchPiece(main, a, b, watches, cw, ch, box, look, blur, evenVolume, out, videoBlur = '') {
+async function watchPiece(main, a, b, watches, cw, ch, box, look, blur, evenVolume, out, videoBlur = '', faces = null, faceSigma = '') {
   const len = b - a;
   const inputs = ['-ss', f3(a), '-t', f3(len), '-i', main];
   const overlays = [];
@@ -347,6 +348,10 @@ async function watchPiece(main, a, b, watches, cw, ch, box, look, blur, evenVolu
     overlays.push({ idx, at: s - a, len: e - s });
     idx++;
   }
+  // Blurred faces: the mask video says where. Done before anything is laid on
+  // top, so the blur stays on the video and the reactor's box stays as it is.
+  let faceIdx = -1;
+  if (faces) { inputs.push('-i', faces.file); faceIdx = idx; idx++; }
   // Box size from the face picture's real shape, kept inside the frame.
   const fd = overlays.length ? await probeDisplaySize(watches.find((w) => w.file && inputs.includes(w.file)).file) : { width: 9, height: 16 };
   const faceAspect = fd.height / fd.width;
@@ -365,6 +370,15 @@ async function watchPiece(main, a, b, watches, cw, ch, box, look, blur, evenVolu
     : Math.max(ch > cw ? Math.round(ch * 0.15) : 0, safeBottom - bh);
   const parts = [`[0:v]scale=${cw}:${ch}:force_original_aspect_ratio=decrease,pad=${cw}:${ch}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${FPS}${videoBlur}[base0]`];
   let last = 'base0';
+  if (faces) {
+    const when = faces.spans.map(([s, e]) => `between(t,${f3(s)},${f3(e)})`).join('+');
+    parts[0] = parts[0].replace('[base0]', '[plain]');
+    parts.push('[plain]split[fo][fb]');
+    parts.push(`[fb]${faceSigma}:enable='${when}'[fbl]`);
+    parts.push(`[${faceIdx}:v]format=gray,gblur=sigma=1,scale=${cw}:${ch}:flags=bilinear[fm]`);
+    parts.push('[fbl][fm]alphamerge[fa]');
+    parts.push('[fo][fa]overlay=eof_action=pass:format=auto[base0]');
+  }
   overlays.forEach((o, k) => {
     // Face box: the look, scaled to the box, THEN Blur Me sized to the box
     // itself, so the small face is hidden as well as a full-screen talk
@@ -394,12 +408,13 @@ async function watchPiece(main, a, b, watches, cw, ch, box, look, blur, evenVolu
  * recording). Landscape video: the frozen frame fills it and the talk sits
  * full-height at the side.
  */
-async function talkPiece(main, at, talkFile, talkLen, cw, ch, out, workDir, i, cap = '', stillBlur = '') {
+async function talkPiece(main, at, talkFile, talkLen, cw, ch, out, workDir, i, cap = '', stillBlur = '', hideFaces = null) {
   const still = path.join(workDir, `still-${i}.jpg`);
   // A frozen frame inside a blurred stretch is blurred too (once, here, not on every frame).
   const vf = stillBlur ? ['-vf', stillBlur] : [];
   await run(['-y', '-ss', f3(Math.max(0, at - 0.04)), '-i', main, ...vf, '-frames:v', '1', '-q:v', '2', still], 'still')
     .catch(() => run(['-y', '-i', main, ...vf, '-frames:v', '1', '-q:v', '2', still], 'still'));
+  if (hideFaces) await hideFaces(still, at);
   const portrait = ch >= cw;
   let fc;
   if (portrait) {
@@ -534,6 +549,18 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
   const blurStrength = Math.max(0.05, Math.min(1, Number(opt.videoBlur) || 0.5));
   const blurFilter = mainBlur(blurStrength, Math.min(cw, ch));
 
+  // Faces the AI found (and the user kept): the same strength, only on the face.
+  const faceTracks = await faceMask.chosenTracks(project.faceBlur, r2Service, path.join(workDir, 'faces.json'));
+  const hideFaces = !faceTracks.length ? null : async (still, at) => {
+    const mask = await faceMask.maskStill(faceTracks, at, cw, ch, `${still}.mask.png`);
+    if (!mask) return;
+    const fixed = `${still}.faces.jpg`;
+    await run(['-y', '-i', still, '-i', mask, '-filter_complex',
+      `[0:v]split[o][b];[b]${blurFilter}[bl];[1:v]format=gray,gblur=sigma=1,scale=${cw}:${ch}:flags=bilinear[m];[bl][m]alphamerge[a];[o][a]overlay`,
+      '-frames:v', '1', '-q:v', '2', fixed], 'faces on still');
+    await fs.move(fixed, still, { overwrite: true });
+  };
+
   // Face box: right side by default (portrait: inside Facebook's safe area, see
   // watchPiece), ~30% wide on a portrait video;
   // on landscape no taller than 45% of the frame.
@@ -642,7 +669,8 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
     say(0.45 + 0.5 * (i / steps.length), `Building part ${i + 1} of ${steps.length}`);
     const out = path.join(workDir, `piece-${String(i).padStart(3, '0')}.mp4`);
     if (s.type === 'watch') {
-      pieces.push(await watchPiece(main, s.a, s.b, watches, cw, ch, box, faceLook, blur, evenVolume, out, pieceBlur(blurred, s.a, s.b, blurFilter)));
+      const faces = faceTracks.length ? await faceMask.maskVideo(faceTracks, s.a, s.b, cw, ch, `${out}.mask.mp4`) : null;
+      pieces.push(await watchPiece(main, s.a, s.b, watches, cw, ch, box, faceLook, blur, evenVolume, out, pieceBlur(blurred, s.a, s.b, blurFilter), faces, blurFilter));
     } else if (s.type === 'clip') {
       // An imported clip (Photos / Files / Tella or any link): silences cut like the talks, fitted like the CTA clip.
       const silence = opt.silence || 'relaxed';
@@ -667,7 +695,7 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
         : '';
       if (s.type === 'talk') {
         const hide = isBlurred(blurred, s.at) || isBlurred(blurred, Math.max(0, s.at - 0.04));
-        pieces.push(await talkPiece(main, s.at, c.file, c.duration, cw, ch, out, workDir, i, cap, hide ? blurFilter : ''));
+        pieces.push(await talkPiece(main, s.at, c.file, c.duration, cw, ch, out, workDir, i, cap, hide ? blurFilter : '', hide ? null : hideFaces));
       }
       else pieces.push(await soloPiece(c.file, c.duration, cw, ch, out, cap));
     }
