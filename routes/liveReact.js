@@ -9,8 +9,8 @@
  *   GET  /api/live-react/grab/:id            -> { status, stage, progress, main, warning, error }
  *   POST /api/live-react/import      file 'file', field 'title' -> { grabId }  (a video from the phone's Photos/Files)
  *   POST /api/live-react/upload      file 'file', field 'project' -> { url }  (one recording)
- *   POST /api/live-react/render      {project} -> { renderId }  (runs in the background)
- *   GET  /api/live-react/render/:id           -> { status, progress, words, video, error }
+ *   POST /api/live-react/render      {project, batch?, push?} -> { renderId }  (waits in line, survives restarts)
+ *   GET  /api/live-react/render/:id           -> { status, progress, words, video, error, place }
  *   POST /api/live-react/ready-rant  {sourceUrl, mainUrl, duration, language} -> { jobId }
  *   GET  /api/live-react/ready-rant/:id       -> { status, rants: [{at, script, why}], ending, error }
  *   POST /api/live-react/faces  {mainUrl} -> { jobId }   (find the women's faces)
@@ -37,6 +37,7 @@ const liveRender = require('../services/liveReact/renderService');
 const { readyRant, transcript, linesOf } = require('../services/liveReact/readyRant');
 const rantPost = require('../services/liveReact/rantPost');
 const faceScan = require('../services/liveReact/faceScan');
+const renderQueue = require('../services/liveReact/renderQueue');
 const multer = require('multer');
 const os = require('os');
 const crypto = require('crypto');
@@ -277,57 +278,28 @@ router.post('/upload', upload.single('file'), async (req, res) => {
 });
 
 // ===================== Render =====================
-// One render at a time on this box (they're CPU-heavy); the rest wait in line.
-const RENDERS = new Map();   // renderId -> job
-let line = Promise.resolve();
-
+// The line itself lives in services/liveReact/renderQueue.js: one render at a
+// time, single RANTs before batch RANTs, kept in R2 so restarts lose nothing.
+//   body: { project, batch?: true, push?: { token, env: 'production'|'sandbox' } }
 router.post('/render', async (req, res) => {
   const deviceId = deviceOf(req);
   if (!deviceId) return res.status(401).json({ success: false, error: 'Open the app and sign in with your code first.' });
-  const project = req.body && req.body.project;
+  const { project, batch, push } = req.body || {};
   if (!project || !project.main || !project.main.url) return res.status(400).json({ success: false, error: 'Nothing to render.' });
-
-  const job = { id: uuidv4(), deviceId, status: 'waiting', progress: 0, words: 'Waiting for the renderer', video: null, error: null, created: Date.now(),
-    said: null, post: null, postStatus: null };
-  RENDERS.set(job.id, job);
-  // The Facebook post is written while the video renders, from what was said.
-  const onSaid = (said) => {
-    job.said = said || null;
-    if (!job.said) return;
-    job.postStatus = 'working';
-    rantPost.writePost({ said: job.said, title: project.main.title, url: project.main.sourceUrl })
-      .then((p) => { job.post = p; job.postStatus = 'done'; })
-      .catch((e) => { console.error('[rant-post] failed:', e.message); job.postStatus = 'failed'; });
-  };
-  line = line.then(async () => {
-    job.status = 'working';
-    const workDir = path.join(process.env.TEMP_DIR || '/app/temp', `live-react-render-${job.id}`);
-    try {
-      const r = await liveRender.render(project, workDir, (f, words) => { job.progress = Math.round(f * 100); job.words = words; }, onSaid);
-      job.words = 'Saving your video';
-      const key = `live-react/${deviceId}/${String(project.id || 'p').replace(/[^a-z0-9-]/gi, '')}/final-${job.id.slice(0, 8)}.mp4`;
-      const up = await r2Service.uploadFile(r.file, key, 'video/mp4');
-      job.video = { url: up.downloadUrl || r2Service.getPublicUrl(key), duration: r.duration, width: r.width, height: r.height };
-      job.status = 'done';
-      job.progress = 100;
-      job.words = 'Done';
-      console.log(`[LiveReact] rendered ${r.width}x${r.height} ${Math.round(r.duration)}s for ${deviceId.slice(0, 6)}`);
-    } catch (err) {
-      console.error('[LiveReact] render failed:', err.message);
-      job.status = 'failed';
-      job.error = 'The video didn’t render. Tap Make my RANT to try again.';
-    } finally {
-      fs.remove(workDir).catch(() => {});
-    }
-  });
-  res.json({ success: true, renderId: job.id, status: job.status });
+  const to = push && typeof push.token === 'string' ? { token: push.token.slice(0, 200), env: push.env === 'sandbox' ? 'sandbox' : 'production' } : null;
+  try {
+    const state = await renderQueue.add({ deviceId, project, batch: batch === true, push: to });
+    res.json({ success: true, ...state });
+  } catch (err) {
+    console.error('[LiveReact] could not queue a render:', err.message);
+    res.status(500).json({ success: false, error: 'The render didn’t start. Try again.' });
+  }
 });
 
-router.get('/render/:id', (req, res) => {
-  const job = RENDERS.get(req.params.id);
-  if (!job || job.deviceId !== deviceOf(req)) return res.status(404).json({ success: false, error: 'That render is no longer on the server. Tap Make my RANT again.' });
-  const { id, status, progress, words, video, error, said, post, postStatus } = job;
-  res.json({ success: true, renderId: id, status, progress, words, video, error, said, post, postStatus });
+router.get('/render/:id', async (req, res) => {
+  const state = await renderQueue.get(String(req.params.id || '').slice(0, 64), deviceOf(req)).catch(() => null);
+  if (!state) return res.status(404).json({ success: false, error: 'That render is no longer on the server. Tap Make my RANT again.' });
+  res.json({ success: true, ...state });
 });
 
 // ===================== Facebook post =====================
@@ -506,7 +478,6 @@ setInterval(() => {
 
 setInterval(() => {
   const now = Date.now();
-  for (const [id, j] of RENDERS) if (now - j.created > TTL_MS) RENDERS.delete(id);
   for (const [id, j] of READY) if (now - j.created > TTL_MS) READY.delete(id);
 }, 15 * 60 * 1000).unref();
 
