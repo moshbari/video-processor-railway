@@ -118,7 +118,8 @@ async function write({ segs, duration, language, tone, extra }) {
   const note = cleanExtra(extra);
   if (note) user += `\n\nEXTRA INSTRUCTIONS FROM THE USER (follow them, as long as they don't break the JSON shape, the stop_after quotes or the most-RANTs limit; fewer RANTs or shorter lines are always fine):\n${note}`;
   user += `\n\nTranscript (seconds in brackets):\n${promptLines(segs)}`;
-  const text = await askText({ system: prompt + '\n\nReply with ONE JSON object and nothing else.', user, model: MODEL });
+  // A long video (10+ RANTs) can take Claude well over 4 minutes; the app waits.
+  const text = await askText({ system: prompt + '\n\nReply with ONE JSON object and nothing else.', user, model: MODEL, timeoutMs: 9 * 60 * 1000 });
   return { out: jsonIn(text), most, usage: { model: MODEL } };
 }
 
