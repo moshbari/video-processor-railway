@@ -89,15 +89,35 @@ function locate(quote, words) {
   return null;
 }
 
+/** Optional voices the user can pick in the app. They change HOW it sounds,
+ *  never the facts, the stops or the JSON. Halal and kind: no swearing, no
+ *  mocking religion, looks, family or anyone's background. */
+const TONES = {
+  funny: 'Funny. Light, playful jokes and surprising comparisons. Still makes a real point.',
+  roast_creator: "Roast the creator. Tease the creator's claims, hype and logic like a friendly roast battle. Sharp and funny, never cruel: roast what they SAY, never who they are.",
+  roast_system: 'Roast the system. Aim the jokes at the system, industry or trend behind the video (the algorithm, the hustle culture, the bank, the government, the market), not at the creator.',
+  wise_comedian: 'Wise stand-up comedian. Get the laugh first, then land one true, wise point people remember. Like a comedian who is secretly a teacher.',
+  serious: 'Straight talk. No jokes. Calm, clear and direct, like a mentor telling a friend the truth.',
+};
+
+/** The user's own words, kept short and on one block. */
+function cleanExtra(extra) {
+  return String(extra || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+}
+
 function promptLines(segs) {
   return segs.map((s) => `[${s.start.toFixed(1)}] ${s.text}`).join('\n');
 }
 
-async function write({ segs, duration, language }) {
+async function write({ segs, duration, language, tone, extra }) {
   const prompt = masterPrompt();
   if (!prompt) throw new Error('Ready-made RANT is not set up on the server yet.');
   const most = mostFor(duration);
-  const user = `Video length: ${Math.round(duration)} seconds\nMost RANTs allowed: ${most}\nLanguage: ${language === 'bengali' ? 'Bengali' : 'English'}\n\nTranscript (seconds in brackets):\n${promptLines(segs)}`;
+  let user = `Video length: ${Math.round(duration)} seconds\nMost RANTs allowed: ${most}\nLanguage: ${language === 'bengali' ? 'Bengali' : 'English'}`;
+  if (TONES[tone]) user += `\n\nTONE (the user picked this; use it for every RANT and the ending, but keep every other rule, keep it honest and keep it halal: no swearing, no mocking religion, looks or family): ${TONES[tone]}`;
+  const note = cleanExtra(extra);
+  if (note) user += `\n\nEXTRA INSTRUCTIONS FROM THE USER (follow them, as long as they don't break the JSON shape, the stop_after quotes or the most-RANTs limit; fewer RANTs or shorter lines are always fine):\n${note}`;
+  user += `\n\nTranscript (seconds in brackets):\n${promptLines(segs)}`;
   const text = await askText({ system: prompt + '\n\nReply with ONE JSON object and nothing else.', user, model: MODEL });
   return { out: jsonIn(text), most, usage: { model: MODEL } };
 }
@@ -120,11 +140,11 @@ function place(out, words, duration, most) {
 }
 
 /** { rants: [{at, script, why}], ending } */
-async function readyRant({ sourceUrl, mainUrl, duration, language }) {
+async function readyRant({ sourceUrl, mainUrl, duration, language, tone, extra }) {
   const segs = await transcript([sourceUrl, mainUrl]);
   const words = wordsOf(segs);
   const dur = Number(duration) > 0 ? Number(duration) : (words.length ? words[words.length - 1].end : 0);
-  const { out, most, usage } = await write({ segs, duration: dur, language });
+  const { out, most, usage } = await write({ segs, duration: dur, language, tone, extra });
   const rants = place(out, words, dur, most);
   console.log(`[ready-rant] ${Math.round(dur)}s → ${rants.length}/${most} RANTs (${usage?.prompt_tokens || 0} in, ${usage?.completion_tokens || 0} out)`);
   // The ending is the AI's verdict + one of Mosh's 99% DFY calls to action (random).
@@ -164,4 +184,4 @@ function linesOf(segs) {
   return out.map((l) => ({ start: Math.round(l.start * 100) / 100, end: Math.round(l.end * 100) / 100, text: l.text }));
 }
 
-module.exports = { readyRant, mostFor, wordsOf, locate, place, transcript, linesOf };
+module.exports = { TONES, readyRant, mostFor, wordsOf, locate, place, transcript, linesOf };

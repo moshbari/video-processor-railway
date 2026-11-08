@@ -364,7 +364,7 @@ const DAILY_READY = Number(process.env.READY_RANT_DAILY || 20);
 router.post('/ready-rant', (req, res) => {
   const deviceId = deviceOf(req);
   if (!deviceId) return res.status(401).json({ success: false, error: 'Open the app and sign in with your code first.' });
-  const { sourceUrl, mainUrl, duration, language } = req.body || {};
+  const { sourceUrl, mainUrl, duration, language, tone, extra } = req.body || {};
   if (!sourceUrl && !mainUrl) return res.status(400).json({ success: false, error: 'Download a video first.' });
   const u = READY_USE.get(deviceId);
   if (u && u.day === today() && u.count >= DAILY_READY) {
@@ -374,7 +374,7 @@ router.post('/ready-rant', (req, res) => {
 
   const job = { id: uuidv4(), deviceId, status: 'working', rants: null, ending: null, error: null, created: Date.now() };
   READY.set(job.id, job);
-  readyRant({ sourceUrl, mainUrl, duration, language: language === 'bengali' ? 'bengali' : 'english' })
+  readyRant({ sourceUrl, mainUrl, duration, language: language === 'bengali' ? 'bengali' : 'english', tone, extra })
     .then((r) => { job.rants = r.rants; job.ending = r.ending; job.status = 'done'; })
     .catch((err) => {
       console.error('[ready-rant] failed:', err.message);
