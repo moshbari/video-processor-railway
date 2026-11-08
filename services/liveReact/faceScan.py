@@ -19,6 +19,7 @@ MIN_SCORE = 0.6       # low on purpose: a blurred non-face costs little, a misse
 MAX_GAP = 1.0         # seconds a face may vanish and still be the same track
 CROPS_PER_TRACK = 3
 CROP_SIZE = 224
+CUT_DIFF = 28.0      # mean grey change (0-255) on a 32x18 copy that counts as a cut
 
 
 def iou(a, b):
@@ -30,10 +31,15 @@ def iou(a, b):
 
 
 def close_enough(a, b):
-    if iou(a, b) > 0.1:
+    """Same face as the last look? Strict, so a box never jumps to the person
+    sitting next to them (8 Nov 2026: a man's label landed on a woman's face)."""
+    ra = (b[2] * b[3]) / max(1e-6, a[2] * a[3])
+    if ra < 0.5 or ra > 2.0:
+        return False
+    if iou(a, b) > 0.3:
         return True
     ax, ay, bx, by = a[0] + a[2] / 2, a[1] + a[3] / 2, b[0] + b[2] / 2, b[1] + b[3] / 2
-    return abs(ax - bx) < a[2] and abs(ay - by) < a[3]
+    return abs(ax - bx) < a[2] * 0.5 and abs(ay - by) < a[3] * 0.5
 
 
 def crop(frame, box):
@@ -43,9 +49,13 @@ def crop(frame, box):
     pad = max(bw, bh) * 0.7
     x1, y1 = max(0, int(x - pad)), max(0, int(y - pad))
     x2, y2 = min(w, int(x + bw + pad)), min(h, int(y + bh + pad))
-    c = frame[y1:y2, x1:x2]
+    c = frame[y1:y2, x1:x2].copy()
     if c.size == 0:
         return None
+    # A green box round the face being asked about: with two people in the
+    # picture, Claude judges the right one.
+    t = max(2, int(max(c.shape[:2]) / 110))
+    cv2.rectangle(c, (int(x - x1), int(y - y1)), (int(x - x1 + bw), int(y - y1 + bh)), (0, 255, 0), t)
     s = CROP_SIZE / max(c.shape[:2])
     if s < 1:
         c = cv2.resize(c, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
@@ -61,7 +71,7 @@ def main(video, workdir):
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     total = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
     step = max(1, int(round(fps / SAMPLE_FPS)))
-    det, hist_prev, active, done = None, None, [], []
+    det, hist_prev, thumb_prev, active, done = None, None, None, [], []
     scale, sw, sh, n, next_id = 1, 0, 0, -1, 0
 
     def finish(t):
@@ -85,11 +95,19 @@ def main(video, workdir):
         # A cut to a new shot ends every track, so a box never slides across a cut.
         hist = cv2.calcHist([cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)], [0], None, [32], [0, 256])
         cv2.normalize(hist, hist)
-        if hist_prev is not None and cv2.compareHist(hist_prev, hist, cv2.HISTCMP_CORREL) < 0.6:
+        # Two checks: the brightness spread changes (histogram), or the picture
+        # itself changes a lot (a tiny grey copy). The histogram alone missed
+        # cuts between two people in the same studio light, and a man's track
+        # carried on onto a woman (8 Nov 2026).
+        thumb = cv2.resize(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (32, 18), interpolation=cv2.INTER_AREA).astype("float32")
+        cut = hist_prev is not None and (
+            cv2.compareHist(hist_prev, hist, cv2.HISTCMP_CORREL) < 0.6 or
+            float(abs(thumb - thumb_prev).mean()) > CUT_DIFF)
+        if cut:
             for t in active:
                 finish(t)
             active = []
-        hist_prev = hist
+        hist_prev, thumb_prev = hist, thumb
 
         _, faces = det.detect(small)
         found = [] if faces is None else [([float(v) for v in f[:4]], float(f[14])) for f in faces]

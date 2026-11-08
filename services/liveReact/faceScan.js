@@ -2,8 +2,10 @@
  * 🎥 RANT: find the women's faces in a video, so they can be blurred automatically.
  *
  *   1. faceScan.py finds and follows every face (free, on this server).
- *   2. Claude Haiku looks at a few small pictures of each face and says
- *      woman / man / unsure. Whole video frames are never sent.
+ *   2. Claude Sonnet looks at up to 3 small pictures of each face (the face
+ *      in a green box) and labels EVERY picture woman / man / unsure. A face
+ *      is a woman if any of its pictures says so. Whole frames are never sent.
+ *      (Haiku until 8 Nov 2026: it called a woman a man and blurred men.)
  *
  * Unsure counts as a woman: a blurred man is a small mistake, a missed woman
  * is the mistake this feature exists to prevent. Same when the AI can't answer.
@@ -18,13 +20,13 @@ const path = require('path');
 
 const CLAUDE_BIN = path.join(__dirname, '..', '..', 'node_modules', '.bin', 'claude');
 const PYTHON = process.env.FACE_SCAN_PYTHON || 'python3';
-const MODEL = process.env.FACE_SCAN_MODEL || 'haiku';
-const BATCH = 12;   // faces in one question
+const MODEL = process.env.FACE_SCAN_MODEL || 'sonnet';
+const BATCH = 30;   // pictures in one question
 
 const SYSTEM = `You help a video creator who hides women's faces in commentary videos, for religious modesty and privacy. The faces get blurred; nobody is named or judged, and you never identify anyone.
-You get small pictures of faces. Each "Face N" has 1 to 3 pictures of the same face in one shot.
-For each face, say how the person looks: "woman" (including girls), "man" (including boys), or "unsure". Use the face, hair, clothing and headscarf. If it is a drawing, a mask, too small or too dark to tell, say "unsure". When in real doubt say "unsure": wrongly blurring is a small mistake, wrongly not blurring is a big one.
-Reply with JSON only, nothing else: {"faces":[{"n":1,"label":"woman"}]}`;
+You get small numbered pictures cut from a video. Each picture has ONE face marked with a green box. Other people may be in the picture too: judge ONLY the face inside the green box.
+For each picture, say how that person looks: "woman" (including girls), "man" (including boys), or "unsure". Use the face, hair, beard, clothing and headscarf. If it is a drawing, a mask, too small, too blurry or too dark to tell, say "unsure". When in real doubt say "unsure": wrongly blurring is a small mistake, wrongly not blurring is a big one.
+Reply with JSON only, nothing else, one entry per picture: {"pictures":[{"n":1,"label":"woman"}]}`;
 
 function runPython(video, workDir, onProgress) {
   return new Promise((resolve, reject) => {
@@ -78,33 +80,42 @@ function askClaude(content, timeoutMs = 120000) {
 function parseLabels(text) {
   const a = text.indexOf('{'), b = text.lastIndexOf('}');
   if (a < 0 || b <= a) return null;
-  try { return JSON.parse(text.slice(a, b + 1)).faces || null; } catch (_) { return null; }
+  try { const j = JSON.parse(text.slice(a, b + 1)); return j.pictures || j.faces || null; } catch (_) { return null; }
 }
 
-/** label for each track, by track id. Anything unanswered stays "unsure". */
+/**
+ * label for each track, by track id. Every picture is judged on its own, then
+ * a face is "woman" if any picture says woman, "man" only if every answered
+ * picture says man, otherwise "unsure" (blurred). Unanswered stays "unsure".
+ */
 async function classify(tracks, workDir) {
-  const labels = new Map(tracks.map((t) => [t.id, 'unsure']));
+  const pics = [];
+  for (const t of tracks) for (const c of t.crops) pics.push({ id: t.id, file: c });
+  const said = new Map(tracks.map((t) => [t.id, []]));
   let answered = 0;
-  for (let i = 0; i < tracks.length; i += BATCH) {
-    const group = tracks.slice(i, i + BATCH);
+  for (let i = 0; i < pics.length; i += BATCH) {
+    const group = pics.slice(i, i + BATCH);
     const content = [];
     for (let n = 0; n < group.length; n++) {
-      content.push({ type: 'text', text: `Face ${n + 1}:` });
-      for (const c of group[n].crops) {
-        const data = (await fs.readFile(path.join(workDir, c))).toString('base64');
-        content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } });
-      }
+      content.push({ type: 'text', text: `Picture ${n + 1}:` });
+      const data = (await fs.readFile(path.join(workDir, group[n].file))).toString('base64');
+      content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } });
     }
-    content.push({ type: 'text', text: `That is all ${group.length} faces. Reply with the JSON.` });
+    content.push({ type: 'text', text: `That is all ${group.length} pictures. Reply with the JSON.` });
     try {
-      const faces = parseLabels(await askClaude(content));
-      for (const f of faces || []) {
-        const t = group[Number(f.n) - 1];
-        if (t && ['woman', 'man', 'unsure'].includes(f.label)) { labels.set(t.id, f.label); answered++; }
+      const out = parseLabels(await askClaude(content, 180000));
+      for (const f of out || []) {
+        const p = group[Number(f.n) - 1];
+        if (p && ['woman', 'man', 'unsure'].includes(f.label)) { said.get(p.id).push(f.label); answered++; }
       }
     } catch (e) {
       console.warn('[faceScan] Claude could not answer:', e.message);
     }
+  }
+  const labels = new Map();
+  for (const t of tracks) {
+    const l = said.get(t.id);
+    labels.set(t.id, l.includes('woman') ? 'woman' : (l.length && l.every((x) => x === 'man')) ? 'man' : 'unsure');
   }
   return { labels, answered };
 }
@@ -123,4 +134,4 @@ async function scan(video, workDir, onProgress) {
   };
 }
 
-module.exports = { scan };
+module.exports = { scan, classify };
