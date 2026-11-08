@@ -176,6 +176,47 @@ function isBlurred(ranges, t) {
   return ranges.some(([s, e]) => t >= s && t <= e);
 }
 
+// --- the camera's dark first frames --------------------------------------------
+
+/** Brightness (0-255) of the first n frames of a file. */
+function firstFrameLevels(file, n = 20) {
+  return new Promise((resolve) => {
+    const child = spawn('ffmpeg', ['-hide_banner', '-nostdin', '-i', file, '-an', '-vf',
+      `select=lt(n\\,${n}),signalstats,metadata=print:key=lavfi.signalstats.YAVG`, '-vsync', '0', '-f', 'null', '-']);
+    let err = '';
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('close', () => resolve([...err.matchAll(/YAVG=([0-9.]+)/g)].map((m) => Number(m[1]))));
+    child.on('error', () => resolve([]));
+  });
+}
+
+/**
+ * The phone camera sometimes writes one or two almost-black frames at the
+ * start of a take (8 Nov 2026, Mosh: "why the first frame… is almost dark").
+ * Those frames are swapped for the first good one, so the take keeps its
+ * length and still lines up with the video. Takes without them are untouched.
+ */
+async function fixDarkStart(file, workDir) {
+  const lv = await firstFrameLevels(file);
+  if (lv.length < 12) return;
+  const rest = lv.slice(6).sort((a, b) => a - b);
+  const ref = rest[Math.floor(rest.length / 2)];
+  if (!(ref > 25)) return; // a genuinely dark room: nothing to fix
+  let k = 0;
+  while (k < 8 && lv[k] < ref * 0.6) k++;
+  if (!k) return;
+  const out = path.join(workDir, `undark-${path.basename(file, path.extname(file))}.mp4`);
+  try {
+    await run(['-y', '-i', file, '-filter_complex',
+      `[0:v]trim=start_frame=${k},setpts=PTS-STARTPTS,tpad=start=${k}:start_mode=clone:stop=${k}:stop_mode=clone[v]`,
+      '-map', '[v]', '-map', '0:a?', '-c:a', 'copy', ...ENC, out], 'dark start');
+    await fs.move(out, file, { overwrite: true });
+    console.log(`[LiveReact] swapped ${k} dark first frame(s) in ${path.basename(file)}`);
+  } catch (e) {
+    console.log(`[LiveReact] dark start fix skipped: ${e.message}`);
+  }
+}
+
 // --- cleaning a talk: oops, cut-a-bit, silences ------------------------------
 
 /** The talk's sound as 16 kHz mono 16-bit samples. */
@@ -533,6 +574,8 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
     const item = fetchList[i];
     const file = path.join(workDir, `in-${i}${path.extname(new URL(item.url).pathname) || '.mov'}`);
     await r2Service.downloadFile(item.url, file);
+    // Camera recordings only (imported clips are left as they are).
+    if (!(item.kind === 'clip' && !item.recorded)) await fixDarkStart(file, workDir);
     item.file = file;
   }
   for (const w of project.watches || []) {
@@ -731,4 +774,4 @@ async function render(project, workDir, onProgress = () => {}, onSaid = null) {
   return { file: final, duration: await probeDuration(final), width: cw, height: ch };
 }
 
-module.exports = { render, talkCuts, keepRanges, ctaPiece, trimSilences, LOOKS, blurRanges, hasAudio };
+module.exports = { render, talkCuts, keepRanges, ctaPiece, trimSilences, LOOKS, blurRanges, hasAudio, fixDarkStart };
