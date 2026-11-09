@@ -454,7 +454,13 @@ async function talkPiece(main, at, talkFile, talkLen, cw, ch, out, workDir, i, c
   // A frozen frame inside a blurred stretch is blurred too (once, here, not on every frame).
   const vf = stillBlur ? ['-vf', stillBlur] : [];
   await run(['-y', '-ss', f3(Math.max(0, at - 0.04)), '-i', main, ...vf, '-frames:v', '1', '-q:v', '2', still], 'still')
-    .catch(() => run(['-y', '-i', main, ...vf, '-frames:v', '1', '-q:v', '2', still], 'still'));
+    .catch(() => {});
+  // A talk at (or a hair past) the very end of the video: ffmpeg "succeeds" but writes
+  // no picture. Use the video's last frame instead (-update keeps the final one).
+  if (!(await fs.pathExists(still))) {
+    await run(['-y', '-sseof', '-1', '-i', main, ...vf, '-update', '1', '-q:v', '2', still], 'last still')
+      .catch(() => run(['-y', '-i', main, ...vf, '-frames:v', '1', '-q:v', '2', still], 'still'));
+  }
   if (hideFaces) await hideFaces(still, at);
   const portrait = ch >= cw;
   let fc;
