@@ -37,20 +37,31 @@ function saidIn(talks) {
 }
 
 /**
- * { said, title, url, earlier? } → the post text.
- * earlier = a post already made: write a clearly different one ("New version").
+ * The full prompt for { said, title, url, earlier? }.
+ * forCopy = the "Copy prompt" button: the person pastes it into ChatGPT/Claude
+ * themselves, so it asks for the plain post instead of this app's JSON.
  */
-async function writePost({ said, title, url, earlier }) {
+function buildPrompt({ said, title, url, earlier }, { forCopy = false } = {}) {
   const base = postPrompt();
   if (!base) throw new Error('The post writer is not set up on the server yet.');
   if (!String(said || '').trim()) throw new Error('Nothing was said in this RANT to write a post from.');
   let prompt = base.replace(/\s*INPUT:\s*$/i, '');
-  prompt += `\n\nOUTPUT FOR THIS APP: reply with ONE JSON object and nothing else: {"post": "the final post, exactly as it should be pasted on Facebook"}. No headings, labels or quotes around it.`;
+  prompt += forCopy
+    ? `\n\nOUTPUT: reply with ONLY the final post, exactly as it should be pasted on Facebook. No headings, labels, notes or quotes around it.`
+    : `\n\nOUTPUT FOR THIS APP: reply with ONE JSON object and nothing else: {"post": "the final post, exactly as it should be pasted on Facebook"}. No headings, labels or quotes around it.`;
   prompt += `\n\nAbout my input: it is what I said in my RANT video (I pause someone's video and give my own take). Write the post from MY points and MY words; the video I reacted to is only background. Don't mention "RANT", "reaction" or "this video I reacted to" unless it helps the story.`;
   if (earlier) prompt += `\n\nThis is a fresh version. Here is an earlier one; write something clearly different (a new angle, a new hook), just as good:\n"""\n${String(earlier).slice(0, 6000)}\n"""`;
   const head = [title && `Video I reacted to: ${title}`, url].filter(Boolean).join('\n');
   prompt += `\n\nINPUT:\n${head ? head + '\n\n' : ''}What I said:\n${String(said).slice(0, 30000)}`;
+  return prompt;
+}
 
+/**
+ * { said, title, url, earlier? } → the post text.
+ * earlier = a post already made: write a clearly different one ("New version").
+ */
+async function writePost(input) {
+  const prompt = buildPrompt(input);
   const text = await askText({ user: prompt, model: MODEL });
   let out = {};
   try { out = jsonIn(text); } catch (_) { /* below */ }
@@ -60,4 +71,4 @@ async function writePost({ said, title, url, earlier }) {
   return post;
 }
 
-module.exports = { saidIn, writePost };
+module.exports = { saidIn, writePost, buildPrompt };

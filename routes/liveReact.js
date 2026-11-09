@@ -11,6 +11,7 @@
  *   POST /api/live-react/upload      file 'file', field 'project' -> { url }  (one recording)
  *   POST /api/live-react/render      {project, batch?, push?} -> { renderId }  (waits in line, survives restarts)
  *   GET  /api/live-react/render/:id           -> { status, progress, words, video, error, place }
+ *   POST /api/live-react/post-prompt {said, title, url} -> { prompt }  (to paste into ChatGPT/Claude)
  *   POST /api/live-react/ready-rant  {sourceUrl, mainUrl, duration, language} -> { jobId }
  *   GET  /api/live-react/ready-rant/:id       -> { status, rants: [{at, script, why}], ending, error }
  *   POST /api/live-react/faces  {mainUrl} -> { jobId }   (find the women's faces)
@@ -325,6 +326,19 @@ router.post('/post', async (req, res) => {
     res.status(500).json({ success: false, error: /not set up/.test(e.message) ? e.message : 'The post didn’t come out. Tap Try again.' });
   }
 });
+
+// "Copy prompt": the same prompt the post writer uses, to paste into ChatGPT/Claude
+// yourself when writing here fails. No AI call, so no daily cap.
+router.post('/post-prompt', (req, res) => {
+  const { said, title, url } = req.body || {};
+  if (!String(said || '').trim()) return res.status(400).json({ success: false, error: 'Make the RANT video first, then the prompt comes with it.' });
+  try {
+    res.json({ success: true, prompt: rantPost.buildPrompt({ said, title, url }, { forCopy: true }) });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 
 // ===================== Ready-made RANT =====================
 // The AI reads the video's transcript and writes the RANTs at the right
