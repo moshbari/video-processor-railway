@@ -405,26 +405,38 @@ RESPOND WITH ONLY valid JSON in this exact format (no markdown, no backticks, no
   ]
 }`;
 
-    const response = await this.openai.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [
-        {
-          role: 'system',
-          content: 'You are a viral content strategist who finds the best clip-worthy moments in videos. You ONLY respond with valid JSON. No markdown, no backticks, no explanation text.'
-        },
-        { role: 'user', content: prompt }
-      ],
-      temperature: 0.7,
-      max_tokens: 4000
-    });
+    // JSON mode guarantees a parseable object; the old free-text reply sometimes
+    // broke mid-list (cut off at the token cap or one bad character) and failed the
+    // whole run. One automatic retry at a calmer temperature before giving up.
+    let parsed = null;
+    let responseText = '';
+    for (let attempt = 1; attempt <= 2 && !parsed; attempt++) {
+      const response = await this.openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a viral content strategist who finds the best clip-worthy moments in videos. You ONLY respond with valid JSON. No markdown, no backticks, no explanation text.'
+          },
+          { role: 'user', content: prompt }
+        ],
+        response_format: { type: 'json_object' },
+        temperature: attempt === 1 ? 0.7 : 0.3,
+        max_tokens: 8000
+      });
 
-    let responseText = response.choices[0].message.content.trim();
-    
-    // Clean up response - remove any markdown formatting
-    responseText = responseText.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+      const finish = response.choices[0].finish_reason;
+      responseText = (response.choices[0].message.content || '').trim()
+        .replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+      try {
+        parsed = JSON.parse(responseText);
+      } catch (e) {
+        console.error(`Failed to parse AI response (attempt ${attempt}, finish=${finish}, ${responseText.length} chars):`, responseText.slice(-200));
+      }
+    }
 
     try {
-      const parsed = JSON.parse(responseText);
+      if (!parsed) throw new Error('unparseable');
       let clips = parsed.clips || [];
 
       // Validate and clean up clips
