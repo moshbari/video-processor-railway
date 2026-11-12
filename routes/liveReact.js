@@ -7,6 +7,10 @@
  *
  *   POST /api/live-react/grab        {url}  -> { grabId }  (download runs in the background)
  *   GET  /api/live-react/grab/:id            -> { status, stage, progress, main, warning, error }
+ *   GET  /api/live-react/queue               -> { items: [{id, url, status, stage, progress, main, place, …}] }  (the To-RANT list)
+ *   POST /api/live-react/queue  {url, push?} -> { item, added, items }  (adds a video to the end; downloads one by one)
+ *   DELETE /api/live-react/queue/:id         -> { items }
+ *   POST /api/live-react/queue/:id/retry     -> { items }
  *   POST /api/live-react/import      file 'file', field 'title' -> { grabId }  (a video from the phone's Photos/Files)
  *   POST /api/live-react/upload      file 'file', field 'project' -> { url }  (one recording)
  *   POST /api/live-react/render      {project, batch?, push?} -> { renderId }  (waits in line, survives restarts)
@@ -39,6 +43,7 @@ const { readyRant, transcript, linesOf } = require('../services/liveReact/readyR
 const rantPost = require('../services/liveReact/rantPost');
 const faceScan = require('../services/liveReact/faceScan');
 const renderQueue = require('../services/liveReact/renderQueue');
+const grabQueue = require('../services/liveReact/grabQueue');
 const multer = require('multer');
 const os = require('os');
 const crypto = require('crypto');
@@ -73,7 +78,15 @@ const deviceOf = (req) => {
 };
 const today = () => new Date().toISOString().slice(0, 10);
 
+// Phones with no daily limit, by their scrambled id (first 10 hex of the
+// sha256 of the code, the same "who" the home downloader logs). Never the code
+// itself: this repo is public and the code is the phone's password.
+// da7deb9251 = Mosh (12 Nov 2026: "unlimited for me, fifteen a day for members").
+const UNLIMITED = new Set(['da7deb9251', ...String(process.env.LIVE_REACT_UNLIMITED_WHO || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)]);
+const whoOf = (deviceId) => crypto.createHash('sha256').update(deviceId).digest('hex').slice(0, 10);
+
 function overCap(deviceId) {
+  if (UNLIMITED.has(whoOf(deviceId))) return false;
   const u = USE.get(deviceId);
   return u && u.day === today() && u.count >= DAILY_GRABS;
 }
@@ -246,6 +259,49 @@ async function runImport(job, file, title) {
     fs.remove(file).catch(() => {});
   }
 }
+
+// --- the To-RANT list (services/liveReact/grabQueue.js) ---
+grabQueue.setRunner(runGrab);
+
+router.get('/queue', async (req, res) => {
+  const deviceId = deviceOf(req);
+  if (!deviceId) return res.status(401).json({ success: false, error: 'Open the app and sign in with your code first.' });
+  res.json({ success: true, items: await grabQueue.list(deviceId) });
+});
+
+router.post('/queue', async (req, res) => {
+  const deviceId = deviceOf(req);
+  if (!deviceId) return res.status(401).json({ success: false, error: 'Open the app and sign in with your code first.' });
+  const url = String((req.body && req.body.url) || '').trim();
+  if (!/^https?:\/\//i.test(url)) return res.status(400).json({ success: false, error: 'Paste a video link that starts with https://' });
+  const p = req.body && req.body.push;
+  const to = p && typeof p.token === 'string' ? { token: p.token.slice(0, 200), env: p.env === 'sandbox' ? 'sandbox' : 'production' } : null;
+  const items = await grabQueue.list(deviceId);
+  const already = items.find((i) => i.url === url && i.status !== 'failed');
+  if (!already) {
+    if (overCap(deviceId)) {
+      return res.status(429).json({ success: false, error: `You’ve added ${DAILY_GRABS} videos today. Try again tomorrow.` });
+    }
+    count(deviceId);
+  }
+  const { item, added } = await grabQueue.add({ deviceId, url, push: to });
+  const list = await grabQueue.list(deviceId);
+  res.json({ success: true, added, item: list.find((i) => i.id === item.id) || null, items: list });
+});
+
+router.delete('/queue/:id', async (req, res) => {
+  const deviceId = deviceOf(req);
+  if (!deviceId) return res.status(401).json({ success: false, error: 'Open the app and sign in with your code first.' });
+  await grabQueue.remove(String(req.params.id || '').slice(0, 64), deviceId);
+  res.json({ success: true, items: await grabQueue.list(deviceId) });
+});
+
+router.post('/queue/:id/retry', async (req, res) => {
+  const deviceId = deviceOf(req);
+  if (!deviceId) return res.status(401).json({ success: false, error: 'Open the app and sign in with your code first.' });
+  await grabQueue.retry(String(req.params.id || '').slice(0, 64), deviceId);
+  res.json({ success: true, items: await grabQueue.list(deviceId) });
+});
 
 router.post('/import', upload.single('file'), (req, res) => {
   const deviceId = deviceOf(req);
