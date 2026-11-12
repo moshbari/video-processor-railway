@@ -6,10 +6,10 @@ const https = require('https');
 const http = require('http');
 
 class R2Service {
-  constructor() {
+  constructor(opts = {}) {
     this.client = null;
-    this.bucketName = process.env.R2_BUCKET_NAME;
-    this.publicUrl = process.env.R2_PUBLIC_URL;
+    this.bucketName = opts.bucket || process.env.R2_BUCKET_NAME;
+    this.publicUrl = opts.publicUrl || process.env.R2_PUBLIC_URL;
     this.initialized = false;
   }
 
@@ -339,3 +339,4 @@ class R2Service {
 }
 
 module.exports = new R2Service();
+module.exports.R2Service = R2Service;

@@ -19,6 +19,7 @@ const path = require('path');
 const fs = require('fs-extra');
 const { v4: uuidv4 } = require('uuid');
 const r2Service = require('../r2Service');
+const rantMedia = require('./rantMedia');
 const liveRender = require('./renderService');
 const rantPost = require('./rantPost');
 const push = require('./push');
@@ -129,8 +130,8 @@ async function runOne(j) {
     const r = await liveRender.render(project, workDir, (f, words) => { j.progress = Math.round(f * 100); j.words = words; }, onSaid);
     j.words = 'Saving your video';
     const key = `live-react/${j.deviceId}/${String(project.id || 'p').replace(/[^a-z0-9-]/gi, '')}/final-${j.id.slice(0, 8)}.mp4`;
-    const up = await r2Service.uploadFile(r.file, key, 'video/mp4');
-    j.video = { url: up.downloadUrl || r2Service.getPublicUrl(key), duration: r.duration, width: r.width, height: r.height };
+    const up = await rantMedia.uploadFile(r.file, key, 'video/mp4');
+    j.video = { url: up.downloadUrl, duration: r.duration, width: r.width, height: r.height };
     j.status = 'done';
     j.progress = 100;
     j.words = 'Done';

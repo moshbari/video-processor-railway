@@ -37,6 +37,7 @@ const { v4: uuidv4 } = require('uuid');
 
 const downloadService = require('../services/downloadService');
 const r2Service = require('../services/r2Service');
+const rantMedia = require('../services/liveReact/rantMedia');
 const renderService = require('../services/proRant/renderService');
 const liveRender = require('../services/liveReact/renderService');
 const { readyRant, transcript, linesOf } = require('../services/liveReact/readyRant');
@@ -153,8 +154,8 @@ async function runGrab(job) {
 
     job.stage = 'upload';
     const key = `live-react/${job.deviceId}/${job.id}/main.mp4`;
-    const up = await r2Service.uploadFile(ready, key, 'video/mp4');
-    const r2Url = up.downloadUrl || r2Service.getPublicUrl(key);
+    const up = await rantMedia.uploadFile(ready, key, 'video/mp4');
+    const r2Url = up.downloadUrl;
 
     // 1080p means the SHORT side: a vertical 1080x1920 Reel counts as 1080p.
     const shortSide = Math.min(dims.width || 0, dims.height || 0);
@@ -237,12 +238,12 @@ async function runImport(job, file, title) {
     if (duration > MAX_SECONDS) throw new Error('Video too long');
     job.stage = 'upload';
     const key = `live-react/${job.deviceId}/${job.id}/main.mp4`;
-    const up = await r2Service.uploadFile(ready, key, 'video/mp4');
+    const up = await rantMedia.uploadFile(ready, key, 'video/mp4');
     const shortSide = Math.min(dims.width || 0, dims.height || 0);
     job.warning = shortSide >= 1080 ? null : `This video is ${dims.width}×${dims.height}, so your final video will be that size too.`;
     if (!(await liveRender.hasAudio(ready))) job.warning = [NO_SOUND, job.warning].filter(Boolean).join(' ');
     job.main = {
-      id: job.id, r2Key: key, url: up.downloadUrl || r2Service.getPublicUrl(key),
+      id: job.id, r2Key: key, url: up.downloadUrl,
       width: dims.width, height: dims.height, duration, isHD: shortSide >= 1080,
       title: title || 'My video', thumbnail: null, platform: 'upload', sourceUrl: null,
     };
@@ -324,8 +325,8 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     const name = String(req.file.originalname || 'clip.mov').replace(/[^a-z0-9._-]/gi, '').slice(0, 80) || 'clip.mov';
     const key = `live-react/${deviceId}/${project}/${name}`;
     const type = /\.mp4$/i.test(name) ? 'video/mp4' : 'video/quicktime';
-    const up = await r2Service.uploadFile(req.file.path, key, type);
-    res.json({ success: true, url: up.downloadUrl || r2Service.getPublicUrl(key) });
+    const up = await rantMedia.uploadFile(req.file.path, key, type);
+    res.json({ success: true, url: up.downloadUrl });
   } catch (err) {
     console.error('[LiveReact] upload failed:', err.message);
     res.status(500).json({ success: false, error: 'The recording didn’t upload. It will try again.' });

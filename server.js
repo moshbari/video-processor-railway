@@ -97,6 +97,7 @@ ensureDirs();
 
 // Start cleanup service (runs every hour, deletes files older than 24h)
 cleanupService.startAutoCleanup();
+require('./services/liveReact/rantMedia').startSweeps();
 
 // Middleware - CORS Configuration
 app.use(cors({
