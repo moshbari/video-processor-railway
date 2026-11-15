@@ -98,6 +98,18 @@ const TONES = {
   roast_system: 'Roast the system. Aim the jokes at the system, industry or trend behind the video (the algorithm, the hustle culture, the bank, the government, the market), not at the creator.',
   wise_comedian: 'Wise stand-up comedian. Get the laugh first, then land one true, wise point people remember. Like a comedian who is secretly a teacher.',
   serious: 'Straight talk. No jokes. Calm, clear and direct, like a mentor telling a friend the truth.',
+  nine_to_five: [
+    "9-to-5 Freedom. The viewer is a 9-to-5 worker (salary, boss, commute, fixed income). Whatever the video is about, turn it into a tip, an advice or a push for them to start their own business or a second income on the side, so they don't rely only on the job.",
+    'THIS TONE CHANGES THE STOP RULE: RANT 1 stops the video as EARLY as possible, right after the creator finishes their FIRST sentence (ignore the "first 15%" rule for RANT 1 only). RANT 1 is a second hook: 1-2 short lines that tie this video to the 9-to-5 viewer so they know it is for them and keep watching (e.g. "If you have a 9-to-5, listen to this one carefully." then why). No tip yet, just the connection and a reason to stay.',
+    'Then 1 or 2 more RANTs at the strongest moments (normal stop rules). Each finds the honest link between what the creator just said and a 9-to-5 worker building their own income: one clear tip, advice, lesson or push they can use this week. Sound like someone who has done it and knows the way, calm and sure, so the viewer trusts you and wants to follow you. Never shame the job (it pays the bills), never promise money or results, no "quit your job tomorrow".',
+    'The ending verdict speaks to the 9-to-5 viewer: one line on what this video means for their own income.',
+  ].join(' '),
+};
+
+/** Tones that also change WHERE the stops go (not just how they sound). */
+const TONE_STOPS = {
+  // Early re-hook + 1-2 tips: 2-3 RANTs whatever the length, first one early.
+  nine_to_five: { earlyFirst: true, most: (n) => Math.min(Math.max(n, 2), 3) },
 };
 
 /** The user's own words, kept short and on one block. */
@@ -112,7 +124,7 @@ function promptLines(segs) {
 async function write({ segs, duration, language, tone, extra }) {
   const prompt = masterPrompt();
   if (!prompt) throw new Error('Ready-made RANT is not set up on the server yet.');
-  const most = mostFor(duration);
+  const most = TONE_STOPS[tone] ? TONE_STOPS[tone].most(mostFor(duration)) : mostFor(duration);
   let user = `Video length: ${Math.round(duration)} seconds\nMost RANTs allowed: ${most}\nLanguage: ${language === 'bengali' ? 'Bengali' : 'English'}`;
   if (TONES[tone]) user += `\n\nTONE (the user picked this; use it for every RANT and the ending, but keep every other rule, keep it honest and keep it halal: no swearing, no mocking religion, looks or family): ${TONES[tone]}`;
   const note = cleanExtra(extra);
@@ -124,7 +136,7 @@ async function write({ segs, duration, language, tone, extra }) {
 }
 
 /** The AI's picks → safe stops, in order, never breaking the rules. */
-function place(out, words, duration, most) {
+function place(out, words, duration, most, { earlyFirst = false } = {}) {
   const gap = (duration / (most + 1)) * 0.6;
   const picks = (Array.isArray(out.rants) ? out.rants : [])
     .map((r) => ({ at: locate(r.stop_after, words), script: String(r.script || '').trim(), why: String(r.why_here || '').trim() }))
@@ -132,8 +144,12 @@ function place(out, words, duration, most) {
     .sort((a, b) => a.at - b.at);
   const kept = [];
   for (const r of picks) {
-    if (r.at < duration * 0.15 || r.at > duration - 3) continue;
-    if (kept.length && r.at - kept[kept.length - 1].at < gap) continue;
+    // earlyFirst (9-to-5 re-hook): the first stop may come right after the opening line.
+    const from = earlyFirst && !kept.length ? Math.min(1.5, duration * 0.15) : duration * 0.15;
+    if (r.at < from || r.at > duration - 3) continue;
+    // The early re-hook doesn't push the next stop back; the 15% rule still does.
+    const rehook = earlyFirst && kept.length === 1;
+    if (kept.length && !rehook && r.at - kept[kept.length - 1].at < gap) continue;
     if (kept.length >= most) break;
     kept.push({ ...r, at: Math.round(r.at * 10) / 10 });
   }
@@ -146,7 +162,7 @@ async function readyRant({ sourceUrl, mainUrl, duration, language, tone, extra }
   const words = wordsOf(segs);
   const dur = Number(duration) > 0 ? Number(duration) : (words.length ? words[words.length - 1].end : 0);
   const { out, most, usage } = await write({ segs, duration: dur, language, tone, extra });
-  const rants = place(out, words, dur, most);
+  const rants = place(out, words, dur, most, TONE_STOPS[tone] || {});
   console.log(`[ready-rant] ${Math.round(dur)}s → ${rants.length}/${most} RANTs (${usage?.prompt_tokens || 0} in, ${usage?.completion_tokens || 0} out)`);
   // The ending is the AI's verdict + one of Mosh's 99% DFY calls to action (random).
   const verdict = String(out.ending || '').trim();
