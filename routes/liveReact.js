@@ -417,7 +417,7 @@ router.post('/ready-rant', (req, res) => {
 
   const job = { id: uuidv4(), deviceId, status: 'working', rants: null, ending: null, error: null, created: Date.now() };
   READY.set(job.id, job);
-  readyRant({ sourceUrl, mainUrl, duration, language: language === 'bengali' ? 'bengali' : 'english', tone, extra })
+  readyRant({ sourceUrl, mainUrl, duration, language: language === 'bengali' ? 'bengali' : 'english', tone, extra, who: whoOf(deviceId) })
     .then((r) => { job.rants = r.rants; job.ending = r.ending; job.status = 'done'; })
     .catch((err) => {
       console.error('[ready-rant] failed:', err.message);

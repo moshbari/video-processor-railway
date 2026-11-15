@@ -26,6 +26,33 @@ function masterPrompt() {
   return fs.existsSync(local) ? fs.readFileSync(local, 'utf8') : null;
 }
 
+/** 9-to-5 Freedom has its own full prompt (mentor mode), not a tone line. */
+function mentorPrompt() {
+  if (process.env.READY_RANT_PROMPT_9TO5) return process.env.READY_RANT_PROMPT_9TO5;
+  const local = path.join(__dirname, '../../private/ready-rant-9to5.md');
+  return fs.existsSync(local) ? fs.readFileSync(local, 'utf8') : null;
+}
+
+/** ABOUT THE SPEAKER for one phone (scrambled who), so only the owner's own
+ *  facts are ever claimed. Env READY_RANT_PROFILES = {"<who>": "facts"}. */
+function speakerFor(who) {
+  if (!who) return '';
+  try {
+    const all = JSON.parse(process.env.READY_RANT_PROFILES || '{}');
+    if (all[who]) return String(all[who]).trim();
+  } catch (_) { /* bad JSON: fall back to the local file */ }
+  const local = path.join(__dirname, '../../private/speakers', `${who}.md`);
+  return fs.existsSync(local) ? fs.readFileSync(local, 'utf8').trim() : '';
+}
+
+function shuffleFacts(text) {
+  const lines = String(text || '').split('\n');
+  const head = lines.filter((l) => !/^\s*-/.test(l));
+  const facts = lines.filter((l) => /^\s*-/.test(l));
+  for (let i = facts.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [facts[i], facts[j]] = [facts[j], facts[i]]; }
+  return [...head, ...facts].join('\n').trim();
+}
+
 /** How many RANTs a video of this length may have. */
 function mostFor(d) {
   if (d <= 40) return 1;
@@ -121,18 +148,31 @@ function promptLines(segs) {
   return segs.map((s) => `[${s.start.toFixed(1)}] ${s.text}`).join('\n');
 }
 
-async function write({ segs, duration, language, tone, extra }) {
-  const prompt = masterPrompt();
+async function write({ segs, duration, language, tone, extra, who }) {
+  const mentor = tone === 'nine_to_five';
+  const prompt = mentor ? mentorPrompt() : masterPrompt();
   if (!prompt) throw new Error('Ready-made RANT is not set up on the server yet.');
   const most = TONE_STOPS[tone] ? TONE_STOPS[tone].most(mostFor(duration)) : mostFor(duration);
   let user = `Video length: ${Math.round(duration)} seconds\nMost RANTs allowed: ${most}\nLanguage: ${language === 'bengali' ? 'Bengali' : 'English'}`;
-  if (TONES[tone]) user += `\n\nTONE (the user picked this; use it for every RANT and the ending, but keep every other rule, keep it honest and keep it halal: no swearing, no mocking religion, looks or family): ${TONES[tone]}`;
+  // Facts shuffled each time, so different videos lean on different proof.
+  const about = mentor ? shuffleFacts(speakerFor(who)) : '';
+  if (about) user += `\n\nABOUT THE SPEAKER (true facts; use at most one per RANT, never stretch them, never promise the viewer results):\n${about}`;
+  if (TONES[tone] && !mentor) user += `\n\nTONE (the user picked this; use it for every RANT and the ending, but keep every other rule, keep it honest and keep it halal: no swearing, no mocking religion, looks or family): ${TONES[tone]}`;
   const note = cleanExtra(extra);
   if (note) user += `\n\nEXTRA INSTRUCTIONS FROM THE USER (follow them, as long as they don't break the JSON shape, the stop_after quotes or the most-RANTs limit; fewer RANTs or shorter lines are always fine):\n${note}`;
   user += `\n\nTranscript (seconds in brackets):\n${promptLines(segs)}`;
   // A long video (10+ RANTs) can take Claude well over 4 minutes; the app waits.
-  const text = await askText({ system: prompt + '\n\nReply with ONE JSON object and nothing else.', user, model: MODEL, timeoutMs: 9 * 60 * 1000 });
-  return { out: jsonIn(text), most, usage: { model: MODEL } };
+  // Mentor mode writes on Opus (tested 15Nov26: far more specific than Sonnet; only 2-3 RANTs, so it stays quick).
+  const model = mentor ? (process.env.READY_RANT_9TO5_MODEL || 'opus') : MODEL;
+  const text = await askText({ system: prompt + '\n\nReply with ONE JSON object and nothing else.', user, model, timeoutMs: 9 * 60 * 1000 });
+  return { out: jsonIn(text), most, usage: { model } };
+}
+
+/** Mentor mode writes 3 drafts and names the best; older replies have script. */
+function scriptOf(r) {
+  const d = Array.isArray(r.drafts) ? r.drafts.map((x) => String(x || '').trim()) : [];
+  const b = Number.isInteger(r.best) && d[r.best] ? d[r.best] : d.find(Boolean);
+  return b || String(r.script || '').trim();
 }
 
 /** Where the creator's opening line ends: the first full stop/?/! after 1.5 s
@@ -159,14 +199,14 @@ function place(out, words, duration, most, { earlyFirst = false } = {}) {
   let rest = list;
   if (earlyFirst && list.length) {
     const at = firstLineEnd(words, duration);
-    const script = String(list[0].script || '').trim();
+    const script = scriptOf(list[0]);
     if (at != null && script) {
       kept.push({ at: Math.round(at * 10) / 10, script, why: String(list[0].why_here || '').trim() });
       rest = list.slice(1);
     }
   }
   const picks = rest
-    .map((r) => ({ at: locate(r.stop_after, words), script: String(r.script || '').trim(), why: String(r.why_here || '').trim() }))
+    .map((r) => ({ at: locate(r.stop_after, words), script: scriptOf(r), why: String(r.why_here || '').trim() }))
     .filter((r) => r.at != null && r.script)
     .sort((a, b) => a.at - b.at);
   const hooked = kept.length;
@@ -182,11 +222,11 @@ function place(out, words, duration, most, { earlyFirst = false } = {}) {
 }
 
 /** { rants: [{at, script, why}], ending } */
-async function readyRant({ sourceUrl, mainUrl, duration, language, tone, extra }) {
+async function readyRant({ sourceUrl, mainUrl, duration, language, tone, extra, who }) {
   const segs = await transcript([sourceUrl, mainUrl]);
   const words = wordsOf(segs);
   const dur = Number(duration) > 0 ? Number(duration) : (words.length ? words[words.length - 1].end : 0);
-  const { out, most, usage } = await write({ segs, duration: dur, language, tone, extra });
+  const { out, most, usage } = await write({ segs, duration: dur, language, tone, extra, who });
   const rants = place(out, words, dur, most, TONE_STOPS[tone] || {});
   console.log(`[ready-rant] ${Math.round(dur)}s → ${rants.length}/${most} RANTs (${usage?.prompt_tokens || 0} in, ${usage?.completion_tokens || 0} out)`);
   // The ending is the AI's verdict + one of Mosh's 99% DFY calls to action (random).
@@ -226,4 +266,4 @@ function linesOf(segs) {
   return out.map((l) => ({ start: Math.round(l.start * 100) / 100, end: Math.round(l.end * 100) / 100, text: l.text }));
 }
 
-module.exports = { TONES, readyRant, mostFor, wordsOf, locate, place, transcript, linesOf };
+module.exports = { TONES, TONE_STOPS, readyRant, write, speakerFor, mentorPrompt, mostFor, wordsOf, locate, place, transcript, linesOf };
