@@ -100,7 +100,7 @@ const TONES = {
   serious: 'Straight talk. No jokes. Calm, clear and direct, like a mentor telling a friend the truth.',
   nine_to_five: [
     "9-to-5 Freedom. The viewer is a 9-to-5 worker (salary, boss, commute, fixed income). Whatever the video is about, turn it into a tip, an advice or a push for them to start their own business or a second income on the side, so they don't rely only on the job.",
-    'THIS TONE CHANGES THE STOP RULE: RANT 1 stops the video as EARLY as possible, right after the creator finishes their FIRST sentence (ignore the "first 15%" rule for RANT 1 only). RANT 1 is a second hook: 1-2 short lines that tie this video to the 9-to-5 viewer so they know it is for them and keep watching (e.g. "If you have a 9-to-5, listen to this one carefully." then why). No tip yet, just the connection and a reason to stay.',
+    'THIS TONE CHANGES THE STOP RULE: RANT 1 stops the video as EARLY as possible, right after the creator finishes their FIRST sentence (ignore the "first 15%" rule for RANT 1 only). List RANT 1 FIRST in the rants array; its stop_after is the end of the opening sentence. RANT 1 is a second hook: 1-2 short lines that tie this video to the 9-to-5 viewer so they know it is for them and keep watching (e.g. "If you have a 9-to-5, listen to this one carefully." then why). No tip yet, just the connection and a reason to stay.',
     'Then 1 or 2 more RANTs at the strongest moments (normal stop rules). Each finds the honest link between what the creator just said and a 9-to-5 worker building their own income: one clear tip, advice, lesson or push they can use this week. Sound like someone who has done it and knows the way, calm and sure, so the viewer trusts you and wants to follow you. Never shame the job (it pays the bills), never promise money or results, no "quit your job tomorrow".',
     'The ending verdict speaks to the 9-to-5 viewer: one line on what this video means for their own income.',
   ].join(' '),
@@ -135,21 +135,46 @@ async function write({ segs, duration, language, tone, extra }) {
   return { out: jsonIn(text), most, usage: { model: MODEL } };
 }
 
-/** The AI's picks → safe stops, in order, never breaking the rules. */
+/** Where the creator's opening line ends: the first full stop/?/! after 1.5 s
+ *  (within 20 s), else the first clear pause, else ~4 s in. Never past 15%. */
+function firstLineEnd(words, duration) {
+  const cap = Math.max(4, Math.min(20, duration * 0.15));
+  const ok = (w) => w.end >= 1.5 && w.end <= cap;
+  const dot = words.find((w) => ok(w) && /[.?!]["')\]]*$/.test(w.text));
+  if (dot) return dot.end;
+  const pause = words.find((w, i) => ok(w) && words[i + 1] && words[i + 1].start - w.end >= 0.4);
+  if (pause) return pause.end;
+  const near = words.find((w) => w.end >= Math.min(4, cap));
+  return near && near.end <= cap ? near.end : null;
+}
+
+/** The AI's picks → safe stops, in order, never breaking the rules.
+ *  earlyFirst (9-to-5 tone): the AI's FIRST RANT is the re-hook; the code puts
+ *  it right after the creator's opening line (the AI's quote for it is not
+ *  trusted: on long videos it matched a line minutes in). */
 function place(out, words, duration, most, { earlyFirst = false } = {}) {
   const gap = (duration / (most + 1)) * 0.6;
-  const picks = (Array.isArray(out.rants) ? out.rants : [])
+  const list = Array.isArray(out.rants) ? out.rants : [];
+  const kept = [];
+  let rest = list;
+  if (earlyFirst && list.length) {
+    const at = firstLineEnd(words, duration);
+    const script = String(list[0].script || '').trim();
+    if (at != null && script) {
+      kept.push({ at: Math.round(at * 10) / 10, script, why: String(list[0].why_here || '').trim() });
+      rest = list.slice(1);
+    }
+  }
+  const picks = rest
     .map((r) => ({ at: locate(r.stop_after, words), script: String(r.script || '').trim(), why: String(r.why_here || '').trim() }))
     .filter((r) => r.at != null && r.script)
     .sort((a, b) => a.at - b.at);
-  const kept = [];
+  const hooked = kept.length;
   for (const r of picks) {
-    // earlyFirst (9-to-5 re-hook): the first stop may come right after the opening line.
-    const from = earlyFirst && !kept.length ? Math.min(1.5, duration * 0.15) : duration * 0.15;
-    if (r.at < from || r.at > duration - 3) continue;
+    if (r.at < duration * 0.15 || r.at > duration - 3) continue;
     // The early re-hook doesn't push the next stop back; the 15% rule still does.
-    const rehook = earlyFirst && kept.length === 1;
-    if (kept.length && !rehook && r.at - kept[kept.length - 1].at < gap) continue;
+    const last = kept.length > hooked ? kept[kept.length - 1] : null;
+    if (last && r.at - last.at < gap) continue;
     if (kept.length >= most) break;
     kept.push({ ...r, at: Math.round(r.at * 10) / 10 });
   }
