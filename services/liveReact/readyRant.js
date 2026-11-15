@@ -45,12 +45,28 @@ function speakerFor(who) {
   return fs.existsSync(local) ? fs.readFileSync(local, 'utf8').trim() : '';
 }
 
-function shuffleFacts(text) {
-  const lines = String(text || '').split('\n');
-  const head = lines.filter((l) => !/^\s*-/.test(l));
-  const facts = lines.filter((l) => /^\s*-/.test(l));
-  for (let i = facts.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [facts[i], facts[j]] = [facts[j], facts[i]]; }
-  return [...head, ...facts].join('\n').trim();
+const shuffled = (a) => { a = [...a]; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+// When the 9-to-5 viewer does the step: rotated so videos don't all say "this week".
+const WHENS = ['tonight', 'after work today', 'on your lunch break tomorrow', 'this weekend', 'tomorrow morning before work',
+  'on your commute', 'before you sleep tonight', 'right after this video', 'this Saturday', 'in the next 24 hours',
+  'next time you scroll your phone', 'this week'];
+
+/** Mentor-mode PLAN: a different fact (spread over every RANT + the ending,
+ *  random order each time) and a different "when" for each RANT. */
+function variety(about, most) {
+  const facts = shuffled(String(about || '').split('\n').filter((l) => /^\s*-/.test(l))
+    .map((l) => l.replace(/^\s*-\s*/, '').replace(/\s*\(.*?\)\s*$/, '').trim())
+    .filter((l) => !/lives in|Muslim|never name the apps/i.test(l)));
+  const whens = shuffled(WHENS);
+  const lines = [];
+  for (let i = 0; i < most; i++) {
+    const parts = [];
+    if (facts.length) parts.push(i < facts.length ? `fact: ${facts[i]}` : 'fact: none (no number in this one)');
+    if (i > 0) parts.push(`the viewer does the step: ${whens[i]}`);
+    lines.push(`RANT ${i + 1}${i === 0 ? ' (re-hook)' : ''}: ${parts.join('; ') || 'no fact'}`);
+  }
+  if (facts.length > most) lines.push(`ENDING: fact (optional): ${facts[most]}`);
+  return `PLAN (variety; follow it, say it in your own words):\n${lines.join('\n')}`;
 }
 
 /** How many RANTs a video of this length may have. */
@@ -154,9 +170,9 @@ async function write({ segs, duration, language, tone, extra, who }) {
   if (!prompt) throw new Error('Ready-made RANT is not set up on the server yet.');
   const most = TONE_STOPS[tone] ? TONE_STOPS[tone].most(mostFor(duration)) : mostFor(duration);
   let user = `Video length: ${Math.round(duration)} seconds\nMost RANTs allowed: ${most}\nLanguage: ${language === 'bengali' ? 'Bengali' : 'English'}`;
-  // Facts shuffled each time, so different videos lean on different proof.
-  const about = mentor ? shuffleFacts(speakerFor(who)) : '';
-  if (about) user += `\n\nABOUT THE SPEAKER (true facts; use at most one per RANT, never stretch them, never promise the viewer results):\n${about}`;
+  const about = mentor ? speakerFor(who) : '';
+  if (about) user += `\n\nABOUT THE SPEAKER (true facts; never stretch them, never promise the viewer results):\n${about}`;
+  if (mentor) user += `\n\n${variety(about, most)}`;
   if (TONES[tone] && !mentor) user += `\n\nTONE (the user picked this; use it for every RANT and the ending, but keep every other rule, keep it honest and keep it halal: no swearing, no mocking religion, looks or family): ${TONES[tone]}`;
   const note = cleanExtra(extra);
   if (note) user += `\n\nEXTRA INSTRUCTIONS FROM THE USER (follow them, as long as they don't break the JSON shape, the stop_after quotes or the most-RANTs limit; fewer RANTs or shorter lines are always fine):\n${note}`;
