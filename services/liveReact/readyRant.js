@@ -160,6 +160,24 @@ function cleanExtra(extra) {
   return String(extra || '').replace(/\s+/g, ' ').trim().slice(0, 500);
 }
 
+/** The user's own words WIN (19 Nov 2026, Mosh: "it ignores my instructions",
+ *  e.g. 9-to-5 + roast, Iron Man's voice, two lines). They used to sit as a
+ *  polite note above a long transcript, under a rulebook (and the 9-to-5
+ *  mentor prompt) with its own voice and word counts, so the rulebook won.
+ *  Now they go at the very END of the system prompt AND after the transcript,
+ *  and say plainly what they override. Only the safety and the machinery stay. */
+function userRules(note) {
+  return [
+    "THE USER'S OWN INSTRUCTIONS: TOP PRIORITY. Follow them exactly, in every RANT and the ending:",
+    `"""${note}"""`,
+    'They OVERRIDE anything above about tone, voice, mood, character, style, structure, length, word counts, the number of lines, how many RANTs (fewer is fine) and the mentor/teacher style.',
+    '- A tone or mood (roast, angry, funny, calm, crazy...): write it that way, all the way, even if a tone above says otherwise. When they also picked a tone above, keep its TOPIC (e.g. 9-to-5 workers and their own income) and use THEIR mood for it.',
+    "- A character's voice (e.g. Iron Man, a pirate, a grandma): write as that character would talk, their attitude and rhythm, in your own words (no long quotes from films).",
+    '- A length (e.g. "two lines", "10 words", "short"): EVERY RANT and the ending stays inside it. Count before you answer. This beats every word count above.',
+    'Only these never change: the JSON shape, stop_after copied exactly from the transcript, the most-RANTs limit, honesty (no made-up facts, no promised money or results), and halal (no swearing, no mocking religion, looks, family or anyone\'s background; a roast hits ideas and claims, not people\'s worth).',
+  ].join('\n');
+}
+
 function promptLines(segs) {
   return segs.map((s) => `[${s.start.toFixed(1)}] ${s.text}`).join('\n');
 }
@@ -175,13 +193,52 @@ async function write({ segs, duration, language, tone, extra, who }) {
   if (mentor) user += `\n\n${variety(about, most)}`;
   if (TONES[tone] && !mentor) user += `\n\nTONE (the user picked this; use it for every RANT and the ending, but keep every other rule, keep it honest and keep it halal: no swearing, no mocking religion, looks or family): ${TONES[tone]}`;
   const note = cleanExtra(extra);
-  if (note) user += `\n\nEXTRA INSTRUCTIONS FROM THE USER (follow them, as long as they don't break the JSON shape, the stop_after quotes or the most-RANTs limit; fewer RANTs or shorter lines are always fine):\n${note}`;
+  if (note) user += `\n\nThe user gave their own instructions (top priority, repeated after the transcript):\n${note}`;
   user += `\n\nTranscript (seconds in brackets):\n${promptLines(segs)}`;
+  if (note) user += `\n\n${userRules(note)}`;
   // A long video (10+ RANTs) can take Claude well over 4 minutes; the app waits.
   // Mentor mode writes on Opus (tested 15Nov26: far more specific than Sonnet; only 2-3 RANTs, so it stays quick).
   const model = mentor ? (process.env.READY_RANT_9TO5_MODEL || 'opus') : MODEL;
-  const text = await askText({ system: prompt + '\n\nReply with ONE JSON object and nothing else.', user, model, timeoutMs: 9 * 60 * 1000 });
-  return { out: jsonIn(text), most, usage: { model } };
+  const system = prompt + (note ? `\n\n${userRules(note)}` : '') + '\n\nReply with ONE JSON object and nothing else.';
+  const text = await askText({ system, user, model, timeoutMs: 9 * 60 * 1000 });
+  let out = jsonIn(text);
+  if (note) out = await obey(out, note, language);
+  return { out, most, usage: { model } };
+}
+
+/** Second pass when the user wrote instructions: the first pass still drifted
+ *  back to the rulebook's voice and word counts (tested 19 Nov 2026: 9-to-5 +
+ *  "roast, angry, Iron Man, two lines" came back calm and 45 words). This one
+ *  sees ONLY the scripts and the instructions, so the instructions win. The
+ *  stops (stop_after) are never touched. A failure keeps the first pass. */
+async function obey(out, note, language) {
+  const rants = Array.isArray(out.rants) ? out.rants : [];
+  const scripts = rants.map(scriptOf);
+  const ending = String(out.ending || '').trim();
+  if (!scripts.some(Boolean) && !ending) return out;
+  const system = [
+    'You rewrite short spoken scripts (RANTs) that a person reads out loud while reacting to a video.',
+    'Make EVERY script and the ending follow the user\'s instructions exactly: their tone, mood, character voice, length, style, format. Instructions beat how the drafts sound now.',
+    '- Keep each script about the same moment and the same main point (and the same topic, e.g. 9-to-5 workers building their own income), unless the instructions say otherwise.',
+    '- A length limit ("two lines", "10 words"...) is HARD: count, and cut facts or numbers to fit.',
+    "- A character's voice: their attitude, swagger and rhythm, in your own words (no long film quotes).",
+    '- Keep true facts only as they are (never invent numbers or promise results). Halal: no swearing, no mocking religion, looks, family or anyone\'s background; a roast hits ideas, not people.',
+    `- Language: ${language === 'bengali' ? 'Bengali (Banglish business words are fine)' : 'English'}. Easy words, made to be spoken.`,
+    'Reply with ONE JSON object and nothing else: {"rants": ["script 1", ...same count and order...], "ending": "..."}',
+  ].join('\n');
+  const user = `USER'S INSTRUCTIONS (follow exactly):\n"""${note}"""\n\nDRAFTS:\n${JSON.stringify({ rants: scripts, ending }, null, 1)}`;
+  try {
+    const r = jsonIn(await askText({ system, user, model: process.env.READY_RANT_OBEY_MODEL || 'sonnet', timeoutMs: 3 * 60 * 1000 }));
+    const fresh = Array.isArray(r.rants) ? r.rants.map((x) => String(x || '').trim()) : [];
+    return {
+      ...out,
+      rants: rants.map((x, i) => (fresh[i] ? { ...x, drafts: undefined, best: undefined, script: fresh[i] } : x)),
+      ending: String(r.ending || '').trim() || out.ending,
+    };
+  } catch (e) {
+    console.warn('[ready-rant] obey pass failed, keeping first pass:', e.message);
+    return out;
+  }
 }
 
 /** Mentor mode writes 3 drafts and names the best; older replies have script. */
