@@ -219,14 +219,24 @@ class ManualVideoLibraryService {
   /**
    * Save the user's added clips / CTAs for one video (auto-save from the editor),
    * so reopening the project brings them back like hooks/cuts. Stored lean:
-   * { atTime: Number|null (null = at the very end), clipUrls: [String R2 urls] }.
+   * { atTime: Number|null (null = at the very end), clipUrls: [String R2 urls],
+   *   clipLabels: [String] } — clipLabels runs parallel to clipUrls and is only
+   * the clip's NAME for the editor (saved CTA name / file name / video title), so
+   * a reopened project says "Webinar-CTA" instead of "Saved clip". The renderer
+   * ignores it.
    */
   async updateInserts(userId, jobId, inserts) {
     const lean = (Array.isArray(inserts) ? inserts : [])
-      .map(p => ({
-        atTime: (p.atTime === null || p.atTime === undefined) ? null : Number(p.atTime),
-        clipUrls: (Array.isArray(p.clipUrls) ? p.clipUrls : []).filter(Boolean).map(String),
-      }))
+      .map(p => {
+        const pairs = (Array.isArray(p.clipUrls) ? p.clipUrls : [])
+          .map((u, i) => [u, Array.isArray(p.clipLabels) ? p.clipLabels[i] : ''])
+          .filter(([u]) => Boolean(u));
+        return {
+          atTime: (p.atTime === null || p.atTime === undefined) ? null : Number(p.atTime),
+          clipUrls: pairs.map(([u]) => String(u)),
+          clipLabels: pairs.map(([, l]) => String(l || '').slice(0, 200)),
+        };
+      })
       .filter(p => p.clipUrls.length > 0);
     for (const owner of [userId, null]) {
       const data = await this.load(owner);
